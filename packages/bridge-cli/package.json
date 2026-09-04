@@ -1,0 +1,28 @@
+{
+  "name": "@bridge/cli",
+  "version": "0.1.0",
+  "description": "The bridge command line interface",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test dist/test/"
+  },
+  "dependencies": {
+    "@bridge/core": "*",
+    "@bridge/compat": "*",
+    "@bridge/generators": "*",
+    "@bridge/registry": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "bin": {
+    "bridge": "dist/bin/bridge.js"
+  }
+}

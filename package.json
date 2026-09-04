@@ -9,14 +9,18 @@
     "url": "https://github.com/Roy-Wanyoike/bridge.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "workspaces": [
     "packages/*"
   ],
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
   "scripts": {
-    "build": "tsc -b packages/*",
-    "test": "npm test --workspaces --if-present",
+    "build": "tsc -b packages/bridge-core packages/bridge-generators packages/bridge-compat packages/bridge-registry packages/bridge-cli",
+    "test": "npm run test --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present"
   }
 }

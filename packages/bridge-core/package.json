@@ -1,0 +1,17 @@
+{
+  "name": "@bridge/core",
+  "version": "0.1.0",
+  "description": "Bridge IDL compiler: lexer, parser, semantic analysis, canonical IR",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test dist/test/"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
