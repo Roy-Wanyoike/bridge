@@ -1,0 +1,34 @@
+// Bridge IDL example: events + RPC over a small order flow.
+//
+// The generated code for this contract demonstrates:
+// - event payloads with the CloudEvents-style Bridge envelope
+// - typed publishers, an in-memory bus and a dispatcher
+// - JSON-over-HTTP RPC clients and server adapters in 4 languages
+
+package store.v1
+
+event OrderPlaced {
+    order_id: uuid
+    total_cents: int64 @min(0)
+    currency: string @length(3)
+}
+
+event OrderShipped {
+    order_id: uuid
+    carrier: string
+}
+
+type CreateOrderRequest {
+    total_cents: int64 @min(1)
+    currency: string @length(3)
+}
+
+type Order {
+    id: uuid
+    total_cents: int64
+    currency: string @length(3)
+}
+
+service Orders {
+    CreateOrder(CreateOrderRequest) -> Order
+}
