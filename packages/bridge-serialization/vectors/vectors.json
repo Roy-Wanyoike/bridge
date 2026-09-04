@@ -1,0 +1,245 @@
+{
+  "profile": "bridge-serialization v1 (docs/SERIALIZATION.md)",
+  "vectors": [
+    {
+      "id": "null",
+      "json": "null",
+      "msgpack": "c0",
+      "cbor": "f6"
+    },
+    {
+      "id": "true",
+      "json": "true",
+      "msgpack": "c3",
+      "cbor": "f5"
+    },
+    {
+      "id": "false",
+      "json": "false",
+      "msgpack": "c2",
+      "cbor": "f4"
+    },
+    {
+      "id": "int_zero",
+      "json": "0",
+      "msgpack": "00",
+      "cbor": "00"
+    },
+    {
+      "id": "int_small",
+      "json": "42",
+      "msgpack": "2a",
+      "cbor": "182a"
+    },
+    {
+      "id": "int_u8_max",
+      "json": "255",
+      "msgpack": "ccff",
+      "cbor": "18ff"
+    },
+    {
+      "id": "int_u16_max",
+      "json": "65535",
+      "msgpack": "cdffff",
+      "cbor": "19ffff"
+    },
+    {
+      "id": "int_u32_max",
+      "json": "4294967295",
+      "msgpack": "ceffffffff",
+      "cbor": "1affffffff"
+    },
+    {
+      "id": "int_u64_max",
+      "json": "18446744073709551615",
+      "msgpack": "cfffffffffffffffff",
+      "cbor": "1bffffffffffffffff"
+    },
+    {
+      "id": "int_neg_one",
+      "json": "-1",
+      "msgpack": "ff",
+      "cbor": "20"
+    },
+    {
+      "id": "int_neg_i8_min",
+      "json": "-128",
+      "msgpack": "d080",
+      "cbor": "387f"
+    },
+    {
+      "id": "int_neg_i16_min",
+      "json": "-32768",
+      "msgpack": "d18000",
+      "cbor": "397fff"
+    },
+    {
+      "id": "int_neg_i32_min",
+      "json": "-2147483648",
+      "msgpack": "d280000000",
+      "cbor": "3a7fffffff"
+    },
+    {
+      "id": "int_neg_i64_min",
+      "json": "-9223372036854775808",
+      "msgpack": "d38000000000000000",
+      "cbor": "3b7fffffffffffffff"
+    },
+    {
+      "id": "int_beyond_2p53",
+      "json": "9007199254740993",
+      "msgpack": "cf0020000000000001",
+      "cbor": "1b0020000000000001"
+    },
+    {
+      "id": "int_neg_beyond_2p53",
+      "json": "-9007199254740993",
+      "msgpack": "d3ffdfffffffffffff",
+      "cbor": "3b0020000000000000"
+    },
+    {
+      "id": "float_zero",
+      "json": "0",
+      "msgpack": "cb0000000000000000",
+      "cbor": "fb0000000000000000"
+    },
+    {
+      "id": "float_pi",
+      "json": "3.14",
+      "msgpack": "cb40091eb851eb851f",
+      "cbor": "fb40091eb851eb851f"
+    },
+    {
+      "id": "float_neg_half",
+      "json": "-0.5",
+      "msgpack": "cbbfe0000000000000",
+      "cbor": "fbbfe0000000000000"
+    },
+    {
+      "id": "float_large",
+      "json": "1e+300",
+      "msgpack": "cb7e37e43c8800759c",
+      "cbor": "fb7e37e43c8800759c"
+    },
+    {
+      "id": "string_empty",
+      "json": "\"\"",
+      "msgpack": "a0",
+      "cbor": "60"
+    },
+    {
+      "id": "string_ascii",
+      "json": "\"hello\"",
+      "msgpack": "a568656c6c6f",
+      "cbor": "6568656c6c6f"
+    },
+    {
+      "id": "string_unicode",
+      "json": "\"héllo 🌉 世界\"",
+      "msgpack": "b268c3a96c6c6f20f09f8c8920e4b896e7958c",
+      "cbor": "7268c3a96c6c6f20f09f8c8920e4b896e7958c"
+    },
+    {
+      "id": "string_32",
+      "json": "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"",
+      "msgpack": "d9207878787878787878787878787878787878787878787878787878787878787878",
+      "cbor": "78207878787878787878787878787878787878787878787878787878787878787878"
+    },
+    {
+      "id": "string_256",
+      "json": "\"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\"",
+      "msgpack": "da010079797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979",
+      "cbor": "79010079797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979"
+    },
+    {
+      "id": "bytes_empty",
+      "json": "\"\"",
+      "msgpack": "c400",
+      "cbor": "40"
+    },
+    {
+      "id": "bytes_small",
+      "json": "\"AAEC/w==\"",
+      "msgpack": "c404000102ff",
+      "cbor": "44000102ff"
+    },
+    {
+      "id": "bytes_256",
+      "json": "\"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw==\"",
+      "msgpack": "c5010007070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707",
+      "cbor": "59010007070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707070707"
+    },
+    {
+      "id": "timestamp_epoch",
+      "json": "\"2024-06-04T15:40:00Z\"",
+      "msgpack": "c70cff0000000000000000665f3550",
+      "cbor": "c1fb41d997cd54000000"
+    },
+    {
+      "id": "timestamp_nanos",
+      "json": "\"2024-06-04T15:40:00.5Z\"",
+      "msgpack": "c70cff1dcd650000000000665f3550",
+      "cbor": "c1fb41d997cd54200000"
+    },
+    {
+      "id": "timestamp_epoch_zero",
+      "json": "\"1970-01-01T00:00:00Z\"",
+      "msgpack": "c70cff000000000000000000000000",
+      "cbor": "c1fb0000000000000000"
+    },
+    {
+      "id": "array_empty",
+      "json": "[]",
+      "msgpack": "90",
+      "cbor": "80"
+    },
+    {
+      "id": "array_mixed",
+      "json": "[1,\"two\",false,null,3.5]",
+      "msgpack": "9501a374776fc2c0cb400c000000000000",
+      "cbor": "85016374776ff4f6fb400c000000000000"
+    },
+    {
+      "id": "map_empty",
+      "json": "{}",
+      "msgpack": "80",
+      "cbor": "a0"
+    },
+    {
+      "id": "map_sorted",
+      "json": "{\"a\":2,\"b\":1}",
+      "msgpack": "82a16102a16201",
+      "cbor": "a2616102616201"
+    },
+    {
+      "id": "map_unicode_keys",
+      "json": "{\"a\":2,\"é\":1}",
+      "msgpack": "82a16102a2c3a901",
+      "cbor": "a261610262c3a901"
+    },
+    {
+      "id": "map_undefined_dropped",
+      "json": "{\"nulled\":null,\"present\":\"x\"}",
+      "msgpack": "82a66e756c6c6564c0a770726573656e74a178",
+      "cbor": "a2666e756c6c6564f66770726573656e746178"
+    },
+    {
+      "id": "set_ints",
+      "json": "[1,2,3]",
+      "msgpack": "93010203",
+      "cbor": "83010203"
+    },
+    {
+      "id": "set_strings",
+      "json": "[\"a\",\"b\"]",
+      "msgpack": "92a161a162",
+      "cbor": "8261616162"
+    },
+    {
+      "id": "nested_struct",
+      "json": "{\"amount\":\"19.99\",\"big\":9007199254740993,\"created\":\"2024-06-04T17:00:00Z\",\"flag\":true,\"id\":\"pay_01\",\"meta\":{\"attempts\":2,\"retry\":false},\"ratio\":-0.5,\"receipt\":\"AAEC/w==\",\"tags\":[\"card\",\"recurring\"],\"voided_at\":null}",
+      "msgpack": "8aa6616d6f756e74a531392e3939a3626967cf0020000000000001a763726561746564c70cff0000000000000000665f4810a4666c6167c3a26964a67061795f3031a46d65746182a8617474656d70747302a57265747279c2a5726174696fcbbfe0000000000000a772656365697074c404000102ffa47461677392a463617264a9726563757272696e67a9766f696465645f6174c0",
+      "cbor": "aa66616d6f756e746531392e3939636269671b00200000000000016763726561746564c1fb41d997d20400000064666c6167f5626964667061795f3031646d657461a268617474656d70747302657265747279f465726174696ffbbfe0000000000000677265636569707444000102ff647461677382646361726469726563757272696e6769766f696465645f6174f6"
+    }
+  ]
+}
