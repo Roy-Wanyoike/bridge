@@ -29,7 +29,6 @@ skills/
 db/
 agent-ctx/
 worklog.md
-scripts/
 *.log
 logs/
 
