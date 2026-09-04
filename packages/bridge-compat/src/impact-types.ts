@@ -7,7 +7,7 @@
  * the reachability heuristics and `impact-report.ts` for rendering.
  */
 import type { IRPackage } from '@bridge/core';
-import type { Change, ChangeKind, Classification, CompatReport } from './types';
+import type { Change, ChangeKind, Classification } from './types';
 
 /**
  * Minimal structural view of one published contract's metadata.
@@ -71,7 +71,15 @@ export type ContactReason =
   /** Scanned successfully; no changed type is reachable from this consumer. */
   | 'unaffected';
 
-/** One discovered consumer contract and how the change reaches it. */
+/**
+ * One discovered consumer contract and how the change reaches it.
+ *
+ * `ImpactReport.affectedConsumers` contains EVERY transitive dependent
+ * discovered in the registry — consumers the change does not reach carry
+ * `severity: 'SAFE'` and `reason: 'unaffected'`, so the list doubles as a
+ * census of who was scanned and cleared. Filter on `severity !== 'SAFE'`
+ * (equivalently `stats.consumersAffected`) for the affected subset.
+ */
 export interface AffectedConsumer {
   /** Full package name of the consumer contract, e.g. `'fraud.v2'`. */
   packageName: string;
@@ -123,20 +131,34 @@ export interface SuggestedAction {
   reaches: string[];
 }
 
-/** Roll-up counts over the discovered consumer graph. */
+/**
+ * Roll-up over an impact report: change counts per classification plus the
+ * consumer counts derived from the transitive walk.
+ */
 export interface ImpactStats {
-  /** All transitive dependents discovered in the registry. */
-  consumersTotal: number;
-  /** Consumers whose IR was pulled and analyzed. */
-  consumersScanned: number;
-  /** Consumers touched by at least one non-SAFE change. */
+  /** Total number of detected changes (== `changes.length`). */
+  total: number;
+  /** Changes classified BREAKING. */
+  breaking: number;
+  /** Changes classified WARNING. */
+  warning: number;
+  /** Changes classified SAFE. */
+  safe: number;
+  /** Changes classified UNKNOWN. */
+  unknown: number;
+  /**
+   * Discovered consumers touched by at least one non-SAFE change (includes
+   * consumers whose IR could not be pulled — they are conservatively
+   * counted as affected). Equal to
+   * `affectedConsumers.filter(c => c.severity !== 'SAFE').length`.
+   */
   consumersAffected: number;
-  /** Direct dependents (depth 1). */
-  direct: number;
-  /** Indirect dependents (depth ≥ 2). */
-  indirect: number;
-  /** Consumers by the worst severity reaching them (`safe` = scanned but untouched). */
-  bySeverity: { breaking: number; unknown: number; warning: number; safe: number };
+  /**
+   * Discovered consumers touched by at least one BREAKING change — the
+   * subset of {@link consumersAffected} that must migrate before the
+   * candidate can ship.
+   */
+  consumersBreakingAffected: number;
 }
 
 /** How the analysis was produced — surfaced so reports state their own limits. */
@@ -149,33 +171,35 @@ export interface ImpactAnalysis {
   notes: string[];
 }
 
-/** Result of {@link computeImpact}: diff + consumer graph + guidance. */
+/**
+ * Result of {@link computeImpact}: diff + consumer graph + guidance.
+ * Deterministic — identical inputs produce byte-identical reports.
+ */
 export interface ImpactReport {
   /**
    * Name of the changed (anchor) package — the OLD name consumers reference.
    * A rename surfaces as a change in `changes`; the new name appears in
-   * `to` and in the rename change itself.
+   * `toRef` and in the rename change itself.
    */
-  packageName: string;
+  contract: string;
   /** Human-readable identity of the baseline, e.g. `payments.v1@v1`. */
-  from: string;
+  fromRef: string;
   /** Human-readable identity of the candidate, e.g. `payments.v1@v2`. */
-  to: string;
+  toRef: string;
   /** All detected changes in the canonical order of `diffPackages`. */
   changes: Change[];
-  /** Worst classification across `changes` (BREAKING > UNKNOWN > WARNING > SAFE). */
-  verdict: Classification;
-  /** Count of changes per classification. */
-  summary: CompatReport['summary'];
+  /**
+   * Every discovered transitive dependent, sorted by name then version
+   * (numeric-aware). Consumers untouched by any non-SAFE change carry
+   * `reason: 'unaffected'` — see {@link AffectedConsumer}.
+   */
+  affectedConsumers: AffectedConsumer[];
+  /** Aggregate counts over `changes` and `affectedConsumers`. */
+  stats: ImpactStats;
   /** One suggested action per change, same order as `changes`. */
   suggestedActions: SuggestedAction[];
-  /**
-   * Every discovered transitive dependent, sorted by name then version.
-   * Consumers untouched by any non-SAFE change carry `reason: 'unaffected'`.
-   */
-  consumers: AffectedConsumer[];
-  /** Aggregate counts over `consumers`. */
-  stats: ImpactStats;
+  /** Worst classification across `changes` (BREAKING > UNKNOWN > WARNING > SAFE). */
+  verdict: Classification;
   /** How the analysis was performed, including its limits. */
   analysis: ImpactAnalysis;
 }
@@ -205,6 +229,6 @@ export interface ImpactOptions {
    * reported (`analysis.graphTraversed === false`).
    */
   registry?: ImpactRegistry;
-  /** Overrides for the human-readable `from`/`to` labels (e.g. file paths). */
+  /** Overrides for the human-readable `fromRef`/`toRef` labels (e.g. file paths). */
   labels?: { from?: string; to?: string };
 }

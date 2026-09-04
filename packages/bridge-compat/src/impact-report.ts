@@ -44,6 +44,13 @@ function cell(text: string): string {
   return text.replace(/\|/g, '\\|');
 }
 
+/** Count consumers by severity (formatter-side roll-up over the census). */
+function severityCounts(consumers: readonly AffectedConsumer[]): Record<Classification, number> {
+  const counts: Record<Classification, number> = { BREAKING: 0, UNKNOWN: 0, WARNING: 0, SAFE: 0 };
+  for (const c of consumers) counts[c.severity] += 1;
+  return counts;
+}
+
 /** How a consumer is reached, as a compact phrase (shared by both formatters). */
 function viaPhrase(c: AffectedConsumer): string {
   switch (c.reason) {
@@ -71,7 +78,7 @@ function viaPhrase(c: AffectedConsumer): string {
  *
  * ```
  * BRIDGE IMPACT REPORT
- * package: payments.v1
+ * contract: payments.v1
  * change: payments.v1@v1 → payments.v1@v2
  *
  * ❌ Breaking: Payment.currency removed
@@ -92,27 +99,28 @@ function viaPhrase(c: AffectedConsumer): string {
  */
 export function formatImpactText(report: ImpactReport): string {
   const lines: string[] = [];
+  const s = report.stats;
+  const counts = severityCounts(report.affectedConsumers);
   lines.push('BRIDGE IMPACT REPORT');
-  lines.push(`package: ${report.packageName}`);
-  lines.push(`change: ${report.from} → ${report.to}`);
+  lines.push(`contract: ${report.contract}`);
+  lines.push(`change: ${report.fromRef} → ${report.toRef}`);
   lines.push('');
   for (const change of [...report.changes].sort(compareChanges)) lines.push(renderChange(change));
   lines.push('');
   lines.push(
-    `Summary: ${report.summary.safe} safe, ${report.summary.warning} warnings, ` +
-      `${report.summary.breaking} breaking, ${report.summary.unknown} unknown`,
+    `Summary: ${s.safe} safe, ${s.warning} warnings, ` +
+      `${s.breaking} breaking, ${s.unknown} unknown`,
   );
   lines.push(`Verdict: ${report.verdict}`);
   lines.push('');
-  const s = report.stats;
   lines.push(
-    `Consumers: ${s.consumersTotal} discovered, ${s.consumersAffected} affected ` +
-      `(breaking ${s.bySeverity.breaking}, unknown ${s.bySeverity.unknown}, warning ${s.bySeverity.warning}, safe ${s.bySeverity.safe})`,
+    `Consumers: ${report.affectedConsumers.length} discovered, ${s.consumersAffected} affected ` +
+      `(breaking ${counts.BREAKING}, unknown ${counts.UNKNOWN}, warning ${counts.WARNING}, safe ${counts.SAFE})`,
   );
   if (!report.analysis.graphTraversed) {
     lines.push('  (no registry provided — consumer graph not traversed)');
   } else {
-    for (const c of report.consumers) {
+    for (const c of report.affectedConsumers) {
       lines.push(`  ${CHANGE_SYMBOL[c.severity]} ${c.packageName}@${c.version} — depth ${c.depth} — ${c.severity} — ${viaPhrase(c)}`);
     }
   }
@@ -139,35 +147,37 @@ export function formatImpactText(report: ImpactReport): string {
 
 /**
  * Format an impact report as GitHub-PR-comment-ready markdown with a summary
- * table, a per-change action table and an affected-consumers table. Contains
+ * table, an affected-consumers table and a per-change action table. Contains
  * no timestamps or volatile data: identical reports render byte-identically.
  */
 export function formatImpactMarkdown(report: ImpactReport): string {
   const s = report.stats;
+  const counts = severityCounts(report.affectedConsumers);
   const lines: string[] = [];
 
-  lines.push(`## Bridge impact report: \`${report.packageName}\``);
+  lines.push(`## Bridge impact report: \`${report.contract}\``);
   lines.push('');
   lines.push(
-    `**${cell(report.from)} → ${cell(report.to)}** · verdict **${report.verdict}** · ` +
-      `${report.summary.breaking} breaking · ${report.summary.unknown} unknown · ` +
-      `${report.summary.warning} warnings · ${report.summary.safe} safe`,
+    `**${cell(report.fromRef)} → ${cell(report.toRef)}** · verdict **${report.verdict}** · ` +
+      `${s.breaking} breaking · ${s.unknown} unknown · ` +
+      `${s.warning} warnings · ${s.safe} safe`,
   );
   lines.push('');
 
   if (report.analysis.graphTraversed) {
     lines.push('| Consumers | Count |');
     lines.push('| --- | --- |');
-    lines.push(`| Discovered | ${s.consumersTotal} |`);
+    lines.push(`| Discovered | ${report.affectedConsumers.length} |`);
     lines.push(`| Affected (non-safe) | ${s.consumersAffected} |`);
-    lines.push(`| 🔴 Breaking | ${s.bySeverity.breaking} |`);
-    lines.push(`| 🟠 Unknown | ${s.bySeverity.unknown} |`);
-    lines.push(`| 🟡 Warning | ${s.bySeverity.warning} |`);
-    lines.push(`| ⚪ Safe / unaffected | ${s.bySeverity.safe} |`);
+    lines.push(`| Breaking-affected | ${s.consumersBreakingAffected} |`);
+    lines.push(`| 🔴 Breaking | ${counts.BREAKING} |`);
+    lines.push(`| 🟠 Unknown | ${counts.UNKNOWN} |`);
+    lines.push(`| 🟡 Warning | ${counts.WARNING} |`);
+    lines.push(`| ⚪ Safe / unaffected | ${counts.SAFE} |`);
     lines.push('');
 
-    const affected = report.consumers.filter((c) => c.severity !== 'SAFE');
-    const untouched = report.consumers.filter((c) => c.severity === 'SAFE');
+    const affected = report.affectedConsumers.filter((c) => c.severity !== 'SAFE');
+    const untouched = report.affectedConsumers.filter((c) => c.severity === 'SAFE');
 
     lines.push(`### Affected consumers (${affected.length})`);
     lines.push('');

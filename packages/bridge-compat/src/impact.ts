@@ -727,8 +727,6 @@ export function computeImpact(options: ImpactOptions): ImpactReport {
   }
 
   const bySeverity = { breaking: 0, unknown: 0, warning: 0, safe: 0 };
-  let scanned = 0;
-  let direct = 0;
   for (const c of consumers) {
     switch (c.severity) {
       case 'BREAKING':
@@ -744,16 +742,15 @@ export function computeImpact(options: ImpactOptions): ImpactReport {
         bySeverity.safe += 1;
         break;
     }
-    if (c.scanned) scanned += 1;
-    if (c.depth === 1) direct += 1;
   }
   const stats: ImpactStats = {
-    consumersTotal: consumers.length,
-    consumersScanned: scanned,
+    total: changes.length,
+    breaking: report.summary.breaking,
+    warning: report.summary.warning,
+    safe: report.summary.safe,
+    unknown: report.summary.unknown,
     consumersAffected: bySeverity.breaking + bySeverity.unknown + bySeverity.warning,
-    direct,
-    indirect: consumers.length - direct,
-    bySeverity,
+    consumersBreakingAffected: bySeverity.breaking,
   };
 
   // ---- suggested actions (one per change) ---------------------------------
@@ -788,15 +785,14 @@ export function computeImpact(options: ImpactOptions): ImpactReport {
   });
 
   return {
-    packageName: oldPackage.name,
-    from: labels?.from ?? (anchorMeta !== undefined ? `${anchorMeta.packageName}@${anchorMeta.version}` : `${oldPackage.name} (provided IR)`),
-    to: labels?.to ?? (newMeta !== undefined ? `${newMeta.packageName}@${newMeta.version}` : `${newPackage.name} (provided IR)`),
+    contract: oldPackage.name,
+    fromRef: labels?.from ?? (anchorMeta !== undefined ? `${anchorMeta.packageName}@${anchorMeta.version}` : `${oldPackage.name} (provided IR)`),
+    toRef: labels?.to ?? (newMeta !== undefined ? `${newMeta.packageName}@${newMeta.version}` : `${newPackage.name} (provided IR)`),
     changes,
-    verdict: report.verdict,
-    summary: report.summary,
-    suggestedActions,
-    consumers,
+    affectedConsumers: consumers,
     stats,
+    suggestedActions,
+    verdict: report.verdict,
     analysis: {
       graphTraversed,
       method: 'type-reference-reachability',
