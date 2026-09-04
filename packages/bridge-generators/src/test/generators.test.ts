@@ -63,7 +63,7 @@ test('Rust: Cargo.toml, serde derives, deterministic collections', () => {
   const files = generate(ir, { language: 'rust' });
   const paths = files.map((f) => f.path).sort();
   assert.deepEqual(paths, [
-    'Cargo.toml', 'src/enums.rs', 'src/events.rs', 'src/lib.rs', 'src/services.rs', 'src/types.rs', 'src/validate.rs',
+    'Cargo.toml', 'src/enums.rs', 'src/events.rs', 'src/lib.rs', 'src/services.rs', 'src/types.rs', 'src/validate.rs', 'tests/roundtrip.rs',
   ]);
   const cargo = byPath(files, 'Cargo.toml');
   assert.match(cargo.content, /^name = "bridge-payments-v1"$/m);
@@ -176,9 +176,16 @@ assert len(m.validate_Money(m.Money(amount="abc", currency="US"))) == 2
 r = m.Resolution.refund(money)
 assert m.Resolution.from_dict(r.to_dict()) == r
 ev = m.PaymentFailed(payment_id="123e4567-e89b-12d3-a456-426614174000", reason="declined")
-name, _ = m.decode_event(m.wrap_payment_failed(ev))
-assert name == "PaymentFailed"
-assert m.unwrap_payment_failed(m.wrap_payment_failed(ev)) == ev
+meta = m.BridgeEventMeta(id="evt-1", source="test://payments", time="2026-01-01T00:00:00Z")
+env = m.encode_payment_failed(ev, meta)
+assert env["type"] == "payments.v1.PaymentFailed" and env["specversion"] == "1.0"
+decoded, dmeta = m.decode_payment_failed(env)
+assert decoded == ev and dmeta == meta
+seen = []
+d = m.BridgeEventDispatcher()
+m.register_payment_failed(d, lambda payload, meta2: seen.append(payload))
+d.dispatch(env)
+assert seen == [ev]
 print("PY-OK")
 `;
     const out = execFileSync('python3', ['-c', script]).toString().trim();
