@@ -1,2 +1,45 @@
-skills/
+# Dependencies
 node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Test & coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Environment & secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Sandbox / workspace artifacts (not part of the project)
+download/
+upload/
+skills/
+db/
+agent-ctx/
+worklog.md
+scripts/
+*.log
+logs/
+
+# Editor & OS
+.vscode/
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Bridge local state
+.bridge-cache/
+bridge.lock

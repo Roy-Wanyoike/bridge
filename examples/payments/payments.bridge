@@ -1,0 +1,38 @@
+// Bridge IDL example: a minimal payments contract.
+// This file is the canonical example used in the README and docs.
+
+package payments.v1
+
+type Money {
+    amount: int64
+    currency: string @length(3)
+}
+
+enum PaymentStatus {
+    PENDING
+    COMPLETED
+    FAILED
+    REFUNDED
+}
+
+type Payment {
+    id: uuid
+    customer_id: uuid
+    amount: Money
+    status: PaymentStatus
+    created_at: timestamp
+}
+
+type CreatePaymentRequest {
+    customer_id: uuid
+    amount: Money
+}
+
+type GetPaymentRequest {
+    id: uuid
+}
+
+service Payments {
+    CreatePayment(CreatePaymentRequest) -> Payment
+    GetPayment(GetPaymentRequest) -> Payment
+}

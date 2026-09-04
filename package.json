@@ -1,0 +1,22 @@
+{
+  "name": "bridge-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bridge — One contract. Every language. Zero interoperability drift.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Roy-Wanyoike/bridge.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b packages/*",
+    "test": "npm test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  }
+}
