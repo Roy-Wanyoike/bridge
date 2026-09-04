@@ -12,7 +12,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { encodeCbor, encodeMsgpack, canonicalJson } from '../dist/index.js';
+import pkg from '../dist/index.js';
+const { encodeCbor, encodeMsgpack, canonicalJson, valueToTagged } = pkg;
 import { BridgeSet, BridgeTimestamp } from '../dist/types.js';
 
 const require = createRequire(import.meta.url);
@@ -22,6 +23,9 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const enc = (id, value) => ({
   id,
+  /** Tagged model — the unambiguous mapping every runtime implements. */
+  model: valueToTagged(value),
+  /** Canonical JSON of the value (integers as exact digits). */
   json: canonicalJson(value),
   msgpack: Buffer.from(encodeMsgpack(value)).toString('hex'),
   cbor: Buffer.from(encodeCbor(value)).toString('hex'),
@@ -92,12 +96,7 @@ const vectors = [
 // in the verifier).
 const payload = {
   profile: 'bridge-serialization v1 (docs/SERIALIZATION.md)',
-  vectors: vectors.map((v) => ({
-    id: v.id,
-    json: v.json,
-    msgpack: v.msgpack,
-    cbor: v.cbor,
-  })),
+  vectors,
 };
 fs.writeFileSync(path.join(outDir, 'vectors.json'), JSON.stringify(payload, null, 2) + '\n');
 console.log(`wrote ${vectors.length} vectors to ${path.join(outDir, 'vectors.json')}`);

@@ -42,3 +42,7 @@ Thumbs.db
 # Bridge local state
 .bridge-cache/
 bridge.lock
+
+# Serialization runtimes build output
+packages/bridge-serialization/runtimes/rust/target/
+packages/bridge-serialization/runtimes/go/bridge-serialization-verify

@@ -33,6 +33,7 @@ import {
   MAX_I64,
   MAX_U64,
   MIN_I64,
+  sortedMapKeys,
 } from './types';
 
 export interface TaggedValue {
@@ -100,6 +101,37 @@ export function valueFromTagged(tagged: unknown): BridgeValue {
     default:
       throw new TypeError(`unknown tagged type: ${node.t}`);
   }
+}
+
+
+/**
+ * Inverse of {@link valueFromTagged}: renders a BridgeValue as the tagged
+ * JSON model. Map keys are emitted in canonical (bytewise-sorted) order and
+ * absent-optional keys are omitted, so identical values produce identical
+ * models — this is the representation golden vectors carry.
+ */
+export function valueToTagged(value: BridgeValue): TaggedValue {
+  if (value === null) return { t: 'null' };
+  if (typeof value === 'boolean') return { t: 'bool', v: value };
+  if (typeof value === 'bigint') {
+    if (value < 0n) return { t: 'i64', v: value.toString() };
+    return { t: 'u64', v: value.toString() };
+  }
+  if (typeof value === 'number') return { t: 'f64', v: value };
+  if (typeof value === 'string') return { t: 'str', v: value };
+  if (value instanceof Uint8Array) return { t: 'bytes', b64: Buffer.from(value).toString('base64') };
+  if (value instanceof BridgeTimestamp) return { t: 'timestamp', iso: value.toISO() };
+  if (value instanceof BridgeSet) return { t: 'set', v: value.entries.map(valueToTagged) };
+  if (Array.isArray(value)) return { t: 'array', v: value.map(valueToTagged) };
+  if (typeof value === 'object') {
+    const out: Record<string, TaggedValue> = {};
+    for (const key of sortedMapKeys(value as BridgeMap)) {
+      const inner = (value as BridgeMap)[key];
+      out[key] = inner === undefined ? { t: 'absent' } : valueToTagged(inner);
+    }
+    return { t: 'map', v: out };
+  }
+  throw new TypeError(`unsupported Bridge value: ${String(value)}`);
 }
 
 function assertBool(v: unknown): boolean {

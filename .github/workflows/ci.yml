@@ -73,3 +73,23 @@ jobs:
       - name: Generate + check + test Rust output
         run: |
           if [ -f scripts/verify-rust.sh ]; then bash scripts/verify-rust.sh; else echo "verify-rust.sh not yet present — skipping"; fi
+
+  serialization-matrix:
+    name: Cross-language serialization matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: pip install msgpack cbor2
+      - run: npm ci
+      - run: npm run build
+      - name: Run the 4-language golden-vector matrix
+        run: |
+          if [ -f scripts/verify-serialization.sh ]; then bash scripts/verify-serialization.sh; else echo "verify-serialization.sh not yet present — skipping"; fi

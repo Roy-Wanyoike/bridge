@@ -26,4 +26,4 @@ export {
 export { canonicalJson } from './canonical';
 export { encodeMsgpack, decodeMsgpack } from './msgpack';
 export { encodeCbor, decodeCbor } from './cbor';
-export { valueFromTagged, TaggedValue } from './tagged';
+export { valueFromTagged, valueToTagged, TaggedValue } from './tagged';
