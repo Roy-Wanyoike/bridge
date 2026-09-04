@@ -19,6 +19,7 @@
 
 import {
   compileSource,
+  formatSource,
   type CompileResult,
   type Diagnostic,
   type IRPackage,
@@ -32,9 +33,11 @@ import {
   type InitializeResult,
   type LspDiagnostic,
   type PublishDiagnosticsParams,
+  type TextEdit,
 } from './protocol';
 import {
   diagnosticRangeAt,
+  fullDocumentRange,
   identifierAt,
   toLspPosition,
 } from './positions';
@@ -144,6 +147,8 @@ export class BridgeLspServer {
         return this.respond(id, null);
       case Methods.Hover:
         return this.hover(id, params);
+      case Methods.Formatting:
+        return this.formatting(id, params);
       case Methods.DocumentDiagnostic:
         return this.pullDiagnostics(id, params);
       default:
@@ -281,6 +286,33 @@ export class BridgeLspServer {
       range,
     };
     this.respond(id, hover);
+  }
+
+  // ------------------------------------------------------------ formatting
+
+  /**
+   * `textDocument/formatting`: run the canonical Bridge formatter over the
+   * whole document and answer with ONE TextEdit replacing the entire text
+   * (the formatter is opinionated — client options like `tabSize` are not
+   * honored). Documents with syntax errors answer `null` (no edit).
+   */
+  private formatting(id: number | string | null, params: unknown): void {
+    const parsed = documentIdentifierParams(params);
+    if (parsed === undefined) {
+      return this.respondError(id, ErrorCodes.InvalidParams, 'Invalid params: expected { textDocument: { uri } }.');
+    }
+    const doc = this.documents.get(parsed.textDocument.uri);
+    if (doc === undefined) return this.respond(id, null);
+
+    const toPath = this.options.uriToPath ?? defaultUriToPath;
+    const result = formatSource(doc.text, toPath(doc.uri));
+    if (!result.ok || result.output === undefined) return this.respond(id, null);
+
+    const edit: TextEdit = {
+      range: fullDocumentRange(doc.text),
+      newText: result.output,
+    };
+    this.respond(id, [edit]);
   }
 
   // ---------------------------------------------------------- diagnostics
