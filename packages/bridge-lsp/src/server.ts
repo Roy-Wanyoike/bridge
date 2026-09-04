@@ -28,14 +28,17 @@ import {
   Methods,
   TextDocumentSyncKind,
   type DocumentDiagnosticReport,
+  type Hover,
   type InitializeResult,
   type LspDiagnostic,
   type PublishDiagnosticsParams,
 } from './protocol';
 import {
   diagnosticRangeAt,
+  identifierAt,
   toLspPosition,
 } from './positions';
+import { typeDeclToText } from './render';
 import { ErrorCodes, type JsonRpcErrorBody, type JsonRpcMessage } from './jsonrpc';
 
 export const SERVER_NAME = 'bridge-lsp';
@@ -139,6 +142,8 @@ export class BridgeLspServer {
       case Methods.Shutdown:
         this.shutdownRequested = true;
         return this.respond(id, null);
+      case Methods.Hover:
+        return this.hover(id, params);
       case Methods.DocumentDiagnostic:
         return this.pullDiagnostics(id, params);
       default:
@@ -237,6 +242,45 @@ export class BridgeLspServer {
     this.lastGoodIr.delete(uri);
     // Clear any diagnostics the editor is still showing for this document.
     this.sendNotification(Methods.PublishDiagnostics, { uri, diagnostics: [] } satisfies PublishDiagnosticsParams);
+  }
+
+  // ---------------------------------------------------------------- hover
+
+  /**
+   * `textDocument/hover`: when the cursor is on an identifier that names a
+   * type declared in the document (or named in the last clean IR), answer
+   * with a markdown block showing the full declaration. Anything else —
+   * unknown symbols, fields, keywords, no document — answers `null`.
+   */
+  private hover(id: number | string | null, params: unknown): void {
+    const parsed = hoverParams(params);
+    if (parsed === undefined) {
+      return this.respondError(id, ErrorCodes.InvalidParams, 'Invalid params: expected { textDocument: { uri }, position }.');
+    }
+    const uri = parsed.textDocument.uri;
+    const doc = this.documents.get(uri);
+    if (doc === undefined) return this.respond(id, null);
+
+    const range = identifierAt(doc.text, parsed.position);
+    if (range === undefined) return this.respond(id, null);
+
+    const word = doc.text
+      .split('\n')[range.start.line]
+      ?.slice(range.start.character, range.end.character);
+    if (word === undefined || word === '') return this.respond(id, null);
+
+    // Compile the CURRENT text; while it is broken, fall back to the last
+    // clean IR so hover keeps working across an editing mistake.
+    this.compile(uri, doc.text);
+    const ir = this.lastGoodIr.get(uri);
+    const definition = ir?.types.find((t) => t.name === word);
+    if (definition === undefined) return this.respond(id, null);
+
+    const hover: Hover = {
+      contents: { kind: 'markdown', value: hoverMarkdown(definition) },
+      range,
+    };
+    this.respond(id, hover);
   }
 
   // ---------------------------------------------------------- diagnostics
@@ -393,6 +437,34 @@ function didSaveParams(params: unknown): { textDocument: { uri: string }; text?:
 
 function didCloseParams(params: unknown): { textDocument: { uri: string } } | undefined {
   return documentIdentifierParams(params);
+}
+
+function hoverParams(params: unknown): {
+  textDocument: { uri: string };
+  position: { line: number; character: number };
+} | undefined {
+  if (!isRecord(params)) return undefined;
+  const doc = textDocumentOf(params);
+  const position = params.position;
+  if (doc === undefined || !isRecord(position)) return undefined;
+  if (typeof position.line !== 'number' || typeof position.character !== 'number') return undefined;
+  return { textDocument: doc, position: { line: position.line, character: position.character } };
+}
+
+/** Markdown payload for a hover: docs blockquote + ```bridge declaration. */
+function hoverMarkdown(definition: import('@bridge/core').IRTypeDefinition): string {
+  const parts: string[] = [];
+  if (definition.docs !== undefined) {
+    for (const line of definition.docs.split('\n')) {
+      parts.push(line.length > 0 ? `> ${line}` : '>');
+    }
+    parts.push('');
+  }
+  parts.push('```bridge', typeDeclToText(definition), '```');
+  if (definition.deprecated !== undefined) {
+    parts.push('', definition.deprecated === true ? '*deprecated*' : `*deprecated: ${definition.deprecated}*`);
+  }
+  return parts.join('\n');
 }
 
 function internalMessage(cause: unknown): string {
