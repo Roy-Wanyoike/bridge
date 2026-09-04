@@ -256,6 +256,14 @@ export function upperSnake(...parts: string[]): string {
 }
 
 /** Service method name -> snake_case client method (`CreatePayment` -> `create_payment`). */
+/** `OrderPlaced` → `ORDER_PLACED` — SCREAMING_SNAKE for generated constants. */
+export function camelToScreamingSnake(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
+    .toUpperCase();
+}
+
 export function camelToLowerSnake(name: string): string {
   return name
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
