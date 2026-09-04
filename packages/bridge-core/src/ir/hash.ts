@@ -12,6 +12,12 @@ import type { IRPackage } from './types';
  * Produce canonical JSON: object keys sorted recursively, arrays kept in
  * order (IR contract guarantees semantic order), no insignificant
  * whitespace. Undefined properties are omitted.
+ *
+ * NOTE (core-compiler agent): the recovered scaffold returned the
+ * intermediate canonicalized *object* here (with an `as string` cast), which
+ * made `hashPackage` throw on every call. The `JSON.stringify` step is the
+ * missing final encoding — this fix restores the documented contract and
+ * does not change the digest format: SHA-256 of the UTF-8 canonical JSON.
  */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));

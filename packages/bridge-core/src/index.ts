@@ -2,19 +2,54 @@
  * @bridge/core — the Bridge compiler: IDL front-end and canonical IR.
  *
  * Public API:
- * - `compileSource(text, filePath)` → CompileResult   (compiler pipeline)
- * - `parse` / lexer internals                         (exported for tooling)
- * - canonical IR types + `hashPackage`                (stable boundary)
+ * - `compileSource` / `compilePackage`   — compiler pipeline → canonical IR
+ * - `formatSource`                       — canonical source formatter
+ * - `formatDiagnostic` / `formatDiagnostics` — diagnostic rendering
+ * - `analyzeFile` / SEMANTIC_CODES       — semantic analysis (tooling)
+ * - `parse` / `tokenize` + AST nodes     — front-end internals (tooling)
+ * - canonical IR types + `hashPackage`   — stable boundary (frozen)
  */
+
+// Frozen canonical IR contract.
 export * from './ir/types';
 export * from './ir/hash';
+
+// Front-end internals, exported for tooling (linter, playground, docs).
+export * from './lexer';
+export * from './parser';
+export * from './ast';
+
+// Semantic analysis.
+export {
+  analyzeFile,
+  didYouMean,
+  levenshtein,
+  suggestionHint,
+  SEMANTIC_CODES,
+  INTERNAL_ERROR,
+  type AnalyzeOptions,
+} from './semantic';
+
+// Compiler pipeline.
+export {
+  bridgeCompiler,
+  compilePackage,
+  compileSource,
+} from './compiler/compile';
+
+// Formatter and diagnostic rendering.
+export { formatSource, type FormatResult } from './format';
+export {
+  formatDiagnostic,
+  formatDiagnostics,
+} from './diagnostics';
 
 import type { CompileResult, IRPackage } from './ir/types';
 
 /**
  * Compiler API implemented by the compiler pipeline (compiler/compile.ts).
  * Kept here as the typed surface that CLI, registry and tooling program
- * against. Agent note: implement in src/compiler/compile.ts and re-export.
+ * against. The concrete implementation is exported as `bridgeCompiler`.
  */
 export interface BridgeCompiler {
   /**

@@ -1,0 +1,766 @@
+     1→/**
+     2→ * Semantic analysis for the Bridge IDL.
+     3→ *
+     4→ * Runs after parsing over the best-effort AST and validates everything the
+     5→ * grammar cannot express: name resolution (with did-you-mean hints), duplicate
+     6→ * declarations, package/import hygiene, alias cycles, method signatures, map
+     7→ * key restrictions, optional-element restrictions and constraint
+     8→ * applicability. It also emits style warnings so `bridge check` can nudge
+     9→ * authors toward the canonical naming conventions without failing builds.
+    10→ *
+    11→ * The analyzer never throws: every problem becomes a diagnostic with a stable
+    12→ * `BR2xxx` code, a file/line/column position and, where actionable, a hint.
+    13→ *
+    14→ * Diagnostic codes (stable — registry and CLI surface them):
+    15→ * - BR2001 unknown type reference (errors, with did-you-mean hint when close)
+    16→ * - BR2002 duplicate top-level declaration name (type/event/service)
+    17→ * - BR2003 duplicate field / union-member name
+    18→ * - BR2004 duplicate enum variant name
+    19→ * - BR2005 duplicate method name
+    20→ * - BR2006 duplicate import
+    21→ * - BR2007 package statement problems (missing; parser reuses the code for
+    22→ *   placement/duplicates)
+    23→ * - BR2008 invalid package/import name (must be dotted lowercase identifier)
+    24→ * - BR2009 alias definition cycle
+    25→ * - BR2010 method input/output must be a named struct reference
+    26→ * - BR2011 map key must be a hashable primitive
+    27→ * - BR2012 optional wrapper on a list/set element
+    28→ * - BR2013 constraint not applicable to the field type
+    29→ * - BR2014 unknown constraint kind (emitted by the parser; listed here to
+    30→ *   keep the family documented in one place)
+    31→ * - BR2015 unknown imported package (compilePackage with dependencies)
+    32→ * - BR2101 type name not PascalCase (warning)
+    33→ * - BR2102 enum variant not SCREAMING_SNAKE_CASE (warning)
+    34→ * - BR2103 field name not snake_case (warning)
+    35→ */
+    36→
+    37→import type { Diagnostic, IRPackage, PrimitiveKind } from './ir/types';
+    38→import {
+    39→  CONSTRAINT_KINDS,
+    40→  MAP_KEY_PRIMITIVES,
+    41→  NUMERIC_PRIMITIVES,
+    42→  PRIMITIVES,
+    43→  PRIMITIVE_SET,
+    44→  isTypeDecl,
+    45→  typeToText,
+    46→  type AliasDeclNode,
+    47→  type BridgeFileNode,
+    48→  type EnumDeclNode,
+    49→  type FieldNode,
+    50→  type NamedTypeNode,
+    51→  type ServiceDeclNode,
+    52→  type TypeDeclNode,
+    53→  type TypeNode,
+    54→} from './ast';
+    55→
+    56→/** Stable diagnostic codes emitted by semantic analysis. */
+    57→export const SEMANTIC_CODES = {
+    58→  unknownType: 'BR2001',
+    59→  duplicateDeclaration: 'BR2002',
+    60→  duplicateField: 'BR2003',
+    61→  duplicateEnumVariant: 'BR2004',
+    62→  duplicateMethod: 'BR2005',
+    63→  duplicateImport: 'BR2006',
+    64→  packageStatement: 'BR2007',
+    65→  invalidDottedName: 'BR2008',
+    66→  aliasCycle: 'BR2009',
+    67→  methodSignature: 'BR2010',
+    68→  invalidMapKey: 'BR2011',
+    69→  optionalCollectionElement: 'BR2012',
+    70→  constraintNotApplicable: 'BR2013',
+    71→  unknownConstraint: 'BR2014',
+    72→  unknownImport: 'BR2015',
+    73→  typeNameStyle: 'BR2101',
+    74→  enumVariantStyle: 'BR2102',
+    75→  fieldNameStyle: 'BR2103',
+    76→} as const;
+    77→
+    78→/** Internal error code used by the compiler pipeline for unexpected failures. */
+    79→export const INTERNAL_ERROR = 'BR2999';
+    80→
+    81→/** A dotted lowercase identifier: `payments`, `payments.v1`, `a.b_c.d1`. */
+    82→const DOTTED_NAME_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$/;
+    83→
+    84→/** PascalCase for type declarations: `Money`, `PaymentStatus`, `HTTPError2`. */
+    85→const PASCAL_CASE_RE = /^[A-Z][A-Za-z0-9]*$/;
+    86→
+    87→/** SCREAMING_SNAKE_CASE for enum variants: `PENDING`, `RATE_LIMIT_5XX`. */
+    88→const SCREAMING_CASE_RE = /^[A-Z][A-Z0-9_]*$/;
+    89→
+    90→/** snake_case for fields: `customer_id`, `amount2`, `id`. */
+    91→const SNAKE_CASE_RE = /^[a-z][a-z0-9_]*$/;
+    92→
+    93→/** Options for {@link analyzeFile}. */
+    94→export interface AnalyzeOptions {
+    95→  /**
+    96→   * Already-compiled dependency packages used to resolve qualified type
+    97→   * references (`identity.v1.User`) and validate imports. When omitted
+    98→   * (`compileSource`), cross-package resolution is skipped and imports are
+    99→   * not checked for existence.
+   100→   */
+   101→  dependencies?: Map<string, IRPackage>;
+   102→}
+   103→
+   104→/**
+   105→ * Analyze a parsed Bridge file.
+   106→ *
+   107→ * Diagnostics are emitted in a deterministic order: package checks first,
+   108→ * then imports in source order, then declarations in source order (with
+   109→ * per-declaration checks in field/method order), then alias-cycle findings.
+   110→ */
+   111→export function analyzeFile(
+   112→  file: BridgeFileNode,
+   113→  filePath: string,
+   114→  options: AnalyzeOptions = {},
+   115→): Diagnostic[] {
+   116→  return new Analyzer(file, filePath, options.dependencies).run();
+   117→}
+   118→
+   119→// ---------------------------------------------------------------------------
+   120→
+   121→/** Result of resolving a type to a primitive for constraint checks. */
+   122→type PrimitiveResolution =
+   123→  | { found: true; primitive: PrimitiveKind }
+   124→  /** Named reference that could not be resolved (already diagnosed). */
+   125→  | { found: false };
+   126→
+   127→class Analyzer {
+   128→  private readonly diags: Diagnostic[] = [];
+   129→  private readonly deps: Map<string, IRPackage> | undefined;
+   130→  /** Local type declarations by name (first declaration wins for lookups). */
+   131→  private readonly localTypes = new Map<string, TypeDeclNode>();
+   132→  /** Local type names + primitives — did-you-mean candidate pool. */
+   133→  private readonly candidateNames: string[] = [];
+   134→  private ownPackage = '';
+   135→
+   136→  constructor(
+   137→    private readonly file: BridgeFileNode,
+   138→    private readonly filePath: string,
+   139→    dependencies?: Map<string, IRPackage>,
+   140→  ) {
+   141→    this.deps = dependencies;
+   142→  }
+   143→
+   144→  run(): Diagnostic[] {
+   145→    this.checkPackage();
+   146→    this.checkImports();
+   147→    this.collectLocalTypes();
+   148→    this.checkDeclarations();
+   149→    this.checkAliasCycles();
+   150→    return this.diags;
+   151→  }
+   152→
+   153→  // ------------------------------------------------------------- plumbing
+   154→
+   155→  private push(
+   156→    severity: Diagnostic['severity'],
+   157→    code: string,
+   158→    message: string,
+   159→    line: number,
+   160→    column: number,
+   161→    hint?: string,
+   162→  ): void {
+   163→    const d: Diagnostic = { severity, code, message, file: this.filePath, line, column };
+   164→    if (hint !== undefined) d.hint = hint;
+   165→    this.diags.push(d);
+   166→  }
+   167→
+   168→  private error(code: string, message: string, line: number, column: number, hint?: string): void {
+   169→    this.push('error', code, message, line, column, hint);
+   170→  }
+   171→
+   172→  private warning(code: string, message: string, line: number, column: number, hint?: string): void {
+   173→    this.push('warning', code, message, line, column, hint);
+   174→  }
+   175→
+   176→  // ------------------------------------------------------------- package
+   177→
+   178→  private checkPackage(): void {
+   179→    const pkg = this.file.package;
+   180→    if (pkg === undefined) {
+   181→      this.error(
+   182→        SEMANTIC_CODES.packageStatement,
+   183→        'Missing package statement — every Bridge file must declare its package.',
+   184→        1,
+   185→        1,
+   186→        'Add `package <name>` as the first statement, e.g. `package payments.v1`.',
+   187→      );
+   188→      return;
+   189→    }
+   190→    if (pkg.name !== '') {
+   191→      if (!DOTTED_NAME_RE.test(pkg.name)) {
+   192→        this.error(
+   193→          SEMANTIC_CODES.invalidDottedName,
+   194→          `Invalid package name \`${pkg.name}\`.`,
+   195→          pkg.line,
+   196→          pkg.column,
+   197→          'Package names are dotted lowercase identifiers: segments match [a-z][a-z0-9_]*, e.g. `payments.v1`.',
+   198→        );
+   199→      }
+   200→      this.ownPackage = pkg.name;
+   201→    }
+   202→  }
+   203→
+   204→  // ------------------------------------------------------------- imports
+   205→
+   206→  private checkImports(): void {
+   207→    const seen = new Set<string>();
+   208→    for (const imp of this.file.imports) {
+   209→      if (imp.name === '') continue; // parse error already reported
+   210→      if (seen.has(imp.name)) {
+   211→        this.error(
+   212→          SEMANTIC_CODES.duplicateImport,
+   213→          `Duplicate import of \`${imp.name}\`.`,
+   214→          imp.line,
+   215→          imp.column,
+   216→          'Remove the repeated import — each package may be imported at most once.',
+   217→        );
+   218→        continue;
+   219→      }
+   220→      seen.add(imp.name);
+   221→      if (!DOTTED_NAME_RE.test(imp.name)) {
+   222→        this.error(
+   223→          SEMANTIC_CODES.invalidDottedName,
+   224→          `Invalid import name \`${imp.name}\`.`,
+   225→          imp.line,
+   226→          imp.column,
+   227→          'Import names are dotted lowercase identifiers, e.g. `identity.v1`.',
+   228→        );
+   229→        continue;
+   230→      }
+   231→      if (this.deps !== undefined && !this.deps.has(imp.name)) {
+   232→        this.error(
+   233→          SEMANTIC_CODES.unknownImport,
+   234→          `Unknown imported package \`${imp.name}\`.`,
+   235→          imp.line,
+   236→          imp.column,
+   237→          'Imported packages must be compiled first and passed as dependencies to `compilePackage`.',
+   238→        );
+   239→      }
+   240→    }
+   241→  }
+   242→
+   243→  // -------------------------------------------------- local type collection
+   244→
+   245→  private collectLocalTypes(): void {
+   246→    // Primitive names join the did-you-mean pool so typos like `strng`
+   247→    // suggest `string`.
+   248→    this.candidateNames.push(...PRIMITIVES);
+   249→    for (const decl of this.file.decls) {
+   250→      if (!isTypeDecl(decl)) continue;
+   251→      if (!this.localTypes.has(decl.name)) {
+   252→        this.localTypes.set(decl.name, decl);
+   253→        this.candidateNames.push(decl.name);
+   254→      }
+   255→    }
+   256→  }
+   257→
+   258→  // ---------------------------------------------------------- declarations
+   259→
+   260→  private checkDeclarations(): void {
+   261→    const seenTypes = new Set<string>();
+   262→    const seenEvents = new Set<string>();
+   263→    const seenServices = new Set<string>();
+   264→
+   265→    for (const decl of this.file.decls) {
+   266→      if (isTypeDecl(decl)) {
+   267→        this.checkDuplicateName(seenTypes, decl.name, 'type', decl.line, decl.column);
+   268→        if (!PASCAL_CASE_RE.test(decl.name)) {
+   269→          this.warning(
+   270→            SEMANTIC_CODES.typeNameStyle,
+   271→            `Type name \`${decl.name}\` is not PascalCase.`,
+   272→            decl.line,
+   273→            decl.column,
+   274→            'Bridge type names start with an uppercase letter and use no underscores, e.g. `PaymentStatus`.',
+   275→          );
+   276→        }
+   277→        switch (decl.decl) {
+   278→          case 'struct':
+   279→            this.checkFieldBody(decl.fields, `struct \`${decl.name}\``);
+   280→            break;
+   281→          case 'union':
+   282→            this.checkFieldBody(decl.members, `union \`${decl.name}\``);
+   283→            break;
+   284→          case 'enum':
+   285→            this.checkEnum(decl);
+   286→            break;
+   287→          case 'alias':
+   288→            // Type-expression checks for the alias target run here so that
+   289→            // unknown references are reported in declaration order.
+   290→            this.checkTypeExpr(decl.target);
+   291→            break;
+   292→        }
+   293→      } else if (decl.decl === 'event') {
+   294→        this.checkDuplicateName(seenEvents, decl.name, 'event', decl.line, decl.column);
+   295→        this.checkFieldBody(decl.fields, `event \`${decl.name}\``);
+   296→      } else {
+   297→        this.checkDuplicateName(seenServices, decl.name, 'service', decl.line, decl.column);
+   298→        this.checkService(decl);
+   299→      }
+   300→    }
+   301→  }
+   302→
+   303→  private checkDuplicateName(
+   304→    seen: Set<string>,
+   305→    name: string,
+   306→    what: string,
+   307→    line: number,
+   308→    column: number,
+   309→  ): void {
+   310→    if (name === '') return; // parse error already reported
+   311→    if (seen.has(name)) {
+   312→      this.error(
+   313→        SEMANTIC_CODES.duplicateDeclaration,
+   314→        `Duplicate ${what} name \`${name}\`.`,
+   315→        line,
+   316→        column,
+   317→        `Rename one of the declarations — ${what} names must be unique within a package.`,
+   318→      );
+   319→    } else {
+   320→      seen.add(name);
+   321→    }
+   322→  }
+   323→
+   324→  // --------------------------------------------------------------- fields
+   325→
+   326→  private checkFieldBody(fields: FieldNode[], container: string): void {
+   327→    const seenFields = new Set<string>();
+   328→    for (const field of fields) {
+   329→      if (field.name === '') continue; // parse error already reported
+   330→      if (seenFields.has(field.name)) {
+   331→        this.error(
+   332→          SEMANTIC_CODES.duplicateField,
+   333→          `Duplicate field name \`${field.name}\` in ${container}.`,
+   334→          field.line,
+   335→          field.column,
+   336→          'Field names must be unique within a struct, union or event.',
+   337→        );
+   338→      } else {
+   339→        seenFields.add(field.name);
+   340→      }
+   341→      if (!SNAKE_CASE_RE.test(field.name)) {
+   342→        this.warning(
+   343→          SEMANTIC_CODES.fieldNameStyle,
+   344→          `Field name \`${field.name}\` is not snake_case.`,
+   345→          field.line,
+   346→          field.column,
+   347→          'Bridge field names are lowercase with underscores between words, e.g. `customer_id`.',
+   348→        );
+   349→      }
+   350→      this.checkTypeExpr(field.type);
+   351→      this.checkConstraints(field, container);
+   352→    }
+   353→  }
+   354→
+   355→  private checkEnum(decl: EnumDeclNode): void {
+   356→    const seen = new Set<string>();
+   357→    for (const variant of decl.variants) {
+   358→      if (variant.name === '') continue; // parse error already reported
+   359→      if (seen.has(variant.name)) {
+   360→        this.error(
+   361→          SEMANTIC_CODES.duplicateEnumVariant,
+   362→          `Duplicate variant name \`${variant.name}\` in enum \`${decl.name}\`.`,
+   363→          variant.line,
+   364→          variant.column,
+   365→          'Variant names must be unique within an enum.',
+   366→        );
+   367→      } else {
+   368→        seen.add(variant.name);
+   369→      }
+   370→      if (!SCREAMING_CASE_RE.test(variant.name)) {
+   371→        this.warning(
+   372→          SEMANTIC_CODES.enumVariantStyle,
+   373→          `Enum variant \`${variant.name}\` is not SCREAMING_SNAKE_CASE.`,
+   374→          variant.line,
+   375→          variant.column,
+   376→          'Bridge enum variants are all-uppercase with underscores between words, e.g. `PAYMENT_FAILED`.',
+   377→        );
+   378→      }
+   379→    }
+   380→  }
+   381→
+   382→  // ----------------------------------------------------------- type walks
+   383→
+   384→  private checkTypeExpr(t: TypeNode): void {
+   385→    switch (t.kind) {
+   386→      case 'primitive':
+   387→        return;
+   388→      case 'named':
+   389→        this.checkNamedRef(t);
+   390→        return;
+   391→      case 'list':
+   392→      case 'set': {
+   393→        if (t.element.kind === 'optional') {
+   394→          this.error(
+   395→            SEMANTIC_CODES.optionalCollectionElement,
+   396→            `Optional elements are not allowed inside \`${t.kind}\` types — \`${typeToText(t)}\` is invalid.`,
+   397→            t.element.line,
+   398→            t.element.column,
+   399→            'Wrap the whole collection instead: `ids: list<string>?` means the list itself may be absent.',
+   400→          );
+   401→          this.checkTypeExpr(t.element.inner);
+   402→          return;
+   403→        }
+   404→        this.checkTypeExpr(t.element);
+   405→        return;
+   406→      }
+   407→      case 'map': {
+   408→        if (t.key.kind !== 'primitive' || !MAP_KEY_PRIMITIVES.has(t.key.primitive)) {
+   409→          this.error(
+   410→            SEMANTIC_CODES.invalidMapKey,
+   411→            `Map key type \`${typeToText(t.key)}\` is not allowed — keys must be hashable primitives.`,
+   412→            t.key.line,
+   413→            t.key.column,
+   414→            `Allowed map key types: ${[...MAP_KEY_PRIMITIVES].join(', ')}.`,
+   415→          );
+   416→        }
+   417→        this.checkTypeExpr(t.value);
+   418→        return;
+   419→      }
+   420→      case 'optional':
+   421→        this.checkTypeExpr(t.inner);
+   422→        return;
+   423→      case 'error':
+   424→        return; // parse error already reported
+   425→    }
+   426→  }
+   427→
+   428→  private checkNamedRef(t: NamedTypeNode): void {
+   429→    if (t.package === undefined) {
+   430→      if (PRIMITIVE_SET.has(t.name)) return; // defensive: parser routes primitives
+   431→      if (this.localTypes.has(t.name)) return;
+   432→      this.error(
+   433→        SEMANTIC_CODES.unknownType,
+   434→        `Unknown type \`${t.name}\`.`,
+   435→        t.line,
+   436→        t.column,
+   437→        suggestionHint(t.name, this.candidateNames),
+   438→      );
+   439→      return;
+   440→    }
+   441→
+   442→    // Qualified reference `pkg.Type`.
+   443→    if (t.package === this.ownPackage) {
+   444→      // Self-qualified reference to the enclosing package resolves locally.
+   445→      if (this.localTypes.has(t.name)) return;
+   446→      this.error(
+   447→        SEMANTIC_CODES.unknownType,
+   448→        `Unknown type \`${t.package}.${t.name}\`.`,
+   449→        t.line,
+   450→        t.column,
+   451→        suggestionHint(t.name, this.candidateNames),
+   452→      );
+   453→      return;
+   454→    }
+   455→
+   456→    if (!this.importedPackages().has(t.package)) {
+   457→      const pkgSuggestion = didYouMean(t.package, [this.ownPackage, ...this.importedPackages()]);
+   458→      this.error(
+   459→        SEMANTIC_CODES.unknownType,
+   460→        `Unknown type \`${t.package}.${t.name}\` — package \`${t.package}\` is not imported.`,
+   461→        t.line,
+   462→        t.column,
+   463→        pkgSuggestion !== undefined
+   464→          ? `Did you mean package \`${pkgSuggestion}\`?`
+   465→          : `Add \`import ${t.package}\` below the package statement, or reference a type from an imported package.`,
+   466→      );
+   467→      return;
+   468→    }
+   469→
+   470→    const dep = this.deps?.get(t.package);
+   471→    if (dep === undefined) return; // no dependencies in compileSource — nothing deeper to check
+   472→    const depNames = dep.types.map((td) => td.name);
+   473→    if (!depNames.includes(t.name)) {
+   474→      this.error(
+   475→        SEMANTIC_CODES.unknownType,
+   476→        `Unknown type \`${t.package}.${t.name}\` — package \`${t.package}\` does not declare it.`,
+   477→        t.line,
+   478→        t.column,
+   479→        suggestionHint(t.name, depNames),
+   480→      );
+   481→    }
+   482→  }
+   483→
+   484→  private importedNamesCache: Set<string> | undefined;
+   485→
+   486→  private importedPackages(): Set<string> {
+   487→    if (this.importedNamesCache === undefined) {
+   488→      this.importedNamesCache = new Set(this.file.imports.map((i) => i.name));
+   489→    }
+   490→    return this.importedNamesCache;
+   491→  }
+   492→
+   493→  // ------------------------------------------------------------- services
+   494→
+   495→  private checkService(decl: ServiceDeclNode): void {
+   496→    const seen = new Set<string>();
+   497→    for (const method of decl.methods) {
+   498→      if (method.name === '') continue; // parse error already reported
+   499→      if (seen.has(method.name)) {
+   500→        this.error(
+   501→          SEMANTIC_CODES.duplicateMethod,
+   502→          `Duplicate method name \`${method.name}\` in service \`${decl.name}\`.`,
+   503→          method.line,
+   504→          method.column,
+   505→          'Method names must be unique within a service.',
+   506→        );
+   507→      } else {
+   508→        seen.add(method.name);
+   509→      }
+   510→      this.checkMethodSignature(method.name, 'input', method.input);
+   511→      this.checkMethodSignature(method.name, 'output', method.output);
+   512→    }
+   513→  }
+   514→
+   515→  private checkMethodSignature(
+   516→    methodName: string,
+   517→    what: 'input' | 'output',
+   518→    t: TypeNode,
+   519→  ): void {
+   520→    if (t.kind === 'error') return; // parse error already reported
+   521→    if (t.kind !== 'named') {
+   522→      this.error(
+   523→        SEMANTIC_CODES.methodSignature,
+   524→        `Method \`${methodName}\` ${what} must be a named struct reference, but \`${typeToText(t)}\` is not.`,
+   525→        t.line,
+   526→        t.column,
+   527→        'Declare a request/response struct and reference it by name, e.g. `CreatePayment(CreatePaymentRequest) -> Payment`.',
+   528→      );
+   529→      return;
+   530→    }
+   531→    // Resolve the named reference to a declaration and require a struct.
+   532→    // `checkNamedRef` reports unknown/unimported references first so that a
+   533→    // broken signature does not silently pass when the type is missing.
+   534→    this.checkNamedRef(t);
+   535→    const resolved = this.resolveNamed(t);
+   536→    if (resolved === undefined) return; // unknown reference already diagnosed
+   537→    if (resolved.decl !== 'struct') {
+   538→      this.error(
+   539→        SEMANTIC_CODES.methodSignature,
+   540→        `Method \`${methodName}\` ${what} \`${t.name}\` must reference a struct, but \`${t.name}\` is a ${resolved.decl}.`,
+   541→        t.line,
+   542→        t.column,
+   543→        `Change \`${t.name}\` to a struct, or wrap it in one, e.g. \`type ${t.name}Response { value: ${t.name} }\`.`,
+   544→      );
+   545→    }
+   546→  }
+   547→
+   548→  /**
+   549→   * Resolve a named type reference to a local declaration or a dependency's
+   550→   * type definition rendered as a pseudo-declaration. Returns undefined when
+   551→   * the reference is unknown (already diagnosed) or not checkable here.
+   552→   */
+   553→  private resolveNamed(t: NamedTypeNode): { decl: 'struct' | 'enum' | 'union' | 'alias' } | undefined {
+   554→    if (t.package === undefined || t.package === this.ownPackage) {
+   555→      const local = this.localTypes.get(t.name);
+   556→      return local === undefined ? undefined : { decl: local.decl };
+   557→    }
+   558→    if (!this.importedPackages().has(t.package)) return undefined;
+   559→    const dep = this.deps?.get(t.package);
+   560→    if (dep === undefined) return undefined;
+   561→    const depType = dep.types.find((td) => td.name === t.name);
+   562→    if (depType === undefined) return undefined;
+   563→    return { decl: depType.kind };
+   564→  }
+   565→
+   566→  // ---------------------------------------------------------- constraints
+   567→
+   568→  private checkConstraints(field: FieldNode, container: string): void {
+   569→    for (const constraint of field.constraints) {
+   570→      if (!CONSTRAINT_KINDS.has(constraint.kindName)) continue; // parser reported BR2014
+   571→      const underlying = field.type.kind === 'optional' ? field.type.inner : field.type;
+   572→      const numeric = constraint.kindName === 'min' || constraint.kindName === 'max';
+   573→      const resolved = this.resolveToPrimitive(underlying);
+   574→      if (resolved === undefined) continue; // unknown type — already diagnosed
+   575→      if (numeric && !NUMERIC_PRIMITIVES.has(resolved)) {
+   576→        this.error(
+   577→          SEMANTIC_CODES.constraintNotApplicable,
+   578→          `@${constraint.kindName} applies to numeric types only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+   579→          constraint.line,
+   580→          constraint.column,
+   581→          '@min/@max support int32, int64, uint32, uint64, float32, float64 and decimal fields.',
+   582→        );
+   583→      } else if (!numeric && resolved !== 'string') {
+   584→        this.error(
+   585→          SEMANTIC_CODES.constraintNotApplicable,
+   586→          `@${constraint.kindName} applies to string fields only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+   587→          constraint.line,
+   588→          constraint.column,
+   589→          '@length/@email/@url/@pattern/@uuid support `string` fields only.',
+   590→        );
+   591→      }
+   592→    }
+   593→  }
+   594→
+   595→  /**
+   596→   * Resolve a type expression to its underlying primitive, following local
+   597→   * aliases (cycle-safe). Returns undefined when the type is not primitive-
+   598→   * resolvable (struct/enum/union, composite, or an unknown reference that
+   599→   * was already diagnosed).
+   600→   */
+   601→  private resolveToPrimitive(t: TypeNode): PrimitiveKind | undefined {
+   602→    const visited = new Set<string>();
+   603→    let current: TypeNode = t;
+   604→    for (;;) {
+   605→      switch (current.kind) {
+   606→        case 'primitive':
+   607→          return current.primitive;
+   608→        case 'optional':
+   609→          current = current.inner;
+   610→          continue;
+   611→        case 'named': {
+   612→          if (current.package !== undefined && current.package !== this.ownPackage) return undefined;
+   613→          if (visited.has(current.name)) return undefined; // alias cycle — diagnosed separately
+   614→          visited.add(current.name);
+   615→          const decl = this.localTypes.get(current.name);
+   616→          if (decl === undefined) return undefined;
+   617→          if (decl.decl !== 'alias') return undefined;
+   618→          current = decl.target;
+   619→          continue;
+   620→        }
+   621→        default:
+   622→          return undefined;
+   623→      }
+   624→    }
+   625→  }
+   626→
+   627→  // --------------------------------------------------------- alias cycles
+   628→
+   629→  private checkAliasCycles(): void {
+   630→    // Direct alias→alias edges among local aliases (transitive via DFS).
+   631→    const edges = new Map<string, string[]>();
+   632→    for (const [name, decl] of this.localTypes) {
+   633→      if (decl.decl !== 'alias') continue;
+   634→      const targets = new Set<string>();
+   635→      this.collectAliasTargets(decl, targets, new Set());
+   636→      edges.set(name, [...targets]);
+   637→    }
+   638→
+   639→    const state = new Map<string, 0 | 1 | 2>(); // 0 = unvisited, 1 = in stack, 2 = done
+   640→    const stack: string[] = [];
+   641→    const visit = (name: string): void => {
+   642→      state.set(name, 1);
+   643→      stack.push(name);
+   644→      for (const next of edges.get(name) ?? []) {
+   645→        const s = state.get(next) ?? 0;
+   646→        if (s === 1) {
+   647→          // Cycle closes at `next`. Report once, at `next`'s declaration.
+   648→          const start = stack.indexOf(next);
+   649→          const cycle = [...stack.slice(start), next];
+   650→          const decl = this.localTypes.get(next);
+   651→          const line = decl?.line ?? 1;
+   652→          const column = decl?.column ?? 1;
+   653→          this.error(
+   654→            SEMANTIC_CODES.aliasCycle,
+   655→            `Alias \`${next}\` participates in a definition cycle: ${cycle.join(' -> ')}.`,
+   656→            line,
+   657→            column,
+   658→            'Break the cycle — Bridge aliases must resolve to a concrete type without referencing themselves.',
+   659→          );
+   660→        } else if (s === 0) {
+   661→          visit(next);
+   662→        }
+   663→      }
+   664→      stack.pop();
+   665→      state.set(name, 2);
+   666→    };
+   667→
+   668→    for (const name of edges.keys()) {
+   669→      if ((state.get(name) ?? 0) === 0) visit(name);
+   670→    }
+   671→  }
+   672→
+   673→  /** Collect local alias names referenced (directly) by an alias target. */
+   674→  private collectAliasTargets(
+   675→    decl: AliasDeclNode,
+   676→    out: Set<string>,
+   677→    guard: Set<TypeNode>,
+   678→  ): void {
+   679→    const walk = (t: TypeNode): void => {
+   680→      if (guard.has(t)) return; // defensive: AST nodes are acyclic
+   681→      guard.add(t);
+   682→      switch (t.kind) {
+   683→        case 'named':
+   684→          if (t.package === undefined || t.package === this.ownPackage) {
+   685→            const target = this.localTypes.get(t.name);
+   686→            if (target?.decl === 'alias') out.add(t.name);
+   687→          }
+   688→          return;
+   689→        case 'list':
+   690→        case 'set':
+   691→          walk(t.element);
+   692→          return;
+   693→        case 'map':
+   694→          walk(t.key);
+   695→          walk(t.value);
+   696→          return;
+   697→        case 'optional':
+   698→          walk(t.inner);
+   699→          return;
+   700→        default:
+   701→          return;
+   702→      }
+   703→    };
+   704→    walk(decl.target);
+   705→  }
+   706→}
+   707→
+   708→// ---------------------------------------------------------------------------
+   709→// Did-you-mean suggestions
+   710→// ---------------------------------------------------------------------------
+   711→
+   712→/**
+   713→ * Levenshtein edit distance (insert/delete/substitute), full DP over short
+   714→ * identifier-sized strings.
+   715→ */
+   716→export function levenshtein(a: string, b: string): number {
+   717→  const m = a.length;
+   718→  const n = b.length;
+   719→  if (m === 0) return n;
+   720→  if (n === 0) return m;
+   721→  let prev: number[] = [];
+   722→  for (let j = 0; j <= n; j++) prev.push(j);
+   723→  for (let i = 1; i <= m; i++) {
+   724→    const curr: number[] = [i];
+   725→    for (let j = 1; j <= n; j++) {
+   726→      const cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+   727→      curr.push(Math.min(
+   728→        (prev[j] ?? 0) + 1,
+   729→        (curr[j - 1] ?? 0) + 1,
+   730→        (prev[j - 1] ?? 0) + cost,
+   731→      ));
+   732→    }
+   733→    prev = curr;
+   734→  }
+   735→  return prev[n] ?? 0;
+   736→}
+   737→
+   738→/** Maximum edit distance for a did-you-mean suggestion. */
+   739→const MAX_SUGGESTION_DISTANCE = 2;
+   740→
+   741→/**
+   742→ * Pick the closest candidate within {@link MAX_SUGGESTION_DISTANCE} edits,
+   743→ * or undefined when nothing is close enough. Deterministic: ties are broken
+   744→ * by alphabetical order of the candidate list.
+   745→ */
+   746→export function didYouMean(name: string, candidates: Iterable<string>): string | undefined {
+   747→  let best: string | undefined;
+   748→  let bestDistance = MAX_SUGGESTION_DISTANCE + 1;
+   749→  for (const candidate of [...candidates].sort()) {
+   750→    if (candidate === name) continue;
+   751→    const distance = levenshtein(name, candidate);
+   752→    if (distance < bestDistance) {
+   753→      best = candidate;
+   754→      bestDistance = distance;
+   755→    }
+   756→  }
+   757→  if (best !== undefined && bestDistance > MAX_SUGGESTION_DISTANCE) return undefined;
+   758→  return best;
+   759→}
+   760→
+   761→/** Render a did-you-mean hint, or undefined when there is no suggestion. */
+   762→export function suggestionHint(name: string, candidates: Iterable<string>): string | undefined {
+   763→  const suggestion = didYouMean(name, candidates);
+   764→  return suggestion === undefined ? undefined : `Did you mean \`${suggestion}\`?`;
+   765→}
+   766→

@@ -1,0 +1,1036 @@
+     1→/**
+     2→ * Recursive-descent parser for the Bridge IDL.
+     3→ *
+     4→ * The parser never throws: every syntax error produces a diagnostic and
+     5→ * parsing recovers (skipping to the next line, brace or declaration
+     6→ * boundary) so a single pass reports as many errors as possible. The
+     7→ * resulting AST is best-effort: failed constructs carry error placeholders
+     8→ * that later stages know to ignore.
+     9→ *
+    10→ * Grammar (v1):
+    11→ * ```
+    12→ * file      := doc* packageDecl doc* importDecl* decl*
+    13→ * package   := 'package' dottedName
+    14→ * import    := 'import' dottedName
+    15→ * decl      := struct | enum | union | alias | service | event
+    16→ * struct    := 'type' NAME headerModifiers? '{' field* '}'
+    17→ * enum      := 'enum' NAME headerModifiers? '{' (variant)* '}'
+    18→ * union     := 'union' NAME headerModifiers? '{' field* '}'
+    19→ * alias     := 'alias' NAME headerModifiers? '=' type
+    20→ * service   := 'service' NAME '{' method* '}'
+    21→ * event     := 'event' NAME '{' field* '}'
+    22→ * field     := doc* NAME '?'? ':' type '?'? constraint* ('=' default)?
+    23→ * variant   := doc* NAME '@deprecated'?
+    24→ * method    := doc* NAME '(' type ')' '->' type '@deprecated'?
+    25→ * type      := 'list' '<' type '>' | 'set' '<' type '>' | 'map' '<' type ',' type '>'
+    26→ *            | primitive | dottedName '?'?
+    27→ * ```
+    28→ * Fields and variants are newline-separated: commas and semicolons are not
+    29→ * part of the grammar and produce errors with actionable hints.
+    30→ */
+    31→
+    32→import type { Diagnostic } from './ir/types';
+    33→import type { PrimitiveKind } from './ir/types';
+    34→import type { Token } from './lexer';
+    35→import {
+    36→  CONSTRAINT_KINDS,
+    37→  PRIMITIVE_SET,
+    38→  type AliasDeclNode,
+    39→  type BridgeFileNode,
+    40→  type ConstraintArgNode,
+    41→  type ConstraintNode,
+    42→  type EnumDeclNode,
+    43→  type EventDeclNode,
+    44→  type FieldNode,
+    45→  type ImportDeclNode,
+    46→  type MethodNode,
+    47→  type PackageDeclNode,
+    48→  type ServiceDeclNode,
+    49→  type StructDeclNode,
+    50→  type TypeNode,
+    51→  type UnionDeclNode,
+    52→  type DefaultValueNode,
+    53→  type VariantNode,
+    54→} from './ast';
+    55→
+    56→/** Syntax-error diagnostic code (lexer/parser family, BR1xxx). */
+    57→const SYNTAX_ERROR = 'BR1004';
+    58→/** Package-statement placement diagnostic code. */
+    59→const PACKAGE_ERROR = 'BR2007';
+    60→/** Unknown-constraint diagnostic code (emitted during parsing). */
+    61→const UNKNOWN_CONSTRAINT = 'BR2014';
+    62→
+    63→const DECL_KEYWORDS: ReadonlySet<string> = new Set([
+    64→  'type', 'enum', 'union', 'alias', 'service', 'event',
+    65→]);
+    66→
+    67→/** Result of parsing: the best-effort file AST plus diagnostics. */
+    68→export interface ParseResult {
+    69→  file: BridgeFileNode;
+    70→  diagnostics: Diagnostic[];
+    71→}
+    72→
+    73→/** Parse a token stream (from {@link tokenize}) into a Bridge file AST. */
+    74→export function parse(tokens: Token[], filePath: string): ParseResult {
+    75→  return new Parser(tokens, filePath).parseFile();
+    76→}
+    77→
+    78→/** Shape returned by `parseAtModifier` — either a deprecated marker, a constraint, or nothing. */
+    79→type ModifierResult =
+    80→  | { kind: 'deprecated'; value: string | true }
+    81→  | { kind: 'constraint'; constraint: ConstraintNode }
+    82→  | { kind: 'none' };
+    83→
+    84→class Parser {
+    85→  private idx = 0;
+    86→  private readonly diagnostics: Diagnostic[] = [];
+    87→  /** Doc comment lines waiting to be attached to the next declaration/field. */
+    88→  private pendingDocs: string[] = [];
+    89→
+    90→  constructor(
+    91→    private readonly tokens: Token[],
+    92→    private readonly filePath: string,
+    93→  ) {}
+    94→
+    95→  // ---------------------------------------------------------------- accessors
+    96→
+    97→  private peek(offset = 0): Token {
+    98→    const t = this.tokens[this.idx + offset];
+    99→    if (t !== undefined) return t;
+   100→    // Tokens always end with `eof`; fall back to it when out of range.
+   101→    const last = this.tokens[this.tokens.length - 1];
+   102→    return last ?? { kind: 'eof', text: '', line: 1, column: 1 };
+   103→  }
+   104→
+   105→  private next(): Token {
+   106→    const t = this.peek();
+   107→    if (t.kind !== 'eof') this.idx++;
+   108→    return t;
+   109→  }
+   110→
+   111→  private atPunct(text: string, offset = 0): boolean {
+   112→    const t = this.peek(offset);
+   113→    return t.kind === 'punct' && t.text === text;
+   114→  }
+   115→
+   116→  private atKeyword(text: string): boolean {
+   117→    const t = this.peek();
+   118→    return t.kind === 'keyword' && t.text === text;
+   119→  }
+   120→
+   121→  private err(
+   122→    code: string,
+   123→    message: string,
+   124→    tok: Token,
+   125→    hint?: string,
+   126→  ): void {
+   127→    const d: Diagnostic = {
+   128→      severity: 'error',
+   129→      code,
+   130→      message,
+   131→      file: this.filePath,
+   132→      line: tok.line,
+   133→      column: tok.column,
+   134→    };
+   135→    if (hint !== undefined) d.hint = hint;
+   136→    this.diagnostics.push(d);
+   137→  }
+   138→
+   139→  /** Human-readable description of a token for error messages. */
+   140→  private describe(tok: Token): string {
+   141→    switch (tok.kind) {
+   142→      case 'ident':
+   143→        return `\`${tok.text}\``;
+   144→      case 'keyword':
+   145→        return `keyword \`${tok.text}\``;
+   146→      case 'number':
+   147→        return `number \`${tok.text}\``;
+   148→      case 'string':
+   149→        return 'string literal';
+   150→      case 'punct':
+   151→        return `\`${tok.text}\``;
+   152→      case 'doc':
+   153→        return 'doc comment';
+   154→      case 'eof':
+   155→        return 'end of file';
+   156→    }
+   157→  }
+   158→
+   159→  /** Consume the current token if it is the expected punctuation. */
+   160→  private expectPunct(text: string, message?: string, hint?: string): boolean {
+   161→    if (this.atPunct(text)) {
+   162→      this.next();
+   163→      return true;
+   164→    }
+   165→    this.err(
+   166→      SYNTAX_ERROR,
+   167→      message ?? `Expected \`${text}\` but found ${this.describe(this.peek())}.`,
+   168→      this.peek(),
+   169→      hint,
+   170→    );
+   171→    return false;
+   172→  }
+   173→
+   174→  /** Consume an identifier, or report an error and return an empty name. */
+   175→  private expectIdent(what: string): { name: string; token: Token } {
+   176→    const t = this.peek();
+   177→    if (t.kind === 'ident') {
+   178→      this.next();
+   179→      return { name: t.text, token: t };
+   180→    }
+   181→    this.err(
+   182→      SYNTAX_ERROR,
+   183→      `Expected ${what} but found ${this.describe(t)}.`,
+   184→      t,
+   185→      'Names are identifiers made of letters, digits and underscores.',
+   186→    );
+   187→    return { name: '', token: t };
+   188→  }
+   189→
+   190→  /** Join and clear pending doc comments. */
+   191→  private takeDocs(): string | undefined {
+   192→    if (this.pendingDocs.length === 0) return undefined;
+   193→    const joined = this.pendingDocs.join('\n');
+   194→    this.pendingDocs = [];
+   195→    return joined;
+   196→  }
+   197→
+   198→  /**
+   199→   * Parse `name.segment...` (used for package and import names).
+   200→   * Returns the dotted name as written; empty when unparseable.
+   201→   */
+   202→  private parseDottedName(what: string): string {
+   203→    const first = this.expectIdent(what);
+   204→    if (first.name === '') return '';
+   205→    let name = first.name;
+   206→    while (this.atPunct('.')) {
+   207→      this.next();
+   208→      const seg = this.expectIdent(`${what} segment after \`.\``);
+   209→      if (seg.name === '') break;
+   210→      name += `.${seg.name}`;
+   211→    }
+   212→    return name;
+   213→  }
+   214→
+   215→  /** Skip tokens until a declaration keyword, `package`/`import`, or EOF. */
+   216→  private skipToDeclaration(): void {
+   217→    for (;;) {
+   218→      const t = this.peek();
+   219→      if (t.kind === 'eof') return;
+   220→      if (t.kind === 'keyword') return; // decl keywords and package/import
+   221→      this.next();
+   222→    }
+   223→  }
+   224→
+   225→  // ------------------------------------------------------------------- file
+   226→
+   227→  parseFile(): ParseResult {
+   228→    const file: BridgeFileNode = { imports: [], decls: [] };
+   229→    let seenDecl = false;
+   230→
+   231→    for (;;) {
+   232→      const tok = this.peek();
+   233→      if (tok.kind === 'eof') break;
+   234→
+   235→      if (tok.kind === 'doc') {
+   236→        this.pendingDocs.push(tok.text);
+   237→        this.next();
+   238→        continue;
+   239→      }
+   240→
+   241→      if (tok.kind === 'keyword') {
+   242→        if (tok.text === 'package') {
+   243→          if (file.package !== undefined) {
+   244→            this.err(
+   245→              PACKAGE_ERROR,
+   246→              'Duplicate package statement — a file may declare only one package.',
+   247→              tok,
+   248→            );
+   249→            this.next();
+   250→            this.parseDottedName('package name');
+   251→            continue;
+   252→          }
+   253→          if (seenDecl || file.imports.length > 0) {
+   254→            this.err(
+   255→              PACKAGE_ERROR,
+   256→              'The package statement must be the first statement in the file.',
+   257→              tok,
+   258→              'Move `package <name>` above every import and declaration.',
+   259→            );
+   260→          }
+   261→          const docs = this.takeDocs();
+   262→          this.next(); // consume `package`
+   263→          const nameTok = this.peek();
+   264→          const name = this.parseDottedName('package name');
+   265→          const pkg: PackageDeclNode = {
+   266→            name,
+   267→            line: nameTok.line,
+   268→            column: nameTok.column,
+   269→          };
+   270→          if (docs !== undefined) pkg.docs = docs;
+   271→          file.package = pkg;
+   272→          continue;
+   273→        }
+   274→
+   275→        if (tok.text === 'import') {
+   276→          if (seenDecl) {
+   277→            this.err(
+   278→              SYNTAX_ERROR,
+   279→              'Unexpected `import` after declarations — imports must appear before types, services and events.',
+   280→              tok,
+   281→              'Move all `import` statements directly below the `package` statement.',
+   282→            );
+   283→          }
+   284→          this.next(); // consume `import`
+   285→          const nameTok = this.peek();
+   286→          const name = this.parseDottedName('imported package name');
+   287→          const imp: ImportDeclNode = {
+   288→            name,
+   289→            line: nameTok.line,
+   290→            column: nameTok.column,
+   291→          };
+   292→          file.imports.push(imp);
+   293→          continue;
+   294→        }
+   295→
+   296→        // One of the declaration keywords.
+   297→        seenDecl = true;
+   298→        file.decls.push(this.parseDecl());
+   299→        continue;
+   300→      }
+   301→
+   302→      // Unexpected token at file scope.
+   303→      this.err(
+   304→        SYNTAX_ERROR,
+   305→        `Unexpected ${this.describe(tok)} at file scope — expected a declaration.`,
+   306→        tok,
+   307→        'Top-level declarations start with one of: type, enum, union, alias, service, event.',
+   308→      );
+   309→      this.next();
+   310→      this.skipToDeclaration();
+   311→    }
+   312→
+   313→    return { file, diagnostics: this.diagnostics };
+   314→  }
+   315→
+   316→  // ------------------------------------------------------------- declarations
+   317→
+   318→  private parseDecl(): StructDeclNode | EnumDeclNode | UnionDeclNode | AliasDeclNode | ServiceDeclNode | EventDeclNode {
+   319→    const t = this.peek();
+   320→    switch (t.text) {
+   321→      case 'type':
+   322→        return this.parseStruct();
+   323→      case 'enum':
+   324→        return this.parseEnum();
+   325→      case 'union':
+   326→        return this.parseUnion();
+   327→      case 'alias':
+   328→        return this.parseAlias();
+   329→      case 'service':
+   330→        return this.parseService();
+   331→      case 'event':
+   332→        return this.parseEvent();
+   333→      default: {
+   334→        // Unreachable: callers only dispatch declaration keywords.
+   335→        this.err(SYNTAX_ERROR, `Unexpected keyword \`${t.text}\`.`, t);
+   336→        this.next();
+   337→        return { decl: 'struct', name: '', fields: [], line: t.line, column: t.column };
+   338→      }
+   339→    }
+   340→  }
+   341→
+   342→  /** Parse `@deprecated` / constraint modifiers that may follow a type header name. */
+   343→  private parseHeaderModifiers(
+   344→    declKind: string,
+   345→    allowDeprecated: boolean,
+   346→  ): string | true | undefined {
+   347→    let deprecated: string | true | undefined;
+   348→    while (this.atPunct('@')) {
+   349→      const at = this.peek();
+   350→      const mod = this.parseAtModifier();
+   351→      if (mod.kind === 'deprecated') {
+   352→        if (!allowDeprecated) {
+   353→          this.err(
+   354→            SYNTAX_ERROR,
+   355→            `@deprecated is not supported on ${declKind}s.`,
+   356→            at,
+   357→          );
+   358→        } else {
+   359→          deprecated = mod.value;
+   360→        }
+   361→      } else if (mod.kind === 'constraint') {
+   362→        this.err(
+   363→          SYNTAX_ERROR,
+   364→          `Only @deprecated is allowed on a ${declKind} header — \`@${mod.constraint.kindName}\` cannot be used here.`,
+   365→          at,
+   366→          'Validation constraints belong on fields, e.g. `count: int32 @min(0)`.',
+   367→        );
+   368→      }
+   369→    }
+   370→    return deprecated;
+   371→  }
+   372→
+   373→  private parseStruct(): StructDeclNode {
+   374→    const kw = this.next(); // `type`
+   375→    const docs = this.takeDocs();
+   376→    const { name } = this.expectIdent('a type name');
+   377→    const deprecated = this.parseHeaderModifiers('type', true);
+   378→    this.expectPunct(
+   379→      '{',
+   380→      `Expected \`{\` to open the body of type \`${name}\`.`,
+   381→      'Structs are written `type Name { field: type }`.',
+   382→    );
+   383→    const fields = this.parseFieldBody(name, 'type');
+   384→    const node: StructDeclNode = { decl: 'struct', name, fields, line: kw.line, column: kw.column };
+   385→    if (docs !== undefined) node.docs = docs;
+   386→    if (deprecated !== undefined) node.deprecated = deprecated;
+   387→    return node;
+   388→  }
+   389→
+   390→  private parseUnion(): UnionDeclNode {
+   391→    const kw = this.next(); // `union`
+   392→    const docs = this.takeDocs();
+   393→    const { name } = this.expectIdent('a union name');
+   394→    const deprecated = this.parseHeaderModifiers('union', true);
+   395→    this.expectPunct(
+   396→      '{',
+   397→      `Expected \`{\` to open the body of union \`${name}\`.`,
+   398→      'Unions are written `union Name { member: Type }`.',
+   399→    );
+   400→    const members = this.parseFieldBody(name, 'union');
+   401→    const node: UnionDeclNode = { decl: 'union', name, members, line: kw.line, column: kw.column };
+   402→    if (docs !== undefined) node.docs = docs;
+   403→    if (deprecated !== undefined) node.deprecated = deprecated;
+   404→    return node;
+   405→  }
+   406→
+   407→  private parseEvent(): EventDeclNode {
+   408→    const kw = this.next(); // `event`
+   409→    const docs = this.takeDocs();
+   410→    const { name } = this.expectIdent('an event name');
+   411→    this.parseHeaderModifiers('event', false);
+   412→    this.expectPunct(
+   413→      '{',
+   414→      `Expected \`{\` to open the body of event \`${name}\`.`,
+   415→      'Events are written `event Name { field: type }`.',
+   416→    );
+   417→    const fields = this.parseFieldBody(name, 'event');
+   418→    const node: EventDeclNode = { decl: 'event', name, fields, line: kw.line, column: kw.column };
+   419→    if (docs !== undefined) node.docs = docs;
+   420→    return node;
+   421→  }
+   422→
+   423→  /**
+   424→   * Parse the newline-separated field body of a struct/union/event until `}`
+   425→   * or EOF. Recovers at declaration boundaries so a missing `}` does not
+   426→   * swallow the rest of the file.
+   427→   */
+   428→  private parseFieldBody(containerName: string, kind: string): FieldNode[] {
+   429→    const fields: FieldNode[] = [];
+   430→    for (;;) {
+   431→      const tok = this.peek();
+   432→      if (tok.kind === 'eof') {
+   433→        this.err(
+   434→          SYNTAX_ERROR,
+   435→          `Unexpected end of file inside ${kind} \`${containerName}\` — missing closing \`}\`.`,
+   436→          tok,
+   437→          'Add a `}` to close the body.',
+   438→        );
+   439→        break;
+   440→      }
+   441→      if (tok.kind === 'punct' && tok.text === '}') {
+   442→        this.next();
+   443→        break;
+   444→      }
+   445→      if (tok.kind === 'doc') {
+   446→        this.pendingDocs.push(tok.text);
+   447→        this.next();
+   448→        continue;
+   449→      }
+   450→      if (tok.kind === 'punct' && (tok.text === ',' || tok.text === ';')) {
+   451→        this.err(
+   452→          SYNTAX_ERROR,
+   453→          tok.text === ','
+   454→            ? `Unexpected \`,\` in ${kind} body — fields are separated by newlines, not commas.`
+   455→            : `Unexpected \`;\` in ${kind} body — fields are separated by newlines; semicolons are not part of the grammar.`,
+   456→          tok,
+   457→          'Remove the punctuation and put each field on its own line.',
+   458→        );
+   459→        this.next();
+   460→        continue;
+   461→      }
+   462→      if (tok.kind === 'keyword' && DECL_KEYWORDS.has(tok.text)) {
+   463→        this.err(
+   464→          SYNTAX_ERROR,
+   465→          `Expected \`}\` before \`${tok.text}\` — the ${kind} body \`${containerName}\` is not closed.`,
+   466→          tok,
+   467→        );
+   468→        break; // leave the token for the outer declaration loop
+   469→      }
+   470→      if (tok.kind === 'ident') {
+   471→        fields.push(this.parseField());
+   472→        continue;
+   473→      }
+   474→      this.err(
+   475→        SYNTAX_ERROR,
+   476→        `Unexpected ${this.describe(tok)} in ${kind} body — expected a field.`,
+   477→        tok,
+   478→        'Fields are written `name: type`.',
+   479→      );
+   480→      this.next();
+   481→    }
+   482→    return fields;
+   483→  }
+   484→
+   485→  private parseField(): FieldNode {
+   486→    const docs = this.takeDocs();
+   487→    const nameTok = this.next(); // identifier (caller verified)
+   488→
+   489→    let optional = false;
+   490→    if (this.atPunct('?')) {
+   491→      optional = true;
+   492→      this.next();
+   493→    }
+   494→    this.expectPunct(
+   495→      ':',
+   496→      `Expected \`:\` after field name \`${nameTok.text}\`.`,
+   497→      'Fields are written `name: type`.',
+   498→    );
+   499→
+   500→    const parsedType = this.parseType();
+   501→    // `parseType` consumes a trailing `?` itself (wrapping the type), so the
+   502→    // marker must be recovered from the node to keep `name: T?` and `name?: T`
+   503→    // equivalent at the field level.
+   504→    if (this.atPunct('?')) {
+   505→      optional = true;
+   506→      this.next();
+   507→    } else if (parsedType.kind === 'optional') {
+   508→      optional = true;
+   509→    }
+   510→
+   511→    const constraints: ConstraintNode[] = [];
+   512→    let deprecated: string | true | undefined;
+   513→    for (;;) {
+   514→      if (!this.atPunct('@')) break;
+   515→      const at = this.peek();
+   516→      const mod = this.parseAtModifier();
+   517→      if (mod.kind === 'deprecated') {
+   518→        deprecated = mod.value;
+   519→      } else if (mod.kind === 'constraint') {
+   520→        constraints.push(mod.constraint);
+   521→      } else {
+   522→        // `parseAtModifier` already reported; make sure we always progress.
+   523→        if (this.peek() === at) this.next();
+   524→      }
+   525→    }
+   526→
+   527→    let defaultValue: DefaultValueNode | undefined;
+   528→    if (this.atPunct('=')) {
+   529→      this.next();
+   530→      defaultValue = this.parseDefaultValue();
+   531→    }
+   532→
+   533→    // Lenient trailing `?` after constraints/default.
+   534→    if (this.atPunct('?')) {
+   535→      optional = true;
+   536→      this.next();
+   537→    }
+   538→
+   539→    const node: FieldNode = {
+   540→      name: nameTok.text,
+   541→      type: parsedType,
+   542→      optional,
+   543→      constraints,
+   544→      line: nameTok.line,
+   545→      column: nameTok.column,
+   546→    };
+   547→    if (docs !== undefined) node.docs = docs;
+   548→    if (deprecated !== undefined) node.deprecated = deprecated;
+   549→    if (defaultValue !== undefined) node.defaultValue = defaultValue;
+   550→    return node;
+   551→  }
+   552→
+   553→  private parseEnum(): EnumDeclNode {
+   554→    const kw = this.next(); // `enum`
+   555→    const docs = this.takeDocs();
+   556→    const { name } = this.expectIdent('an enum name');
+   557→    const deprecated = this.parseHeaderModifiers('enum', true);
+   558→    this.expectPunct(
+   559→      '{',
+   560→      `Expected \`{\` to open the body of enum \`${name}\`.`,
+   561→      'Enum variants are SCREAMING_CASE names separated by newlines.',
+   562→    );
+   563→    const variants: VariantNode[] = [];
+   564→    for (;;) {
+   565→      const tok = this.peek();
+   566→      if (tok.kind === 'eof') {
+   567→        this.err(
+   568→          SYNTAX_ERROR,
+   569→          `Unexpected end of file inside enum \`${name}\` — missing closing \`}\`.`,
+   570→          tok,
+   571→          'Add a `}` to close the body.',
+   572→        );
+   573→        break;
+   574→      }
+   575→      if (tok.kind === 'punct' && tok.text === '}') {
+   576→        this.next();
+   577→        break;
+   578→      }
+   579→      if (tok.kind === 'doc') {
+   580→        this.pendingDocs.push(tok.text);
+   581→        this.next();
+   582→        continue;
+   583→      }
+   584→      if (tok.kind === 'punct' && (tok.text === ',' || tok.text === ';')) {
+   585→        this.err(
+   586→          SYNTAX_ERROR,
+   587→          tok.text === ','
+   588→            ? 'Unexpected `,` in enum body — variants are separated by newlines, not commas.'
+   589→            : 'Unexpected `;` in enum body — variants are separated by newlines; semicolons are not part of the grammar.',
+   590→          tok,
+   591→          'Remove the punctuation and put each variant on its own line.',
+   592→        );
+   593→        this.next();
+   594→        continue;
+   595→      }
+   596→      if (tok.kind === 'keyword' && DECL_KEYWORDS.has(tok.text)) {
+   597→        this.err(
+   598→          SYNTAX_ERROR,
+   599→          `Expected \`}\` before \`${tok.text}\` — the enum body \`${name}\` is not closed.`,
+   600→          tok,
+   601→        );
+   602→        break;
+   603→      }
+   604→      if (tok.kind === 'ident') {
+   605→        variants.push(this.parseVariant());
+   606→        continue;
+   607→      }
+   608→      this.err(
+   609→        SYNTAX_ERROR,
+   610→        `Unexpected ${this.describe(tok)} in enum body — expected a variant name.`,
+   611→        tok,
+   612→      );
+   613→      this.next();
+   614→    }
+   615→    const node: EnumDeclNode = { decl: 'enum', name, variants, line: kw.line, column: kw.column };
+   616→    if (docs !== undefined) node.docs = docs;
+   617→    if (deprecated !== undefined) node.deprecated = deprecated;
+   618→    return node;
+   619→  }
+   620→
+   621→  private parseVariant(): VariantNode {
+   622→    const docs = this.takeDocs();
+   623→    const nameTok = this.next(); // identifier
+   624→    let deprecated: string | true | undefined;
+   625→    while (this.atPunct('@')) {
+   626→      const at = this.peek();
+   627→      const mod = this.parseAtModifier();
+   628→      if (mod.kind === 'deprecated') {
+   629→        deprecated = mod.value;
+   630→      } else if (mod.kind === 'constraint') {
+   631→        this.err(
+   632→          SYNTAX_ERROR,
+   633→          `Constraints are not allowed on enum variants — only @deprecated.`,
+   634→          at,
+   635→        );
+   636→      }
+   637→    }
+   638→    const node: VariantNode = { name: nameTok.text, line: nameTok.line, column: nameTok.column };
+   639→    if (docs !== undefined) node.docs = docs;
+   640→    if (deprecated !== undefined) node.deprecated = deprecated;
+   641→    return node;
+   642→  }
+   643→
+   644→  private parseAlias(): AliasDeclNode {
+   645→    const kw = this.next(); // `alias`
+   646→    const docs = this.takeDocs();
+   647→    const { name } = this.expectIdent('an alias name');
+   648→    const deprecated = this.parseHeaderModifiers('alias', true);
+   649→    this.expectPunct(
+   650→      '=',
+   651→      `Expected \`=\` in alias \`${name}\`.`,
+   652→      'Aliases are written `alias Name = Type`.',
+   653→    );
+   654→    const target = this.parseType();
+   655→    const node: AliasDeclNode = { decl: 'alias', name, target, line: kw.line, column: kw.column };
+   656→    if (docs !== undefined) node.docs = docs;
+   657→    if (deprecated !== undefined) node.deprecated = deprecated;
+   658→    return node;
+   659→  }
+   660→
+   661→  private parseService(): ServiceDeclNode {
+   662→    const kw = this.next(); // `service`
+   663→    const docs = this.takeDocs();
+   664→    const { name } = this.expectIdent('a service name');
+   665→    this.parseHeaderModifiers('service', false);
+   666→    this.expectPunct(
+   667→      '{',
+   668→      `Expected \`{\` to open the body of service \`${name}\`.`,
+   669→      'Methods are written `Name(Input) -> Output`.',
+   670→    );
+   671→    const methods: MethodNode[] = [];
+   672→    for (;;) {
+   673→      const tok = this.peek();
+   674→      if (tok.kind === 'eof') {
+   675→        this.err(
+   676→          SYNTAX_ERROR,
+   677→          `Unexpected end of file inside service \`${name}\` — missing closing \`}\`.`,
+   678→          tok,
+   679→          'Add a `}` to close the body.',
+   680→        );
+   681→        break;
+   682→      }
+   683→      if (tok.kind === 'punct' && tok.text === '}') {
+   684→        this.next();
+   685→        break;
+   686→      }
+   687→      if (tok.kind === 'doc') {
+   688→        this.pendingDocs.push(tok.text);
+   689→        this.next();
+   690→        continue;
+   691→      }
+   692→      if (tok.kind === 'punct' && (tok.text === ',' || tok.text === ';')) {
+   693→        this.err(
+   694→          SYNTAX_ERROR,
+   695→          tok.text === ','
+   696→            ? 'Unexpected `,` in service body — methods are separated by newlines, not commas.'
+   697→            : 'Unexpected `;` in service body — methods are separated by newlines; semicolons are not part of the grammar.',
+   698→          tok,
+   699→          'Remove the punctuation and put each method on its own line.',
+   700→        );
+   701→        this.next();
+   702→        continue;
+   703→      }
+   704→      if (tok.kind === 'keyword' && DECL_KEYWORDS.has(tok.text)) {
+   705→        this.err(
+   706→          SYNTAX_ERROR,
+   707→          `Expected \`}\` before \`${tok.text}\` — the service body \`${name}\` is not closed.`,
+   708→          tok,
+   709→        );
+   710→        break;
+   711→      }
+   712→      if (tok.kind === 'ident') {
+   713→        methods.push(this.parseMethod());
+   714→        continue;
+   715→      }
+   716→      this.err(
+   717→        SYNTAX_ERROR,
+   718→        `Unexpected ${this.describe(tok)} in service body — expected a method.`,
+   719→        tok,
+   720→        'Methods are written `Name(Input) -> Output`.',
+   721→      );
+   722→      this.next();
+   723→    }
+   724→    const node: ServiceDeclNode = { decl: 'service', name, methods, line: kw.line, column: kw.column };
+   725→    if (docs !== undefined) node.docs = docs;
+   726→    return node;
+   727→  }
+   728→
+   729→  private parseMethod(): MethodNode {
+   730→    const docs = this.takeDocs();
+   731→    const nameTok = this.next(); // identifier
+   732→
+   733→    let input: TypeNode = { kind: 'error', line: nameTok.line, column: nameTok.column };
+   734→    let output: TypeNode = { kind: 'error', line: nameTok.line, column: nameTok.column };
+   735→
+   736→    if (this.expectPunct(
+   737→      '(',
+   738→      `Expected \`(\` after method name \`${nameTok.text}\`.`,
+   739→      'Methods are written `Name(Input) -> Output`.',
+   740→    )) {
+   741→      input = this.parseType();
+   742→      this.expectPunct(')', `Expected \`)\` after the input type of method \`${nameTok.text}\`.`);
+   743→    }
+   744→    if (this.atPunct('->')) {
+   745→      this.next();
+   746→      output = this.parseType();
+   747→    } else {
+   748→      this.err(
+   749→        SYNTAX_ERROR,
+   750→        `Expected \`->\` in method \`${nameTok.text}\` — methods are written \`Name(Input) -> Output\`.`,
+   751→        this.peek(),
+   752→      );
+   753→      // Lenient recovery: if an identifier follows, treat it as the output type.
+   754→      if (this.peek().kind === 'ident') {
+   755→        output = this.parseType();
+   756→      }
+   757→    }
+   758→
+   759→    let deprecated: string | true | undefined;
+   760→    while (this.atPunct('@')) {
+   761→      const at = this.peek();
+   762→      const mod = this.parseAtModifier();
+   763→      if (mod.kind === 'deprecated') {
+   764→        deprecated = mod.value;
+   765→      } else if (mod.kind === 'constraint') {
+   766→        this.err(
+   767→          SYNTAX_ERROR,
+   768→          `Constraints are not allowed on methods — only @deprecated.`,
+   769→          at,
+   770→        );
+   771→      }
+   772→    }
+   773→
+   774→    const node: MethodNode = {
+   775→      name: nameTok.text,
+   776→      input,
+   777→      output,
+   778→      line: nameTok.line,
+   779→      column: nameTok.column,
+   780→    };
+   781→    if (docs !== undefined) node.docs = docs;
+   782→    if (deprecated !== undefined) node.deprecated = deprecated;
+   783→    return node;
+   784→  }
+   785→
+   786→  // --------------------------------------------------------------- modifiers
+   787→
+   788→  /**
+   789→   * Parse an `@name(...)` modifier. The `@` must be the current token.
+   790→   * Returns the deprecated marker for `@deprecated`, a constraint node for
+   791→   * known constraint kinds, or nothing (after reporting) for unknown names.
+   792→   */
+   793→  private parseAtModifier(): ModifierResult {
+   794→    const at = this.next(); // `@`
+   795→    const kindTok = this.peek();
+   796→    if (kindTok.kind !== 'ident') {
+   797→      this.err(
+   798→        SYNTAX_ERROR,
+   799→        `Expected a constraint name after \`@\` but found ${this.describe(kindTok)}.`,
+   800→        kindTok,
+   801→        'Known constraints: @min, @max, @length, @email, @url, @pattern, @uuid.',
+   802→      );
+   803→      return { kind: 'none' };
+   804→    }
+   805→    this.next(); // constraint name
+   806→
+   807→    if (kindTok.text === 'deprecated') {
+   808→      const args = this.parseArgList();
+   809→      if (args.length === 0) return { kind: 'deprecated', value: true };
+   810→      if (args.length === 1 && args[0]?.isString) {
+   811→        return { kind: 'deprecated', value: args[0].text };
+   812→      }
+   813→      this.err(
+   814→        SYNTAX_ERROR,
+   815→        '@deprecated takes at most one string literal argument.',
+   816→        kindTok,
+   817→        'Use `@deprecated` or `@deprecated("explanation")`.',
+   818→      );
+   819→      return { kind: 'deprecated', value: true };
+   820→    }
+   821→
+   822→    if (CONSTRAINT_KINDS.has(kindTok.text)) {
+   823→      const args = this.parseArgList();
+   824→      return {
+   825→        kind: 'constraint',
+   826→        constraint: {
+   827→          kindName: kindTok.text,
+   828→          args,
+   829→          line: at.line,
+   830→          column: at.column,
+   831→        },
+   832→      };
+   833→    }
+   834→
+   835→    this.err(
+   836→      UNKNOWN_CONSTRAINT,
+   837→      `Unknown constraint \`@${kindTok.text}\`.`,
+   838→      kindTok,
+   839→      'Known constraints: @min, @max, @length, @email, @url, @pattern, @uuid.',
+   840→    );
+   841→    this.skipParenGroup();
+   842→    return { kind: 'none' };
+   843→  }
+   844→
+   845→  /**
+   846→   * Parse an optional parenthesized argument list `(a, b, ...)` for a
+   847→   * constraint. Arguments are kept as written; quoted strings are recorded
+   848→   * so the formatter can re-quote them. Commas are separators here (unlike
+   849→   * field bodies).
+   850→   */
+   851→  private parseArgList(): ConstraintArgNode[] {
+   852→    const args: ConstraintArgNode[] = [];
+   853→    if (!this.atPunct('(')) return args;
+   854→    this.next(); // `(`
+   855→    for (;;) {
+   856→      const tok = this.peek();
+   857→      if (tok.kind === 'eof') {
+   858→        this.err(SYNTAX_ERROR, 'Unclosed `(` in constraint arguments.', tok, 'Add a closing `)`.');
+   859→        break;
+   860→      }
+   861→      if (tok.kind === 'punct' && tok.text === ')') {
+   862→        this.next();
+   863→        break;
+   864→      }
+   865→      if (tok.kind === 'punct' && tok.text === '(') {
+   866→        this.next(); // tolerate nesting without mis-pairing
+   867→        continue;
+   868→      }
+   869→      if (tok.kind === 'punct' && tok.text === ',') {
+   870→        this.next();
+   871→        continue;
+   872→      }
+   873→      if (tok.kind === 'string') {
+   874→        args.push({ text: tok.text, isString: true });
+   875→        this.next();
+   876→        continue;
+   877→      }
+   878→      if (tok.kind === 'number') {
+   879→        args.push({ text: tok.text, isString: false });
+   880→        this.next();
+   881→        continue;
+   882→      }
+   883→      if (tok.kind === 'punct' && tok.text === '-') {
+   884→        this.next();
+   885→        const num = this.peek();
+   886→        if (num.kind === 'number') {
+   887→          args.push({ text: `-${num.text}`, isString: false });
+   888→          this.next();
+   889→        } else {
+   890→          this.err(SYNTAX_ERROR, 'Expected a number after `-` in constraint argument.', num);
+   891→        }
+   892→        continue;
+   893→      }
+   894→      if (tok.kind === 'ident') {
+   895→        args.push({ text: tok.text, isString: false });
+   896→        this.next();
+   897→        continue;
+   898→      }
+   899→      this.err(
+   900→        SYNTAX_ERROR,
+   901→        `Unexpected ${this.describe(tok)} in constraint arguments.`,
+   902→        tok,
+   903→      );
+   904→      this.next();
+   905→    }
+   906→    return args;
+   907→  }
+   908→
+   909→  /** Skip a balanced-ish `(...)` group after an unknown constraint name. */
+   910→  private skipParenGroup(): void {
+   911→    if (!this.atPunct('(')) return;
+   912→    this.next();
+   913→    let depth = 1;
+   914→    while (depth > 0) {
+   915→      const tok = this.peek();
+   916→      if (tok.kind === 'eof') return;
+   917→      if (tok.kind === 'punct' && tok.text === '(') depth++;
+   918→      if (tok.kind === 'punct' && tok.text === ')') depth--;
+   919→      this.next();
+   920→    }
+   921→  }
+   922→
+   923→  private parseDefaultValue(): DefaultValueNode | undefined {
+   924→    const tok = this.peek();
+   925→    if (tok.kind === 'string') {
+   926→      this.next();
+   927→      return { text: tok.text, isString: true };
+   928→    }
+   929→    if (tok.kind === 'number') {
+   930→      this.next();
+   931→      return { text: tok.text, isString: false };
+   932→    }
+   933→    if (tok.kind === 'ident') {
+   934→      this.next();
+   935→      return { text: tok.text, isString: false };
+   936→    }
+   937→    if (tok.kind === 'punct' && tok.text === '-') {
+   938→      this.next();
+   939→      const num = this.peek();
+   940→      if (num.kind === 'number') {
+   941→        this.next();
+   942→        return { text: `-${num.text}`, isString: false };
+   943→      }
+   944→      this.err(SYNTAX_ERROR, 'Expected a number after `-` in default value.', num);
+   945→      return undefined;
+   946→    }
+   947→    this.err(
+   948→      SYNTAX_ERROR,
+   949→      `Expected a default value but found ${this.describe(tok)}.`,
+   950→      tok,
+   951→      'Defaults are written `field: type = value` and may be a string, number or identifier.',
+   952→    );
+   953→    return undefined;
+   954→  }
+   955→
+   956→  // -------------------------------------------------------------------- types
+   957→
+   958→  /**
+   959→   * Parse a type expression: primitives, named (possibly package-qualified)
+   960→   * references, or `list<T>` / `set<T>` / `map<K, V>` composites, each
+   961→   * optionally followed by `?` (producing an optional wrapper).
+   962→   *
+   963→   * On failure reports an error and returns an `error` node **without
+   964→   * consuming** the offending token — the caller's loop makes progress.
+   965→   */
+   966→  private parseType(): TypeNode {
+   967→    const tok = this.peek();
+   968→    let result: TypeNode;
+   969→
+   970→    if (tok.kind === 'ident') {
+   971→      const name = tok.text;
+   972→      const nextTok = this.peek(1);
+   973→      const isComposite =
+   974→        (name === 'list' || name === 'set' || name === 'map') &&
+   975→        nextTok.kind === 'punct' &&
+   976→        nextTok.text === '<';
+   977→
+   978→      if (isComposite) {
+   979→        this.next(); // composite name
+   980→        this.next(); // `<`
+   981→        if (name === 'map') {
+   982→          const key = this.parseType();
+   983→          this.expectPunct(
+   984→            ',',
+   985→            'Expected `,` between the key and value types of a map.',
+   986→            'Map types are written `map<K, V>`.',
+   987→          );
+   988→          const value = this.parseType();
+   989→          this.expectPunct('>', 'Expected `>` to close the `map<` type.');
+   990→          result = { kind: 'map', key, value, line: tok.line, column: tok.column };
+   991→        } else {
+   992→          const element = this.parseType();
+   993→          this.expectPunct('>', `Expected \`>\` to close the \`${name}<\` type.`);
+   994→          result =
+   995→            name === 'list'
+   996→              ? { kind: 'list', element, line: tok.line, column: tok.column }
+   997→              : { kind: 'set', element, line: tok.line, column: tok.column };
+   998→        }
+   999→      } else if (PRIMITIVE_SET.has(name)) {
+  1000→        this.next();
+  1001→        result = { kind: 'primitive', primitive: name as PrimitiveKind, line: tok.line, column: tok.column };
+  1002→      } else {
+  1003→        this.next();
+  1004→        const segments: string[] = [name];
+  1005→        while (this.atPunct('.')) {
+  1006→          this.next();
+  1007→          const seg = this.expectIdent('a type name segment after `.`');
+  1008→          if (seg.name === '') break;
+  1009→          segments.push(seg.name);
+  1010→        }
+  1011→        if (segments.length === 1) {
+  1012→          result = { kind: 'named', name, line: tok.line, column: tok.column };
+  1013→        } else {
+  1014→          const typeName = segments[segments.length - 1] ?? name;
+  1015→          const pkg = segments.slice(0, -1).join('.');
+  1016→          result = { kind: 'named', name: typeName, package: pkg, line: tok.line, column: tok.column };
+  1017→        }
+  1018→      }
+  1019→    } else {
+  1020→      this.err(
+  1021→        SYNTAX_ERROR,
+  1022→        `Expected a type but found ${this.describe(tok)}.`,
+  1023→        tok,
+  1024→        'Types are primitives (string, int64, ...), named types, or composites like list<T> and map<K, V>.',
+  1025→      );
+  1026→      result = { kind: 'error', line: tok.line, column: tok.column };
+  1027→    }
+  1028→
+  1029→    if (this.atPunct('?')) {
+  1030→      this.next();
+  1031→      result = { kind: 'optional', inner: result, line: tok.line, column: tok.column };
+  1032→    }
+  1033→    return result;
+  1034→  }
+  1035→}
+  1036→
