@@ -13,7 +13,7 @@
  */
 import type { GeneratedFile, GeneratorInput } from './input';
 import type { IRField, IREvent, IRService } from '@bridge/core';
-import { camelToLowerSnake, rustCrateName, rustFieldName } from '../naming';
+import { camelToScreamingSnake, camelToLowerSnake, rustCrateName, rustFieldName } from '../naming';
 import { isLocalStructRef } from '../mappings';
 import { sortedEvents, sortedServices, sortedTypes, structZeroValuePassesValidation } from '../analysis';
 import { generatedFile } from '../util';
@@ -160,7 +160,7 @@ export function rustEventEnvelopeBlock(): string {
 export function rustEventV2(event: IREvent, input: GeneratorInput): string {
   let out = '';
   const snake = camelToLowerSnake(event.name);
-  const typeConst = `${event.name}_TYPE`;
+  const typeConst = `${camelToScreamingSnake(event.name)}_TYPE`;
   const fqType = `${input.packageName}.${event.name}`;
 
   out += `pub const ${typeConst}: &str = ${JSON.stringify(fqType)};\n\n`;
@@ -609,7 +609,7 @@ export function rustRoundtripTestFile(input: GeneratorInput): GeneratedFile | un
         lines.push(`        "specversion": "1.0",`);
         lines.push(`        "id": "evt-test-1",`);
         lines.push(`        "source": "test://bridge",`);
-        lines.push(`        "type": ${event.name}_TYPE,`);
+        lines.push(`        "type": ${camelToScreamingSnake(event.name)}_TYPE,`);
         lines.push(`        "time": "2026-01-01T00:00:00Z",`);
         lines.push(`        "data": {}`);
         lines.push('    });');
@@ -638,7 +638,7 @@ export function rustRoundtripTestFile(input: GeneratorInput): GeneratedFile | un
         lines.push(`    publish_${snake}(&bus, &payload, &meta).expect("publish");`);
         lines.push('    let published = bus.published();');
         lines.push('    assert_eq!(published.len(), 1);');
-        lines.push(`    assert_eq!(published[0].event_type, ${event.name}_TYPE);`);
+        lines.push(`    assert_eq!(published[0].event_type, ${camelToScreamingSnake(event.name)}_TYPE);`);
         lines.push('    let mut dispatcher = BridgeEventDispatcher::new();');
         lines.push(`    register_${snake}(&mut dispatcher, |payload, meta| {`);
         lines.push('        let _ = serde_json::to_value(&payload).expect("payload value");');

@@ -51,7 +51,7 @@ import { pythonDocstring, pythonFieldComment } from '../docs';
 import { NUMERIC_PRIMITIVES, renderTypeRef } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes } from '../analysis';
 import { pythonEventsFileV2, pythonServerBlocks } from './python-wire';
-import { camelToLowerSnake, pythonFieldName, pythonModuleName, rustCrateName } from '../naming';
+import { camelToScreamingSnake, camelToLowerSnake, pythonFieldName, pythonModuleName, rustCrateName } from '../naming';
 import type { GeneratedFile, GeneratorInput } from './input';
 
 /** Generates the Python project for an IR package. */
@@ -1053,11 +1053,12 @@ function pythonInitFile(
     lines.push(')');
     for (const event of sortedEvents(input.ir)) {
       const snake = camelToLowerSnake(event.name);
-      lines.push(`from .events import ${event.name}, ${event.name}_TYPE, ${event.name}Publisher, ${event.name}Handler`);
+      const screaming = camelToScreamingSnake(event.name);
+      lines.push(`from .events import ${event.name}, ${screaming}_TYPE, ${event.name}Publisher, ${event.name}Handler`);
       lines.push(`from .events import create_${snake}_publisher, encode_${snake}, decode_${snake}, register_${snake}`);
       names.push(
         event.name,
-        `${event.name}_TYPE`,
+        `${screaming}_TYPE`,
         `${event.name}Publisher`,
         `${event.name}Handler`,
         `create_${snake}_publisher`,

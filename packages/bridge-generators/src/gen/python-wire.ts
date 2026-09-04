@@ -15,6 +15,7 @@
  */
 import type { GeneratedFile, GeneratorInput } from './input';
 import {
+  camelToScreamingSnake,
   camelToLowerSnake,
 } from '../naming';
 import {
@@ -189,7 +190,7 @@ export function pythonEventsFileV2(
 function renderEventPayload(event: IREvent, input: GeneratorInput): string {
   const lines: string[] = [];
   const snake = camelToLowerSnake(event.name);
-  const typeConst = `${event.name}_TYPE`;
+  const typeConst = `${camelToScreamingSnake(event.name)}_TYPE`;
   const fqType = eventTypeName(input.packageName, event.name);
 
   lines.push('');
