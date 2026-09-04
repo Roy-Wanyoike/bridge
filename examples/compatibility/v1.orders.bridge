@@ -1,0 +1,16 @@
+// Bridge IDL: orders contract, revision 1 — the published baseline.
+
+package orders.v1
+
+enum OrderStatus {
+    PENDING
+    SHIPPED
+    DELIVERED
+}
+
+type Order {
+    id: uuid
+    quantity: int32
+    status: OrderStatus
+    created_at: timestamp
+}

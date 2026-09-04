@@ -1,0 +1,33 @@
+// Bridge IDL: an orders contract that depends on payments.v1.
+// Used by the registry demo to show the dependents graph.
+
+package orders.v1
+
+import payments.v1
+
+enum OrderStatus {
+    PENDING
+    PAID
+    SHIPPED
+}
+
+type Order {
+    id: uuid
+    customer_id: uuid
+    total: payments.v1.Money
+    status: OrderStatus
+}
+
+type CreateOrderRequest {
+    customer_id: uuid
+    total: payments.v1.Money
+}
+
+event OrderPlaced {
+    order_id: uuid
+    total: payments.v1.Money
+}
+
+service Orders {
+    PlaceOrder(CreateOrderRequest) -> Order
+}

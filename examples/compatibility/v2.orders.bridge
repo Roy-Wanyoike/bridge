@@ -1,0 +1,23 @@
+// Bridge IDL: orders contract, revision 2 — the candidate.
+//
+// Two compatible changes vs revision 1:
+// - adds optional field  Order.note  (SAFE)
+// - widens the counter   Order.quantity  int32 -> int64  (WARNING: widening
+//   primitive changes are tolerated by every generated language; TS consumers
+//   see the documented 2^53 precision caveat)
+
+package orders.v1
+
+enum OrderStatus {
+    PENDING
+    SHIPPED
+    DELIVERED
+}
+
+type Order {
+    id: uuid
+    quantity: int64
+    status: OrderStatus
+    note: string?
+    created_at: timestamp
+}

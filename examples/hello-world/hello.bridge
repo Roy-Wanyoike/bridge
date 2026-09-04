@@ -1,0 +1,8 @@
+// Bridge IDL: the smallest possible Bridge contract.
+
+package hello.v1
+
+type Greeting {
+    name: string @length(1)
+    message: string?
+}

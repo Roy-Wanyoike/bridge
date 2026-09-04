@@ -1,0 +1,23 @@
+// Bridge IDL: payments contract, revision 1 — the published baseline.
+
+package payments.v1
+
+type Money {
+    amount: int64
+    currency: string @length(3)
+}
+
+enum PaymentStatus {
+    PENDING
+    COMPLETED
+    FAILED
+}
+
+type Payment {
+    id: uuid
+    customer_id: uuid
+    amount: Money
+    currency: string @length(3)
+    status: PaymentStatus
+    created_at: timestamp
+}
