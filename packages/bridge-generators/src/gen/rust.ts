@@ -49,6 +49,13 @@ import type {
 import { generatedFile } from '../util';
 import { fileHeader, headerLines } from '../header';
 import { docLines, rustDoc } from '../docs';
+import {
+  rustEventEnvelopeBlock,
+  rustEventV2,
+  rustRoundtripTestFile,
+  rustServerPrelude,
+  rustServiceHttp,
+} from './rust-wire';
 import { findLocalType, isLocalEnumRef, isLocalStructRef, renderTypeRef } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes } from '../analysis';
 import { camelToLowerSnake, rustCrateName, rustFieldName, rustVariantName, serdeRenameAllMatches } from '../naming';
@@ -76,6 +83,8 @@ export function generateRust(input: GeneratorInput): GeneratedFile[] {
   for (const [, file] of modules) {
     if (file !== undefined) files.push(file);
   }
+  const roundtripTest = rustRoundtripTestFile(input);
+  if (roundtripTest !== undefined) files.push(roundtripTest);
   return files;
 }
 
@@ -119,14 +128,14 @@ function rustDeprecatedAttr(deprecated: string | true | undefined): string {
 }
 
 /** Rust type for a field; optional fields are wrapped in Option. */
-function rustFieldType(field: IRField, input: GeneratorInput): string {
+export function rustFieldType(field: IRField, input: GeneratorInput): string {
   const base = renderTypeRef(field.type, input.render);
   if (field.optional && field.type.kind !== 'optional') return `Option<${base}>`;
   return base;
 }
 
 /** serde attribute list for a field. */
-function rustFieldSerdeAttrs(field: IRField): string[] {
+export function rustFieldSerdeAttrs(field: IRField): string[] {
   const attrs: string[] = [];
   const named = rustFieldName(field.name);
   if (named.rename !== undefined) attrs.push(`rename = ${JSON.stringify(named.rename)}`);
@@ -137,7 +146,7 @@ function rustFieldSerdeAttrs(field: IRField): string[] {
 }
 
 /** Result of scanning refs for local named targets. */
-interface LocalRefs {
+export interface LocalRefs {
   /** Local named types that are NOT enums (structs, aliases, unions). */
   readonly types: Set<string>;
   readonly enums: Set<string>;
@@ -145,7 +154,7 @@ interface LocalRefs {
   usesBTreeSet: boolean;
 }
 
-function emptyLocalRefs(): LocalRefs {
+export function emptyLocalRefs(): LocalRefs {
   return { types: new Set(), enums: new Set(), usesBTreeMap: false, usesBTreeSet: false };
 }
 
@@ -158,7 +167,7 @@ function isLocalType(
   return findLocalType(input.ir, ref.name) !== undefined;
 }
 
-function scanRef(ref: TypeRef, input: GeneratorInput, into: LocalRefs): void {
+export function scanRef(ref: TypeRef, input: GeneratorInput, into: LocalRefs): void {
   switch (ref.kind) {
     case 'primitive':
       break;
@@ -185,7 +194,7 @@ function scanRef(ref: TypeRef, input: GeneratorInput, into: LocalRefs): void {
 }
 
 /** Renders a sorted `use` list for one path prefix. */
-function rustUseList(prefix: string, names: Iterable<string>): string | undefined {
+export function rustUseList(prefix: string, names: Iterable<string>): string | undefined {
   const sorted = [...names].sort();
   if (sorted.length === 0) return undefined;
   if (sorted.length === 1) return `use ${prefix}::${sorted[0]};`;
@@ -193,7 +202,7 @@ function rustUseList(prefix: string, names: Iterable<string>): string | undefine
 }
 
 /** File preamble: header, crate-level docs, then use statements. */
-function rustFilePreamble(input: GeneratorInput, crateDocs: string[], uses: string[]): string {
+export function rustFilePreamble(input: GeneratorInput, crateDocs: string[], uses: string[]): string {
   const parts: string[] = [fileHeader('rust', input.packageName)];
   const docLinesOut = crateDocs.map((line) => `//! ${line}`);
   if (docLinesOut.length > 0) parts.push('', docLinesOut.join('\n'));
@@ -718,11 +727,21 @@ function rustServicesFile(input: GeneratorInput): GeneratedFile | undefined {
   for (const service of services) {
     body += rustService(service, input);
   }
+  body += rustServerPrelude();
+  body += '\n';
+  for (const service of services) {
+    body += rustServiceHttp(service, input);
+    body += '\n';
+  }
 
   const parts = [
     rustFilePreamble(
       input,
-      ['Service traits generated from the Bridge package (serde-only; transport left to the embedder).'],
+      [
+        'Service traits, the canonical error-code table and stdlib-TCP JSON-over-HTTP',
+        'clients/servers generated from the Bridge package.',
+        'Wire shape: POST /<package>/<Service>/<Method>.',
+      ],
       uses,
     ),
     '',
@@ -743,8 +762,8 @@ function rustService(service: IRService, input: GeneratorInput): string {
   const docLinesOut = [
     ...docLines(service.docs),
     `${service.name} is the Bridge service trait for the ${service.name} service.`,
-    'Sync methods returning Result<T, String>; serde-only in v1, the HTTP',
-    `transport binding is POST /${input.packageName}/${service.name}/<Method>.`,
+    'Sync methods returning Result<T, String>; bind to HTTP with the generated',
+    `client/server pair (POST /${input.packageName}/${service.name}/<Method>).`,
   ];
   const doc = rustDoc(docLinesOut.join('\n'));
   if (doc.length > 0) out += `${doc}\n`;
@@ -778,15 +797,22 @@ function rustEventsFile(input: GeneratorInput): GeneratedFile | undefined {
   const enumsUse = rustUseList('crate::enums', refs.enums);
   if (enumsUse !== undefined) uses.push(enumsUse);
 
-  let body = '';
+  let body = rustEventEnvelopeBlock() + '\n';
   for (const event of events) {
     body += rustEvent(event, input);
+    body += rustEventV2(event, input);
+    body += '\n';
   }
 
   const parts = [
     rustFilePreamble(
       input,
-      ['Event payloads and the Bridge wire envelope: {"event": name, "payload": {...}}.'],
+      [
+        'Event payloads and the CloudEvents-style Bridge envelope:',
+        '{specversion: "1.0", id, source, type: "<package>.<Event>", time, data}.',
+        'id, source and time are ALWAYS caller-supplied: generated code contains',
+        'no clocks and no uuid generation.',
+      ],
       uses,
     ),
     '',
@@ -810,35 +836,5 @@ function rustEvent(event: IREvent, input: GeneratorInput): string {
     out += `    pub ${rustFieldName(field.name).name}: ${rustFieldType(field, input)},\n`;
   }
   out += '}\n\n';
-
-  out += `/// Wire envelope for ${event.name}: {"event": name, "payload": {...}}.\n`;
-  out += '#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n';
-  out += `pub struct ${event.name}Envelope {\n`;
-  out += `    pub event: String,\n`;
-  out += `    pub payload: ${event.name},\n`;
-  out += '}\n\n';
-
-  out += `impl ${event.name} {\n`;
-  out += `    /// Wraps the event in the Bridge wire envelope.\n`;
-  out += `    pub fn envelope(&self) -> ${event.name}Envelope {\n`;
-  out += `        ${event.name}Envelope {\n`;
-  out += `            event: ${JSON.stringify(event.name)}.to_string(),\n`;
-  out += `            payload: self.clone(),\n`;
-  out += `        }\n`;
-  out += `    }\n\n`;
-  out += `    /// Decodes an envelope from its JSON text, verifying the event name.\n`;
-  out += `    pub fn decode_envelope(data: &str) -> Result<${event.name}Envelope, String> {\n`;
-  out += `        let envelope: ${event.name}Envelope =\n`;
-  out += `            serde_json::from_str(data).map_err(|err| err.to_string())?;\n`;
-  out += `        if envelope.event != ${JSON.stringify(event.name)} {\n`;
-  out += `            return Err(format!(\n`;
-  out += `                "unexpected event {:?}, want {:?}",\n`;
-  out += `                envelope.event,\n`;
-  out += `                ${JSON.stringify(event.name)}\n`;
-  out += `            ));\n`;
-  out += `        }\n`;
-  out += `        Ok(envelope)\n`;
-  out += `    }\n`;
-  out += `}\n\n`;
   return out;
 }

@@ -1033,7 +1033,7 @@ function tsEventEnvelopeBlock(): string {
   out += `export class InMemoryEventBus implements EventPublisher {\n`;
   out += `  private readonly subscribers = new Map<\n`;
   out += `    string,\n`;
-  out += `    Array<(envelope: BridgeEventEnvelope<unknown>) => void | Promise<void>>,\n`;
+  out += `    Array<(envelope: BridgeEventEnvelope<unknown>) => void | Promise<void>>\n`;
   out += `  >();\n\n`;
   out += `  subscribe(\n`;
   out += `    type: string,\n`;
@@ -1135,7 +1135,7 @@ function tsEventDispatcher(events: readonly IREvent[]): string {
   out += `export class BridgeEventDispatcher {\n`;
   out += `  private readonly handlers = new Map<\n`;
   out += `    string,\n`;
-  out += `    Array<(payload: unknown, meta: BridgeEventMeta) => void | Promise<void>>,\n`;
+  out += `    Array<(payload: unknown, meta: BridgeEventMeta) => void | Promise<void>>\n`;
   out += `  >();\n\n`;
   for (const event of events) {
     out += `  ${tsDoc(`Registers a handler for ${event.name} events.`)}\n`;
