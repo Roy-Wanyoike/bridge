@@ -86,7 +86,7 @@ Every target below is generated from the same IR — types, enums, tagged unions
 
 ## Status
 
-**Bridge 0.1.0 — the Phase 1 foundation is complete and tested: 311+ tests green across five packages.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
+**Bridge 0.1.0 — the Phase 1 foundation is complete and tested: 355+ tests green across five packages.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
 
 | Area | Status |
 |------|--------|
@@ -100,7 +100,7 @@ Every target below is generated from the same IR — types, enums, tagged unions
 | Examples + docs + verification scripts | ✅ Shipped |
 | Serialization round-trip matrix (Go↔Rust↔TS↔Python) | 🔬 In flight ([#15](https://github.com/Roy-Wanyoike/bridge/issues/15)) |
 | Event + RPC transports | 🔬 In flight ([#16](https://github.com/Roy-Wanyoike/bridge/issues/16), [#17](https://github.com/Roy-Wanyoike/bridge/issues/17)) |
-| Consumer-aware impact analysis + CI governance | 🔬 In flight ([#19](https://github.com/Roy-Wanyoike/bridge/issues/19)) |
+| Consumer-aware impact analysis + CI governance (`bridge impact`, `bridge check --against`) | ✅ Shipped |
 | Registry service (server, auth, multi-tenancy) | 🔲 Planned ([#18](https://github.com/Roy-Wanyoike/bridge/issues/18)) |
 | Dashboard | 🔲 Planned ([#20](https://github.com/Roy-Wanyoike/bridge/issues/20)) |
 | LSP / IDE integration | 🔲 Planned ([#21](https://github.com/Roy-Wanyoike/bridge/issues/21)) |

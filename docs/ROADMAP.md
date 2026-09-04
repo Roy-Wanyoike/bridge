@@ -6,7 +6,7 @@ Legend: 🔲 planned · 🟡 in progress · ✅ done
 
 ## Phase 1 — The compiler era (shipped)
 
-One IDL → one deterministic IR → validated code in four languages, with compatibility checking and an immutable registry. 311+ tests green across five packages.
+One IDL → one deterministic IR → validated code in four languages, with compatibility checking and an immutable registry. 355+ tests green across five packages.
 
 | Capability | Status | Notes |
 |------------|--------|-------|
