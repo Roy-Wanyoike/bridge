@@ -180,3 +180,50 @@ export function unionVariants(type: IRTypeDefinition): IRUnion['variants'] | und
 export function aliasTarget(type: IRTypeDefinition): IRAlias['target'] | undefined {
   return type.kind === 'alias' ? type.target : undefined;
 }
+
+/**
+ * Conservative predicate used by generated round-trip tests: true when the
+ * ZERO value of the named local struct is guaranteed to pass Bridge
+ * validation. That is the case when no REQUIRED field on the struct — nor
+ * on any struct reachable through required struct-typed fields — carries a
+ * constraint. Optional constrained fields are skipped for absent values by
+ * the generated validators, so they never block a zero value.
+ */
+export function structZeroValuePassesValidation(
+  ir: IRPackage,
+  name: string,
+  seen: ReadonlySet<string> = new Set<string>(),
+): boolean {
+  if (seen.has(name)) return true;
+  const visited = new Set(seen);
+  visited.add(name);
+  const def = ir.types.find((t) => t.name === name);
+  if (def === undefined || def.kind !== 'struct') return false;
+  for (const field of def.fields) {
+    if (field.optional) continue; // absent -> validators skip constraints
+    if (field.constraints.length > 0) return false;
+    // Recurse through required struct-typed fields (unwrap optional is
+    // moot here: optional fields never reach this point).
+    const targets: TypeRef[] = [];
+    switch (field.type.kind) {
+      case 'named':
+        targets.push(field.type);
+        break;
+      case 'list':
+      case 'set':
+        targets.push(field.type.element);
+        break;
+      case 'map':
+        targets.push(field.type.value);
+        break;
+      default:
+        break;
+    }
+    for (const target of targets) {
+      if (target.kind !== 'named') continue;
+      if (target.package !== undefined && target.package !== ir.name) continue;
+      if (!structZeroValuePassesValidation(ir, target.name, visited)) return false;
+    }
+  }
+  return true;
+}

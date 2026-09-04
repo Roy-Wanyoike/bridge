@@ -35,7 +35,7 @@ test('Go: expected file list and structure', () => {
   const files = generate(ir, { language: 'go' });
   const paths = files.map((f) => f.path).sort();
   assert.deepEqual(paths, [
-    'enums.go', 'events.go', 'go.mod', 'services.go', 'types.go', 'validate.go',
+    'enums.go', 'events.go', 'go.mod', 'roundtrip_test.go', 'services.go', 'types.go', 'validate.go',
   ]);
   const goMod = byPath(files, 'go.mod');
   assert.match(goMod.content, /^module bridge\/generated\/payments_v1$/m);

@@ -41,7 +41,20 @@ import {
   isLocalStructRef,
   renderTypeRef,
 } from '../mappings';
-import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes, usesSets } from '../analysis';
+import {
+  crossPackageRefs,
+  sortedEvents,
+  sortedServices,
+  sortedTypes,
+  structZeroValuePassesValidation,
+  usesSets,
+} from '../analysis';
+import {
+  ENVELOPE_SPECVERSION,
+  RPC_ERROR_CODES_SORTED,
+  RPC_ERROR_STATUS,
+  eventTypeName,
+} from '../wire';
 import {
   goExportedName,
   goPackageName,
@@ -70,6 +83,8 @@ export function generateGo(input: GeneratorInput): GeneratedFile[] {
   if (services !== undefined) files.push(services);
   const events = goEventsFile(input);
   if (events !== undefined) files.push(events);
+  const roundtripTest = goRoundtripTestFile(input);
+  if (roundtripTest !== undefined) files.push(roundtripTest);
   return files;
 }
 
@@ -619,13 +634,23 @@ function goServicesFile(input: GeneratorInput): GeneratedFile | undefined {
   const services = sortedServices(input.ir);
   if (services.length === 0) return undefined;
 
+  // Server-side request validators: one per method whose input is a local
+  // struct (validate.go emits Validate for every local struct).
+  const validators = new Map<string, string>();
+  for (const service of services) {
+    for (const method of service.methods) {
+      const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+      if (ref.kind === 'named' && isLocalStructRef(ref, input.ir)) {
+        validators.set(`${service.name}.${method.name}`, ref.name);
+      }
+    }
+  }
+
   let body = '';
-  body += `${goDoc('HTTPDoer executes HTTP requests. *http.Client implements it.')}\n`;
-  body += 'type HTTPDoer interface {\n';
-  body += '\tDo(req *http.Request) (*http.Response, error)\n';
-  body += '}\n\n';
+  body += goRpcBlock();
   for (const service of services) {
     body += goService(service, input);
+    body += goServiceHandler(service, input, validators);
   }
 
   const parts = [
@@ -633,12 +658,68 @@ function goServicesFile(input: GeneratorInput): GeneratedFile | undefined {
     '',
     goPackageClause(input.packageName),
     '',
-    'import (\n\t"bytes"\n\t"context"\n\t"encoding/json"\n\t"fmt"\n\t"io"\n\t"net/http"\n\t"strings"\n)',
+    'import (\n\t"bytes"\n\t"context"\n\t"encoding/json"\n\t"errors"\n\t"fmt"\n\t"io"\n\t"net/http"\n\t"strings"\n)',
     '',
     body.trimEnd(),
     '',
   ];
   return generatedFile('services.go', parts.join('\n'));
+}
+
+/**
+ * Shared RPC block: BridgeRPCError, the code→status mapping and the
+ * JSON response-writing helpers used by the server adapters.
+ */
+function goRpcBlock(): string {
+  let out = '';
+  out += `${goDoc('HTTPDoer executes HTTP requests. *http.Client implements it.')}\n`;
+  out += 'type HTTPDoer interface {\n';
+  out += '\tDo(req *http.Request) (*http.Response, error)\n';
+  out += '}\n\n';
+  out += `${goDoc('BridgeRPCError is the wire-level Bridge RPC error: HTTP status + code + message.')}\n`;
+  out += 'type BridgeRPCError struct {\n';
+  out += '\tStatus  int    `json:"-"`\n';
+  out += '\tCode    string `json:"code"`\n';
+  out += '\tMessage string `json:"message"`\n';
+  out += '}\n\n';
+  out += `${goDoc('Error implements the error interface.')}\n`;
+  out += 'func (e *BridgeRPCError) Error() string {\n';
+  out += '\treturn fmt.Sprintf("bridge rpc %s (status %d): %s", e.Code, e.Status, e.Message)\n';
+  out += '}\n\n';
+  out += `${goDoc('BridgeStatusForCode maps a Bridge RPC error code to its canonical HTTP status; unknown codes map to 500.')}\n`;
+  out += 'func BridgeStatusForCode(code string) int {\n';
+  out += '\tswitch code {\n';
+  for (const code of RPC_ERROR_CODES_SORTED) {
+    out += `\tcase ${JSON.stringify(code)}:\n\t\treturn ${RPC_ERROR_STATUS[code]}\n`;
+  }
+  out += '\tdefault:\n\t\treturn 500\n\t}\n}\n\n';
+  out += `${goDoc('writeBridgeJSON writes a JSON body with the given HTTP status.')}\n`;
+  out += 'func writeBridgeJSON(w http.ResponseWriter, status int, body any) {\n';
+  out += '\tw.Header().Set("Content-Type", "application/json")\n';
+  out += '\tw.WriteHeader(status)\n';
+  out += '\t_ = json.NewEncoder(w).Encode(body)\n';
+  out += '}\n\n';
+  out += `${goDoc('writeBridgeError writes the canonical {"code", "message"} error body.')}\n`;
+  out += 'func writeBridgeError(w http.ResponseWriter, code string, message string) {\n';
+  out += '\twriteBridgeJSON(w, BridgeStatusForCode(code), map[string]string{"code": code, "message": message})\n';
+  out += '}\n\n';
+  out += `${goDoc('bridgeErrorFromBody parses a non-2xx {"code", "message"} body into a *BridgeRPCError.')}\n`;
+  out += 'func bridgeErrorFromBody(status int, body []byte) *BridgeRPCError {\n';
+  out += '\tcode := "internal"\n';
+  out += '\tmessage := fmt.Sprintf("non-2xx status %d: %s", status, string(body))\n';
+  out += '\tvar parsed struct {\n';
+  out += '\t\tCode    string `json:"code"`\n';
+  out += '\t\tMessage string `json:"message"`\n';
+  out += '\t}\n';
+  out += '\tif err := json.Unmarshal(body, &parsed); err == nil && parsed.Code != "" {\n';
+  out += '\t\tcode = parsed.Code\n';
+  out += '\t\tif parsed.Message != "" {\n';
+  out += '\t\t\tmessage = parsed.Message\n';
+  out += '\t\t}\n';
+  out += '\t}\n';
+  out += '\treturn &BridgeRPCError{Status: status, Code: code, Message: message}\n';
+  out += '}\n\n';
+  return out;
 }
 
 function goService(service: IRService, input: GeneratorInput): string {
@@ -711,12 +792,271 @@ function goClientDoHelper(service: IRService, packageName: string): string {
   out += '\t\treturn fmt.Errorf("read response: %w", err)\n';
   out += '\t}\n';
   out += '\tif resp.StatusCode < 200 || resp.StatusCode > 299 {\n';
-  out += `\t\treturn fmt.Errorf("%s: non-2xx status %d: %s", method, resp.StatusCode, string(respBody))\n`;
+  out += `\t\treturn fmt.Errorf("%s: %w", method, bridgeErrorFromBody(resp.StatusCode, respBody))\n`;
   out += '\t}\n';
   out += '\tif err := json.Unmarshal(respBody, out); err != nil {\n';
   out += '\t\treturn fmt.Errorf("unmarshal response: %w", err)\n';
   out += '\t}\n';
   out += '\treturn nil\n';
+  out += '}\n\n';
+  return out;
+}
+
+/**
+ * Server side: net/http handler binding a <Service>Server to the Bridge
+ * JSON-over-HTTP wire shape. POST /<package>/<Service>/<Method>; malformed
+ * or invalid requests become 400 {"code": "invalid_argument"};
+ * *BridgeRPCError from the handler maps code → status; anything else is
+ * 500 {"code": "internal"}.
+ */
+function goServiceHandler(
+  service: IRService,
+  input: GeneratorInput,
+  validators: ReadonlyMap<string, string>,
+): string {
+  let out = '';
+  const handlerName = `New${service.name}Handler`;
+  const routePrefix = `/${input.packageName}/${service.name}/`;
+  const docLinesOut = [
+    ...docLines(service.docs),
+    `${handlerName} binds a ${service.name}Server to the Bridge JSON-over-HTTP wire shape`,
+    `(POST ${routePrefix}<Method>) as a net/http handler.`,
+    'Malformed or invalid requests become 400 {"code": "invalid_argument"};',
+    '*BridgeRPCError maps code → status; anything else is 500 {"code": "internal"}.',
+  ];
+  const doc = goDoc(docLinesOut.join('\n'));
+  if (doc.length > 0) out += `${doc}\n`;
+  out += `func ${handlerName}(server ${service.name}Server) http.Handler {\n`;
+  out += `\tconst routePrefix = ${JSON.stringify(routePrefix)}\n`;
+  out += '\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n';
+  out += '\t\tif r.Method != http.MethodPost {\n';
+  out += `\t\t\twriteBridgeError(w, "method_not_allowed", "Bridge RPC routes accept POST only")\n`;
+  out += '\t\t\treturn\n';
+  out += '\t\t}\n';
+  out += '\t\tif !strings.HasPrefix(r.URL.Path, routePrefix) {\n';
+  out += '\t\t\twriteBridgeError(w, "not_found", fmt.Sprintf("unknown route %q", r.URL.Path))\n';
+  out += '\t\t\treturn\n';
+  out += '\t\t}\n';
+  out += '\t\tmethod := strings.TrimPrefix(r.URL.Path, routePrefix)\n';
+  out += '\t\tbody, err := io.ReadAll(r.Body)\n';
+  out += '\t\tif err != nil {\n';
+  out += '\t\t\twriteBridgeError(w, "invalid_argument", "failed to read request body")\n';
+  out += '\t\t\treturn\n';
+  out += '\t\t}\n';
+  out += '\t\tswitch method {\n';
+  for (const method of service.methods) {
+    const requestType = methodTypeName(method.input, input);
+    const responseType = methodTypeName(method.output, input);
+    const validator = validators.get(`${service.name}.${method.name}`);
+    out += `\t\tcase ${JSON.stringify(method.name)}:\n`;
+    out += `\t\t\tvar req ${requestType}\n`;
+    out += '\t\t\tif err := json.Unmarshal(body, &req); err != nil {\n';
+    out += `\t\t\t\twriteBridgeError(w, "invalid_argument", fmt.Sprintf("decode ${requestType}: %v", err))\n`;
+    out += '\t\t\t\treturn\n';
+    out += '\t\t\t}\n';
+    if (validator !== undefined) {
+      out += '\t\t\tif err := req.Validate(); err != nil {\n';
+      out += '\t\t\t\twriteBridgeError(w, "invalid_argument", err.Error())\n';
+      out += '\t\t\t\treturn\n';
+      out += '\t\t\t}\n';
+    }
+    out += `\t\t\tresp, err := server.${method.name}(r.Context(), &req)\n`;
+    out += '\t\t\tif err != nil {\n';
+    out += '\t\t\t\tvar rpcErr *BridgeRPCError\n';
+    out += '\t\t\t\tif errors.As(err, &rpcErr) {\n';
+    out += '\t\t\t\t\twriteBridgeError(w, rpcErr.Code, rpcErr.Message)\n';
+    out += '\t\t\t\t\treturn\n';
+    out += '\t\t\t\t}\n';
+    out += '\t\t\t\twriteBridgeError(w, "internal", err.Error())\n';
+    out += '\t\t\t\treturn\n';
+    out += '\t\t\t}\n';
+    out += `\t\t\twriteBridgeJSON(w, http.StatusOK, resp)\n`;
+    out += '\t\t\treturn\n';
+  }
+  out += '\t\tdefault:\n';
+  out += '\t\t\twriteBridgeError(w, "not_found", fmt.Sprintf("unknown method %q", method))\n';
+  out += '\t\t}\n';
+  out += '\t})\n';
+  out += '}\n\n';
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* roundtrip_test.go                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Emits a `net/http/httptest` round-trip test file that ships inside the
+ * generated Go module:
+ *
+ * - a stub <Service>Server whose methods return zero responses;
+ * - unknown-method  → 404 {"code":"not_found"};
+ * - non-POST        → 405 {"code":"method_not_allowed"};
+ * - invalid JSON    → 400 {"code":"invalid_argument"};
+ * - a full typed client round-trip per method whose request struct's zero
+ *   value is guaranteed to pass Bridge validation (see
+ *   structZeroValuePassesValidation); methods that may fail validation
+ *   assert the 400 {"code":"invalid_argument"} error path instead, which
+ *   is deterministic for any contract.
+ */
+function goRoundtripTestFile(input: GeneratorInput): GeneratedFile | undefined {
+  if (!input.generateServices) return undefined;
+  const services = sortedServices(input.ir);
+  if (services.length === 0) return undefined;
+
+  let body = '';
+  for (const service of services) {
+    body += goStubServer(service, input);
+  }
+
+  const testHelpers = goRoundtripTestHelpers();
+  body = testHelpers + body;
+
+  for (const service of services) {
+    body += goRoundtripErrorPathTest(service, input);
+    for (const method of service.methods) {
+      const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+      if (ref.kind !== 'named') continue;
+      if (!isLocalStructRef(ref, input.ir)) continue;
+      const passesZero = structZeroValuePassesValidation(input.ir, ref.name);
+      body += passesZero
+        ? goRoundtripSuccessTest(service, method, input)
+        : goRoundtripValidationTest(service, method, input);
+    }
+  }
+
+  const parts = [
+    fileHeader('go', input.packageName),
+    '',
+    goPackageClause(input.packageName),
+    '',
+    'import (\n\t"context"\n\t"encoding/json"\n\t"net/http"\n\t"net/http/httptest"\n\t"strings"\n\t"testing"\n)',
+    '',
+    body.trimEnd(),
+    '',
+  ];
+  return generatedFile('roundtrip_test.go', parts.join('\n'));
+}
+
+/** Shared assertion helpers for the generated round-trip tests. */
+function goRoundtripTestHelpers(): string {
+  let out = '';
+  out += `${goDoc('bridgeAssertErrorBody decodes a {"code","message"} error body and asserts the code.')}\n`;
+  out += 'func bridgeAssertErrorBody(t *testing.T, resp *http.Response, wantCode string) {\n';
+  out += '\tt.Helper()\n';
+  out += '\tdefer resp.Body.Close()\n';
+  out += '\tvar parsed struct {\n';
+  out += '\t\tCode    string `json:"code"`\n';
+  out += '\t\tMessage string `json:"message"`\n';
+  out += '\t}\n';
+  out += '\tif err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {\n';
+  out += '\t\tt.Fatalf("decode error body: %v", err)\n';
+  out += '\t}\n';
+  out += '\tif parsed.Code != wantCode {\n';
+  out += '\t\tt.Fatalf("error code = %q, want %q", parsed.Code, wantCode)\n';
+  out += '\t}\n';
+  out += '}\n\n';
+  return out;
+}
+
+/** Stub server implementation returning zero-value responses. */
+function goStubServer(service: IRService, input: GeneratorInput): string {
+  let out = '';
+  out += `${goDoc(`stub${service.name}Server is a ${service.name}Server returning zero-value responses.`)}\n`;
+  out += `type stub${service.name}Server struct{}\n\n`;
+  for (const method of service.methods) {
+    const inType = methodTypeName(method.input, input);
+    const outType = methodTypeName(method.output, input);
+    out += `func (s *stub${service.name}Server) ${method.name}(ctx context.Context, req *${inType}) (*${outType}, error) {\n`;
+    out += `\t_ = ctx\n`;
+    out += `\t_ = req\n`;
+    out += `\tvar out ${outType}\n`;
+    out += '\treturn &out, nil\n';
+    out += '}\n\n';
+  }
+  return out;
+}
+
+/** Deterministic wire-level error-path tests (405 / 404 / invalid JSON). */
+function goRoundtripErrorPathTest(service: IRService, input: GeneratorInput): string {
+  const first = service.methods[0];
+  if (first === undefined) return '';
+  const route = `${input.packageName}/${service.name}/${first.name}`;
+  const unknownRoute = `${input.packageName}/${service.name}/DefinitelyNotAMethod`;
+  let out = '';
+  out += `${goDoc(`Test${service.name}MethodNotAllowed asserts POST-only routing on real HTTP.`)}\n`;
+  out += `func Test${service.name}MethodNotAllowed(t *testing.T) {\n`;
+  out += `\tserver := httptest.NewServer(New${service.name}Handler(&stub${service.name}Server{}))\n`;
+  out += '\tdefer server.Close()\n';
+  out += `\tresp, err := server.Client().Get(server.URL + ${JSON.stringify(`/${input.packageName}/${service.name}/`)})\n`;
+  out += '\tif err != nil {\n\t\tt.Fatalf("get: %v", err)\n\t}\n';
+  out += '\tif resp.StatusCode != http.StatusMethodNotAllowed {\n';
+  out += '\t\tt.Fatalf("status = %d, want 405", resp.StatusCode)\n\t}\n';
+  out += '\tbridgeAssertErrorBody(t, resp, "method_not_allowed")\n';
+  out += '}\n\n';
+  out += `${goDoc(`Test${service.name}UnknownMethod asserts 404 not_found for unknown methods over real HTTP.`)}\n`;
+  out += `func Test${service.name}UnknownMethod(t *testing.T) {\n`;
+  out += `\tserver := httptest.NewServer(New${service.name}Handler(&stub${service.name}Server{}))\n`;
+  out += '\tdefer server.Close()\n';
+  out += `\tresp, err := server.Client().Post(server.URL+${JSON.stringify(`/${unknownRoute}`)}, "application/json", strings.NewReader("{}"))\n`;
+  out += '\tif err != nil {\n\t\tt.Fatalf("post: %v", err)\n\t}\n';
+  out += '\tif resp.StatusCode != http.StatusNotFound {\n';
+  out += '\t\tt.Fatalf("status = %d, want 404", resp.StatusCode)\n\t}\n';
+  out += '\tbridgeAssertErrorBody(t, resp, "not_found")\n';
+  out += '}\n\n';
+  out += `${goDoc(`Test${service.name}InvalidJSON asserts 400 invalid_argument for undecodable bodies over real HTTP.`)}\n`;
+  out += `func Test${service.name}InvalidJSON(t *testing.T) {\n`;
+  out += `\tserver := httptest.NewServer(New${service.name}Handler(&stub${service.name}Server{}))\n`;
+  out += '\tdefer server.Close()\n';
+  out += `\tresp, err := server.Client().Post(server.URL+${JSON.stringify(`/${route}`)}, "application/json", strings.NewReader("not-json"))\n`;
+  out += '\tif err != nil {\n\t\tt.Fatalf("post: %v", err)\n\t}\n';
+  out += '\tif resp.StatusCode != http.StatusBadRequest {\n';
+  out += '\t\tt.Fatalf("status = %d, want 400", resp.StatusCode)\n\t}\n';
+  out += '\tbridgeAssertErrorBody(t, resp, "invalid_argument")\n';
+  out += '}\n\n';
+  return out;
+}
+
+/** Full typed client round-trip for methods whose zero request validates. */
+function goRoundtripSuccessTest(
+  service: IRService,
+  method: import('@bridge/core').IRMethod,
+  input: GeneratorInput,
+): string {
+  const inType = methodTypeName(method.input, input);
+  let out = '';
+  out += `${goDoc(`Test${service.name}${method.name}RoundTrip calls the typed JSON client against the generated handler over real HTTP.`)}\n`;
+  out += `func Test${service.name}${method.name}RoundTrip(t *testing.T) {\n`;
+  out += `\tserver := httptest.NewServer(New${service.name}Handler(&stub${service.name}Server{}))\n`;
+  out += '\tdefer server.Close()\n';
+  out += `\tclient := New${service.name}JSONClient(server.Client(), server.URL)\n`;
+  out += `\treq := &${inType}{}\n`;
+  out += `\tif _, err := client.${method.name}(req); err != nil {\n`;
+  out += `\t\tt.Fatalf("${method.name}: %v", err)\n\t}\n`;
+  out += '}\n\n';
+  return out;
+}
+
+/**
+ * Methods whose zero request may fail Bridge validation assert the
+ * deterministic 400 {"code":"invalid_argument"} error path instead.
+ */
+function goRoundtripValidationTest(
+  service: IRService,
+  method: import('@bridge/core').IRMethod,
+  input: GeneratorInput,
+): string {
+  const route = `${input.packageName}/${service.name}/${method.name}`;
+  let out = '';
+  out += `${goDoc(`Test${service.name}${method.name}Validation asserts that a request violating ${methodTypeName(method.input, input)} constraints yields 400 {"code":"invalid_argument"}.`)}\n`;
+  out += `func Test${service.name}${method.name}Validation(t *testing.T) {\n`;
+  out += `\tserver := httptest.NewServer(New${service.name}Handler(&stub${service.name}Server{}))\n`;
+  out += '\tdefer server.Close()\n';
+  out += `\tresp, err := server.Client().Post(server.URL+${JSON.stringify(`/${route}`)}, "application/json", strings.NewReader("{}"))\n`;
+  out += '\tif err != nil {\n\t\tt.Fatalf("post: %v", err)\n\t}\n';
+  out += '\tif resp.StatusCode != http.StatusBadRequest {\n';
+  out += '\t\tt.Fatalf("status = %d, want 400", resp.StatusCode)\n\t}\n';
+  out += '\tbridgeAssertErrorBody(t, resp, "invalid_argument")\n';
   out += '}\n\n';
   return out;
 }
@@ -727,20 +1067,17 @@ function goClientDoHelper(service: IRService, packageName: string): string {
 
 function goEventsFile(input: GeneratorInput): GeneratedFile | undefined {
   if (!input.generateEvents) return undefined;
-  const events = sortedEvents(input.ir);
-  if (events.length === 0) return undefined;
+  if (sortedEvents(input.ir).length === 0) return undefined;
 
   let body = '';
-  for (const event of events) {
-    body += goEvent(event, input);
-  }
+  body += goEventEnvelopeBlock(input);
 
   const parts = [
     fileHeader('go', input.packageName),
     '',
     goPackageClause(input.packageName),
     '',
-    'import (\n\t"encoding/json"\n\t"fmt"\n)',
+    'import (\n\t"encoding/json"\n\t"fmt"\n\t"sync"\n)',
     '',
     body.trimEnd(),
     '',
@@ -748,8 +1085,161 @@ function goEventsFile(input: GeneratorInput): GeneratedFile | undefined {
   return generatedFile('events.go', parts.join('\n'));
 }
 
+/**
+ * Shared envelope machinery: BridgeEventMeta, the CloudEvents-style
+ * BridgeEventEnvelope, envelope decode, the generic publisher interface,
+ * the in-memory bus and the type-routing dispatcher.
+ */
+function goEventEnvelopeBlock(input: GeneratorInput): string {
+  const events = sortedEvents(input.ir);
+  let out = '';
+  out += `${goDoc('BridgeEventSpecversion is the CloudEvents spec version emitted in every envelope.')}\n`;
+  out += `const BridgeEventSpecversion = ${JSON.stringify(ENVELOPE_SPECVERSION)}\n\n`;
+  out += `${goDoc(
+    'BridgeEventMeta is the caller-supplied envelope metadata. Generated code\nnever reads the clock or generates ids, so publishers must provide all\nthree values.',
+  )}\n`;
+  out += 'type BridgeEventMeta struct {\n';
+  out += '\tID     string\n';
+  out += '\tSource string\n';
+  out += '\tTime   string\n';
+  out += '}\n\n';
+  out += `${goDoc(
+    'BridgeEventEnvelope is the CloudEvents-style Bridge event envelope:\n{specversion: "1.0", id, source, type: "<package>.<Event>", time, data}.',
+  )}\n`;
+  out += 'type BridgeEventEnvelope struct {\n';
+  out += '\tSpecversion string          `json:"specversion"`\n';
+  out += '\tID          string          `json:"id"`\n';
+  out += '\tSource      string          `json:"source"`\n';
+  out += '\tType        string          `json:"type"`\n';
+  out += '\tTime        string          `json:"time"`\n';
+  out += '\tData        json.RawMessage `json:"data"`\n';
+  out += '}\n\n';
+  out += `${goDoc(
+    'DecodeBridgeEventEnvelope decodes and validates the envelope shape\n(specversion "1.0", string id/source/type/time) without touching the\npayload. Per-event decode helpers verify the type and decode `data`.',
+  )}\n`;
+  out += 'func DecodeBridgeEventEnvelope(data []byte) (BridgeEventEnvelope, error) {\n';
+  out += '\tvar envelope BridgeEventEnvelope\n';
+  out += '\tif err := json.Unmarshal(data, &envelope); err != nil {\n';
+  out += '\t\treturn BridgeEventEnvelope{}, fmt.Errorf("bridge event envelope: %w", err)\n';
+  out += '\t}\n';
+  out += '\tif envelope.Specversion != BridgeEventSpecversion {\n';
+  out += '\t\treturn BridgeEventEnvelope{}, fmt.Errorf("bridge event envelope: unsupported specversion %q", envelope.Specversion)\n';
+  out += '\t}\n';
+  out += '\tif envelope.ID == "" || envelope.Source == "" || envelope.Type == "" || envelope.Time == "" {\n';
+  out += '\t\treturn BridgeEventEnvelope{}, fmt.Errorf("bridge event envelope: expected non-empty id, source, type and time")\n';
+  out += '\t}\n';
+  out += '\treturn envelope, nil\n';
+  out += '}\n\n';
+  out += `${goDoc(
+    'BridgeEventPublisher publishes a raw payload under an event type; the\ntransport (bus, broker, queue) builds the envelope from `meta`.',
+  )}\n`;
+  out += 'type BridgeEventPublisher interface {\n';
+  out += '\tPublish(eventType string, payload any, meta BridgeEventMeta) error\n';
+  out += '}\n\n';
+  out += `${goDoc(
+    'InMemoryEventBus is an in-memory BridgeEventPublisher: it hands envelopes\nto per-type subscribers. Ideal for tests and in-process wiring; swap for a\nreal transport in production.',
+  )}\n`;
+  out += 'type bridgeEventSubscriber func(BridgeEventEnvelope)\n\n';
+  out += 'type InMemoryEventBus struct {\n';
+  out += '\tmu          sync.Mutex\n';
+  out += '\tsubscribers map[string][]*bridgeEventSubscriber\n';
+  out += '}\n\n';
+  out += `${goDoc('Subscribe registers a subscriber for an event type; the returned func unsubscribes.')}\n`;
+  out += 'func (b *InMemoryEventBus) Subscribe(eventType string, subscriber bridgeEventSubscriber) func() {\n';
+  out += '\tentry := &subscriber\n';
+  out += '\tb.mu.Lock()\n';
+  out += '\tdefer b.mu.Unlock()\n';
+  out += '\tif b.subscribers == nil {\n';
+  out += '\t\tb.subscribers = make(map[string][]*bridgeEventSubscriber)\n';
+  out += '\t}\n';
+  out += '\tb.subscribers[eventType] = append(b.subscribers[eventType], entry)\n';
+  out += '\treturn func() {\n';
+  out += '\t\tb.mu.Lock()\n';
+  out += '\t\tdefer b.mu.Unlock()\n';
+  out += '\t\tcurrent := b.subscribers[eventType]\n';
+  out += '\t\tfiltered := current[:0]\n';
+  out += '\t\tfor _, existing := range current {\n';
+  out += '\t\t\tif existing != entry {\n';
+  out += '\t\t\t\tfiltered = append(filtered, existing)\n';
+  out += '\t\t\t}\n';
+  out += '\t\t}\n';
+  out += '\t\tb.subscribers[eventType] = filtered\n';
+  out += '\t}\n';
+  out += '}\n\n';
+  out += `${goDoc('Publish marshals the payload and delivers the envelope to every subscriber of the type.')}\n`;
+  out += 'func (b *InMemoryEventBus) Publish(eventType string, payload any, meta BridgeEventMeta) error {\n';
+  out += '\tdata, err := json.Marshal(payload)\n';
+  out += '\tif err != nil {\n';
+  out += '\t\treturn fmt.Errorf("marshal event payload: %w", err)\n';
+  out += '\t}\n';
+  out += '\tenvelope := BridgeEventEnvelope{\n';
+  out += '\t\tSpecversion: BridgeEventSpecversion,\n';
+  out += '\t\tID:          meta.ID,\n';
+  out += '\t\tSource:      meta.Source,\n';
+  out += '\t\tType:        eventType,\n';
+  out += '\t\tTime:        meta.Time,\n';
+  out += '\t\tData:        data,\n';
+  out += '\t}\n';
+  out += '\tb.mu.Lock()\n';
+  out += '\tsubscribers := make([]*bridgeEventSubscriber, len(b.subscribers[eventType]))\n';
+  out += '\tcopy(subscribers, b.subscribers[eventType])\n';
+  out += '\tb.mu.Unlock()\n';
+  out += '\tfor _, subscriber := range subscribers {\n';
+  out += '\t\t(*subscriber)(envelope)\n';
+  out += '\t}\n';
+  out += '\treturn nil\n';
+  out += '}\n\n';
+  out += `${goDoc(
+    'BridgeEventDispatcher routes Bridge event envelopes (decoded JSON or\nin-memory) to the registered per-event handlers by their `type`. Dispatch\nerrors on unknown types.',
+  )}\n`;
+  out += 'type BridgeEventDispatcher struct {\n';
+  out += '\thandlers map[string][]func(BridgeEventEnvelope)\n';
+  out += '}\n\n';
+  out += `${goDoc('NewBridgeEventDispatcher creates an empty dispatcher.')}\n`;
+  out += 'func NewBridgeEventDispatcher() *BridgeEventDispatcher {\n';
+  out += '\treturn &BridgeEventDispatcher{handlers: make(map[string][]func(BridgeEventEnvelope))}\n';
+  out += '}\n\n';
+  for (const event of events) {
+    out += `${goDoc(`On${event.name} registers a typed handler for ${event.name} events.`)}\n`;
+    out += `func (d *BridgeEventDispatcher) On${event.name}(handler func(payload ${event.name}, meta BridgeEventMeta)) *BridgeEventDispatcher {\n`;
+    out += `\td.handlers[${JSON.stringify(eventTypeName(input.packageName, event.name))}] = append(d.handlers[${JSON.stringify(eventTypeName(input.packageName, event.name))}], func(envelope BridgeEventEnvelope) {\n`;
+    out += '\t\tvar payload ' + event.name + '\n';
+    out += '\t\t_ = json.Unmarshal(envelope.Data, &payload)\n';
+    out += `\t\thandler(payload, BridgeEventMeta{ID: envelope.ID, Source: envelope.Source, Time: envelope.Time})\n`;
+    out += '\t})\n';
+    out += '\treturn d\n';
+    out += '}\n\n';
+  }
+  out += `${goDoc(
+    'Dispatch decodes the envelope and runs every handler registered for its\ntype. Returns an error for malformed envelopes and unknown event types.',
+  )}\n`;
+  out += 'func (d *BridgeEventDispatcher) Dispatch(data []byte) error {\n';
+  out += '\tenvelope, err := DecodeBridgeEventEnvelope(data)\n';
+  out += '\tif err != nil {\n';
+  out += '\t\treturn err\n';
+  out += '\t}\n';
+  out += '\thandlers, ok := d.handlers[envelope.Type]\n';
+  out += '\tif !ok || len(handlers) == 0 {\n';
+  out += '\t\treturn fmt.Errorf("no handler registered for event type %q", envelope.Type)\n';
+  out += '\t}\n';
+  out += '\tfor _, handler := range handlers {\n';
+  out += '\t\thandler(envelope)\n';
+  out += '\t}\n';
+  out += '\treturn nil\n';
+  out += '}\n\n';
+  for (const event of events) {
+    out += goEvent(event, input);
+  }
+  return out;
+}
+
 function goEvent(event: import('@bridge/core').IREvent, input: GeneratorInput): string {
   let out = '';
+  const typeConst = `${event.name}Type`;
+  const fqType = eventTypeName(input.packageName, event.name);
+  out += `${goDoc(`${event.name}Type is the fully-qualified event type (${fqType}).`)}\n`;
+  out += `const ${typeConst} = ${JSON.stringify(fqType)}\n\n`;
+
   const doc = goDoc(event.docs);
   if (doc.length > 0) out += `${doc}\n`;
   out += `type ${event.name} struct {\n`;
@@ -758,31 +1248,41 @@ function goEvent(event: import('@bridge/core').IREvent, input: GeneratorInput): 
     if (fdoc.length > 0) out += `${tab(fdoc)}\n`;
     const base = renderTypeRef(field.type, input.render);
     const goType = field.optional && field.type.kind !== 'optional' ? `*${base}` : base;
-    const tag = field.optional ? ` json:"${field.name},omitempty"` : ` json:"${field.name}"`;
+    const tag = field.optional ? `json:"${field.name},omitempty"` : `json:"${field.name}"`;
     out += `\t${goExportedName(field.name)} ${goType} \`${tag}\`\n`;
   }
   out += '}\n\n';
 
-  out += `type ${event.name}Envelope struct {\n`;
-  out += `\tEvent string \`json:"event"\`\n`;
-  out += `\tPayload ${event.name} \`json:"payload"\`\n`;
+  out += `${goDoc(`Encode${event.name} wraps the event into the CloudEvents-style Bridge envelope with caller-supplied metadata.`)}\n`;
+  out += `func Encode${event.name}(payload ${event.name}, meta BridgeEventMeta) (BridgeEventEnvelope, error) {\n`;
+  out += '\tdata, err := json.Marshal(payload)\n';
+  out += '\tif err != nil {\n';
+  out += '\t\treturn BridgeEventEnvelope{}, fmt.Errorf("marshal ' + event.name + ': %w", err)\n';
+  out += '\t}\n';
+  out += '\treturn BridgeEventEnvelope{\n';
+  out += '\t\tSpecversion: BridgeEventSpecversion,\n';
+  out += '\t\tID:          meta.ID,\n';
+  out += '\t\tSource:      meta.Source,\n';
+  out += `\t\tType:        ${typeConst},\n`;
+  out += '\t\tTime:        meta.Time,\n';
+  out += '\t\tData:        data,\n';
+  out += '\t}, nil\n';
   out += '}\n\n';
 
-  out += `${goDoc(`Envelope wraps the ${event.name} in the Bridge wire envelope: {"event": name, "payload": {...}}.`)}\n`;
-  out += `func (e ${event.name}) Envelope() ${event.name}Envelope {\n`;
-  out += `\treturn ${event.name}Envelope{Event: ${JSON.stringify(event.name)}, Payload: e}\n`;
-  out += '}\n\n';
-
-  out += `${goDoc(`Decode${event.name}Envelope decodes an envelope and verifies the event name.`)}\n`;
-  out += `func Decode${event.name}Envelope(data []byte) (${event.name}Envelope, error) {\n`;
-  out += `\tvar env ${event.name}Envelope\n`;
-  out += '\tif err := json.Unmarshal(data, &env); err != nil {\n';
-  out += `\t\treturn ${event.name}Envelope{}, err\n`;
+  out += `${goDoc(`Decode${event.name} decodes an envelope, verifying specversion and the event type, and decodes the payload.`)}\n`;
+  out += `func Decode${event.name}(data []byte) (${event.name}, BridgeEventEnvelope, error) {\n`;
+  out += '\tenvelope, err := DecodeBridgeEventEnvelope(data)\n';
+  out += '\tif err != nil {\n';
+  out += `\t\treturn ${event.name}{}, BridgeEventEnvelope{}, err\n`;
   out += '\t}\n';
-  out += `\tif env.Event != ${JSON.stringify(event.name)} {\n`;
-  out += `\t\treturn ${event.name}Envelope{}, fmt.Errorf("unexpected event %q, want %q", env.Event, ${JSON.stringify(event.name)})\n`;
+  out += `\tif envelope.Type != ${typeConst} {\n`;
+  out += `\t\treturn ${event.name}{}, envelope, fmt.Errorf("unexpected event type %q, want %q", envelope.Type, ${typeConst})\n`;
   out += '\t}\n';
-  out += '\treturn env, nil\n';
+  out += `\tvar payload ${event.name}\n`;
+  out += '\tif err := json.Unmarshal(envelope.Data, &payload); err != nil {\n';
+  out += `\t\treturn ${event.name}{}, envelope, fmt.Errorf("decode ${event.name} payload: %w", err)\n`;
+  out += '\t}\n';
+  out += '\treturn payload, envelope, nil\n';
   out += '}\n\n';
   return out;
 }
