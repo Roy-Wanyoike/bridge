@@ -137,7 +137,12 @@ export class MessageReader {
  * stream. `Content-Length` is computed with `Buffer.byteLength` so bodies
  * containing multi-byte UTF-8 characters are framed byte-accurately.
  */
-export function writeMessage(writable: NodeJS.WritableStream, message: JsonRpcMessage): void {
+export interface MessageWriter {
+  /** Minimal write surface satisfied by streams, sockets and stdout. */
+  write(chunk: Buffer): unknown;
+}
+
+export function writeMessage(writable: MessageWriter, message: JsonRpcMessage): void {
   const body = Buffer.from(JSON.stringify(message), 'utf8');
   const head = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'ascii');
   writable.write(Buffer.concat([head, body]));
