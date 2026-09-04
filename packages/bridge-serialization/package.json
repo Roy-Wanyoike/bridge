@@ -1,0 +1,19 @@
+{
+  "name": "@bridge/serialization",
+  "version": "0.1.0",
+  "description": "Cross-language serialization for Bridge values: canonical JSON, MessagePack, CBOR round-trips",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && if [ -d dist/test ]; then node --test \"dist/test/*.test.js\"; else echo 'no tests yet'; fi"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
