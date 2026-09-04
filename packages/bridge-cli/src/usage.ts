@@ -15,7 +15,10 @@ Commands:
   generate --language <lang> [file]
                                   Generate Go/Rust/TypeScript/Python code
   diff <old-file> <new-file>      Human-readable compatibility report
-  check <old-file> <new-file>     Machine-oriented compatibility gate (CI)
+  check <old> <new> | <file> --against <ref>
+                                  Machine-oriented compatibility gate (CI)
+  impact <contract> --to <ref>    Consumer-aware impact analysis: who is
+                                  affected? (CI governance)
   publish <file> [options]        Publish a contract to the local registry
   pull <package> <version>        Fetch a published contract
   versions <package>              List published versions of a package
@@ -112,17 +115,54 @@ Options:
 
 Exit 1 when the check fails in the selected mode (default strict).`,
 
-  check: `bridge check <old-file> <new-file> [--compatible] [--json]
+  check: `bridge check <old-file> <new-file> [--compatible] [--strict]
+                [--format table|json|markdown]
+bridge check <new-file> --against <ref-file|name@version> [--registry dir] […]
 
-Machine-oriented compatibility gate for CI. Prints the verdict, the gate
-decision and a change summary; with --json prints
-{ package, mode, passed, verdict, summary, changes }.
+Machine-oriented compatibility gate for CI. The baseline is either the
+first file or, with --against, a file or a published registry reference
+('name@version', or 'name' for the latest version).
+
+Gate (exit 1 when the verdict lands in the fail set):
+  default        BREAKING and UNKNOWN changes fail
+  --strict       additionally fails WARNING changes (full governance)
+  --compatible   only definite BREAKING changes fail
 
 Options:
+  --against <ref>       baseline: file path or published name@version
+  --registry <dir>      registry root for --against name references
+  --format <fmt>        table (default) | json | markdown (PR-comment ready)
   --compatible          gate on definite breaking changes only
-  --json                machine-readable output
+  --strict              also fail on warnings
+  --json                shorthand for --format json
 
-Exit 1 when the gate fails in the selected mode (default strict).`,
+Exit 1 when the gate fails in the selected mode.`,
+
+  impact: `bridge impact <contract> --to <name@version|file> [--registry dir]
+              [--format table|json|markdown] [--strict]
+
+Consumer-aware impact analysis: diff the contract against its baseline and
+walk the registry's dependent graph transitively to answer "who feels this
+change?". Every discovered consumer is reported with how the change reaches
+it — a referenced type changed (directly or through an intermediate
+contract), an event changed, the package was renamed — or why it is
+unaffected. See docs/IMPACT.md for the reachability model and its limits.
+
+'<contract>' and '--to' are each a file path or a published registry
+reference ('name@version', or 'name' for the latest version). A path that
+exists on disk wins over a registry name.
+
+Options:
+  --to <ref>            required: the candidate version to analyze
+  --registry <dir>      registry root (default ./.bridge-registry, then
+                        $BRIDGE_REGISTRY); a missing registry degrades the
+                        report to the plain diff with a note
+  --format <fmt>        table (default) | json (deterministic) | markdown
+                        (GitHub PR-comment ready)
+  --strict              exit 1 when any BREAKING change is detected
+
+Exit 0 advisory by default; 1 with --strict on breaking changes or on
+registry/compile failures; 2 on usage errors.`,
 
   publish: `bridge publish <file> [--registry dir] [--owner name]
                   [--description text] [--version vX]

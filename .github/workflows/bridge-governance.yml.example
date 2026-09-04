@@ -1,0 +1,94 @@
+# Bridge contract governance — example PR workflow.
+#
+# Copy this file to .github/workflows/bridge-governance.yml and adjust:
+#   - BRIDGE_REGISTRY: where your contracts live (a git-tracked directory
+#     works; a registry service URL works once the registry service ships).
+#   - node-version / checkout depth to match your repo.
+#
+# What it does on every PR that touches *.bridge files:
+#   1. publishes nothing — it diffs candidate contracts against the
+#      published baselines in the registry directory,
+#   2. posts the consumer-aware impact report as a sticky PR comment,
+#   3. fails the PR when a BREAKING change is detected (--strict also
+#      gates WARNING changes; remove the flag to gate breaking only).
+#
+# NOTE: rename/remove the sticky-comment step if your repo already uses
+# one comment per PR from another bot.
+
+name: bridge-governance
+
+on:
+  pull_request:
+    paths:
+      - '**/*.bridge'
+      - '.bridge-registry/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  BRIDGE_REGISTRY: .bridge-registry
+
+jobs:
+  bridge-governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the baseline registry directory is complete.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Bridge CLI
+        run: |
+          git clone https://github.com/Roy-Wanyoike/bridge.git /tmp/bridge
+          cd /tmp/bridge && npm install && npm run build
+          echo "$(pwd)/packages/bridge-cli/dist/bin" >> "$GITHUB_PATH"
+
+      - name: Find changed candidate contracts
+        id: changed
+        run: |
+          files=$(git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}" -- '*.bridge' | tr '\n' ' ')
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Impact analysis + compatibility gate
+        id: gate
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          failed=0
+          report=""
+          for f in ${{ steps.changed.outputs.files }}; do
+            name=$(grep -m1 -oP '(?<=^package )[a-zA-Z0-9_.]+' "$f" || true)
+            if [ -z "$name" ]; then
+              echo "::error file=$f::cannot read package name"
+              failed=1
+              continue
+            fi
+            echo "### \`$name\`" >> bridge-report.md
+            if ! bridge impact "$name" --to "$f" --registry "$BRIDGE_REGISTRY" \
+                 --format markdown --strict >> bridge-report.md 2>> bridge-errors.txt; then
+              failed=1
+            fi
+            echo >> bridge-report.md
+          done
+          cat bridge-errors.txt || true
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+        # Keep running so the PR comment is still posted on failure.
+
+      - name: Fail on breaking changes
+        if: steps.gate.outputs.failed == '1'
+        run: |
+          echo "Bridge governance gate failed: breaking change(s) detected."
+          exit 1
+
+      - name: Post impact report as PR comment (sticky)
+        if: always() && hashFiles('bridge-report.md') != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: bridge-impact
+          path: bridge-report.md

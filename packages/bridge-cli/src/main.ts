@@ -5,6 +5,7 @@
  * failures, missing files) · 2 usage error. User-facing failures are thrown
  * as {@link CliError} and rendered as plain messages — never stack traces.
  */
+import { ImpactError } from '@bridge/compat';
 import { ArgSpec, parseArgs, ParsedArgs } from './args';
 import { CliError } from './errors';
 import { errOut } from './output';
@@ -15,6 +16,7 @@ import * as diff from './commands/diff';
 import * as doctor from './commands/doctor';
 import * as generate from './commands/generate';
 import * as help from './commands/help';
+import * as impact from './commands/impact';
 import * as init from './commands/init';
 import * as inspect from './commands/inspect';
 import * as fmt from './commands/fmt';
@@ -41,7 +43,17 @@ const COMMANDS: Record<string, CommandEntry> = {
     run: generate.run,
   },
   diff: { spec: { flags: ['--compatible'] }, run: diff.run },
-  check: { spec: { flags: ['--json', '--compatible'] }, run: check.run },
+  check: {
+    spec: {
+      flags: ['--json', '--compatible', '--strict'],
+      options: ['--against', '--registry', '--format'],
+    },
+    run: check.run,
+  },
+  impact: {
+    spec: { flags: ['--strict'], options: ['--to', '--registry', '--format'] },
+    run: impact.run,
+  },
   publish: {
     spec: { options: ['--registry', '--owner', '--description', '--version'] },
     run: publish.run,
@@ -89,6 +101,11 @@ function fail(command: string, e: unknown): void {
       errOut(`Run 'bridge help ${command}' for usage.`);
     }
     process.exitCode = e.exitCode;
+    return;
+  }
+  if (e instanceof ImpactError) {
+    errOut(`bridge: impact analysis failed: ${e.message}`);
+    process.exitCode = 1;
     return;
   }
   if (isRegistryError(e)) {

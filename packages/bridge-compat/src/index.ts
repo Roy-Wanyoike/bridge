@@ -23,10 +23,29 @@
  *   change) classify as UNKNOWN and fail the default strict gate — never
  *   silently SAFE.
  * - Zero runtime dependencies beyond `@bridge/core` (the frozen IR types).
+ *
+ * Consumer-aware impact analysis (`computeImpact`) builds on the diff and a
+ * registry-backed dependents walk; it takes a structural `ImpactRegistry`
+ * (satisfied by `RegistryStore` from `@bridge/registry`) so this package
+ * stays dependency-free. See docs/IMPACT.md for the heuristics and limits.
  */
 export type { Classification, Change, ChangeKind, CompatReport, DiffOptions } from './types';
 export { diffPackages, check } from './diff';
 export { formatReport, toJson } from './report';
+export { formatReportMarkdown } from './report-md';
+export type {
+  AffectedConsumer,
+  ContactReason,
+  ContractMetaLike,
+  ImpactAnalysis,
+  ImpactOptions,
+  ImpactRegistry,
+  ImpactReport,
+  ImpactStats,
+  SuggestedAction,
+} from './impact-types';
+export { computeImpact, ImpactError } from './impact';
+export { formatImpactText, formatImpactMarkdown, formatImpactJson } from './impact-report';
 
 /**
  * Re-export the canonical IR types (and hashing helpers) from `@bridge/core`
