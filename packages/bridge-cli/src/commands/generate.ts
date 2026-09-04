@@ -49,8 +49,8 @@ export function run(args: ParsedArgs): void {
   }
 
   try {
-    fs.mkdirSync(outDir, { recursive: true });
     for (const [target, content] of generated) {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, content, 'utf8');
     }
   } catch (e) {
