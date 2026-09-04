@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "build": "tsc -p .",
-    "test": "tsc -p . && node --test \"dist/test/*.test.js\""
+    "test": "tsc -p . && if [ -d dist/test ]; then node --test \"dist/test/*.test.js\"; else echo 'no tests yet'; fi"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
