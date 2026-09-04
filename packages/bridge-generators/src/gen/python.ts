@@ -50,6 +50,7 @@ import { fileHeader } from '../header';
 import { pythonDocstring, pythonFieldComment } from '../docs';
 import { NUMERIC_PRIMITIVES, renderTypeRef } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes } from '../analysis';
+import { pythonEventsFileV2, pythonServerBlocks } from './python-wire';
 import { camelToLowerSnake, pythonFieldName, pythonModuleName, rustCrateName } from '../naming';
 import type { GeneratedFile, GeneratorInput } from './input';
 
@@ -78,14 +79,14 @@ export function generatePython(input: GeneratorInput): GeneratedFile[] {
 /* ------------------------------------------------------------------ */
 
 /** Python annotation for a field; optional fields are `T | None`. */
-function pythonFieldType(field: IRField, input: GeneratorInput): string {
+export function pythonFieldType(field: IRField, input: GeneratorInput): string {
   const base = renderTypeRef(field.type, input.render);
   if (field.optional && field.type.kind !== 'optional') return `${base} | None`;
   return base;
 }
 
 /** Wire-name-aware field name (Python keywords get a trailing underscore). */
-function pyField(field: IRField): string {
+export function pyField(field: IRField): string {
   return pythonFieldName(field.name).name;
 }
 
@@ -471,7 +472,7 @@ function toDictExpr(field: IRField, input: GeneratorInput): string {
 }
 
 /** Serialization expression for a TypeRef value. */
-function serializeExpr(ref: TypeRef, value: string, input: GeneratorInput): string {
+export function serializeExpr(ref: TypeRef, value: string, input: GeneratorInput): string {
   switch (ref.kind) {
     case 'primitive':
       if (ref.primitive === 'bytes') return `base64.b64encode(${value}).decode("ascii")`;
@@ -512,7 +513,7 @@ function fromDictExpr(field: IRField, input: GeneratorInput, raw: string): strin
 }
 
 /** Deserialization expression for a TypeRef raw value. */
-function deserializeExpr(ref: TypeRef, raw: string, input: GeneratorInput, optional: boolean): string {
+export function deserializeExpr(ref: TypeRef, raw: string, input: GeneratorInput, optional: boolean): string {
   const noneGuard = (expr: string): string =>
     optional ? `None if ${raw} is None else ${expr}` : expr;
   switch (ref.kind) {
@@ -738,11 +739,17 @@ function pythonServicesFile(
   const blocks: string[] = [];
   blocks.push(
     [
-      '"""Service clients for the Bridge generated package.',
+      '"""Service clients and HTTP server adapters for the Bridge generated package.',
       '',
       'Clients POST JSON to `<base_url>/<package>/<Service>/<Method>` and',
       'decode responses with the generated from_dict decoders. The transport',
       'is urllib.request (stdlib) and can be replaced per call via `urlopen`.',
+      '',
+      'Server side: `<Service>ServiceHandler` implementations are bound to the',
+      'standard library http.server with `make_<service>_handler(handler)`.',
+      'Errors are {"code": str, "message": str} bodies with the canonical',
+      'Bridge error-code to HTTP-status mapping (every generated language',
+      'emits the identical table).',
       '"""',
     ].join('\n'),
   );
@@ -750,10 +757,24 @@ function pythonServicesFile(
   blocks.push('');
   blocks.push('import json');
   blocks.push('import urllib.request');
+  blocks.push('from http.server import BaseHTTPRequestHandler');
   blocks.push('from typing import Any, Callable');
+
+  // Request-type validators for the server adapter (local structs only).
+  const localStructs = new Set(
+    sortedTypes(input.ir).filter((t) => t.kind === 'struct').map((t) => t.name),
+  );
+  const requestTypes = sortedServices(input.ir)
+    .flatMap((service) => service.methods.map((m) => (m.input as { name: string }).name))
+    .filter((name) => localStructs.has(name));
+  const uniqueRequestTypes = [...new Set(requestTypes)].sort();
+  const hasEnumsForServices = sortedTypes(input.ir).some((t) => t.kind === 'enum');
   blocks.push('');
   blocks.push(`from .models import *  # noqa: F401,F403`);
-  blocks.push(`from .enums import *  # noqa: F401,F403`);
+  if (hasEnumsForServices) blocks.push(`from .enums import *  # noqa: F401,F403`);
+  if (uniqueRequestTypes.length > 0) {
+    blocks.push(`from .validation import ${uniqueRequestTypes.map((n) => `validate_${n}`).join(', ')}`);
+  }
 
   blocks.push(
     [
@@ -771,6 +792,8 @@ function pythonServicesFile(
   for (const service of services) {
     blocks.push(renderServiceClient(service, input, module));
   }
+
+  blocks.push(...pythonServerBlocks(input));
 
   const content = [fileHeader('python', input.packageName), joinBlocks(blocks), ''].join('\n');
   return generatedFile(`${module}/services.py`, content);
@@ -842,6 +865,13 @@ function renderServiceClient(
 function pythonEventsFile(
   input: GeneratorInput,
   module: string,
+): GeneratedFile | undefined {
+  return pythonEventsFileV2(input, module);
+}
+
+function pythonEventsFileOldDisabled(
+  input: GeneratorInput,
+  _module: string,
 ): GeneratedFile | undefined {
   if (!input.generateEvents) return undefined;
   const events = sortedEvents(input.ir);
@@ -1002,19 +1032,48 @@ function pythonInitFile(
     }
   }
   if (present.services !== undefined) {
+    lines.push('from .services import BridgeServiceError, BridgeRpcError');
+    names.push('BridgeServiceError', 'BridgeRpcError');
     for (const service of sortedServices(input.ir)) {
-      lines.push(`from .services import ${service.name}Client, BridgeServiceError`);
-      names.push(`${service.name}Client`, 'BridgeServiceError');
-      break; // BridgeServiceError once
+      const snake = camelToLowerSnake(service.name);
+      lines.push(
+        `from .services import ${service.name}Client, ${service.name}ServiceHandler, make_${snake}_handler`,
+      );
+      names.push(`${service.name}Client`, `${service.name}ServiceHandler`, `make_${snake}_handler`);
     }
   }
   if (present.events !== undefined) {
+    lines.push('from .events import (');
+    lines.push('    BRIDGE_EVENT_SPECVERSION,');
+    lines.push('    BridgeEventMeta,');
+    lines.push('    EventPublisher,');
+    lines.push('    InMemoryEventBus,');
+    lines.push('    BridgeEventDispatcher,');
+    lines.push('    decode_bridge_event_envelope,');
+    lines.push(')');
     for (const event of sortedEvents(input.ir)) {
-      lines.push(`from .events import ${event.name}, wrap_${camelToLowerSnake(event.name)}, unwrap_${camelToLowerSnake(event.name)}`);
-      names.push(event.name, `wrap_${camelToLowerSnake(event.name)}`, `unwrap_${camelToLowerSnake(event.name)}`);
+      const snake = camelToLowerSnake(event.name);
+      lines.push(`from .events import ${event.name}, ${event.name}_TYPE, ${event.name}Publisher, ${event.name}Handler`);
+      lines.push(`from .events import create_${snake}_publisher, encode_${snake}, decode_${snake}, register_${snake}`);
+      names.push(
+        event.name,
+        `${event.name}_TYPE`,
+        `${event.name}Publisher`,
+        `${event.name}Handler`,
+        `create_${snake}_publisher`,
+        `encode_${snake}`,
+        `decode_${snake}`,
+        `register_${snake}`,
+      );
     }
-    lines.push('from .events import decode_event');
-    names.push('decode_event');
+    names.push(
+      'BRIDGE_EVENT_SPECVERSION',
+      'BridgeEventMeta',
+      'EventPublisher',
+      'InMemoryEventBus',
+      'BridgeEventDispatcher',
+      'decode_bridge_event_envelope',
+    );
   }
   lines.push('');
   lines.push('__all__ = [');
