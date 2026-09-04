@@ -31,12 +31,19 @@
  * - Defaults map to a `<NAME>_DEFAULTS` partial-constant factory; combine
  *   with spread: `{ ...PAYMENT_DEFAULTS, ...rest }`.
  * - Services map to a `<Service>Client` interface plus
- *   `create<Service>Client({ baseUrl, fetchImpl? })` built on `fetch`
- *   (POST /<package>/<Service>/<Method>).
- * - Events map to payload interfaces plus the wire envelope
- *   `{"event": name, "payload": {...}}` with encode/decode helpers.
+ *   `create<Service>Client({ baseUrl, fetchImpl? })` built on `fetch`, a
+ *   `<Service>ServiceHandler` interface plus a node:http-compatible request
+ *   listener via `create<Service>RequestListener(handler)` (server side).
+ *   POST /<package>/<Service>/<Method>; errors are thrown/returned as
+ *   `BridgeRpcError` carrying the wire code and HTTP status.
+ * - Events map to payload interfaces plus a CloudEvents-style envelope
+ *   {specversion, id, source, type, time, data} with encode/decode
+ *   helpers, per-event handler/publisher interfaces, a generic
+ *   `EventPublisher`, an `InMemoryEventBus` and a `BridgeEventDispatcher`
+ *   that routes decoded JSON envelopes by their `type`.
  * - Cross-package references become `export type X = unknown` opaque
- *   aliases documented as "imported from <pkg>".
+ *   aliases documented as "imported from <pkg>"; modules referencing them
+ *   import the alias from ./types.
  */
 
 import type { IRField, IRService, IRTypeDefinition, IREvent, TypeRef } from '@bridge/core';
@@ -54,6 +61,12 @@ import {
   renderTypeRef,
 } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes, usesSets } from '../analysis';
+import {
+  ENVELOPE_SPECVERSION,
+  RPC_ERROR_CODES_SORTED,
+  RPC_ERROR_STATUS,
+  eventTypeName,
+} from '../wire';
 import {
   pascalFromScreaming,
   pascalToCamel,
@@ -107,10 +120,12 @@ function tsFieldType(field: IRField, input: GeneratorInput): string {
 interface LocalRefs {
   readonly types: Set<string>;
   readonly enums: Set<string>;
+  /** Cross-package named refs; declared as opaque aliases in types.ts. */
+  readonly opaque: Set<string>;
 }
 
 function emptyLocalRefs(): LocalRefs {
-  return { types: new Set(), enums: new Set() };
+  return { types: new Set(), enums: new Set(), opaque: new Set() };
 }
 
 /** True when the named ref points at any type declared in this package. */
@@ -126,6 +141,13 @@ function scanRef(ref: TypeRef, input: GeneratorInput, into: LocalRefs): void {
     case 'named':
       if (isLocalEnumRef(ref, input.ir)) into.enums.add(ref.name);
       else if (isLocalType(ref, input)) into.types.add(ref.name);
+      else if (
+        ref.package !== undefined &&
+        ref.package !== input.ir.name &&
+        findLocalType(input.ir, ref.name) === undefined
+      ) {
+        into.opaque.add(ref.name);
+      }
       break;
     case 'list':
       scanRef(ref.element, input, into);
@@ -602,33 +624,139 @@ function tsServicesFile(input: GeneratorInput): GeneratedFile | undefined {
     }
   }
 
+  // Server-side request validators: one per method whose input is a local
+  // struct (validate.ts emits validate<Type> for every local struct).
+  const validators = new Map<string, string>();
+  for (const service of services) {
+    for (const method of service.methods) {
+      const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+      if (ref.kind === 'named' && isLocalStructRef(ref, input.ir)) {
+        validators.set(`${service.name}.${method.name}`, ref.name);
+      }
+    }
+  }
+
   let body = '';
-  body += `${tsDoc(
-    'Minimal structural fetch type; keeps the generated package independent of DOM lib types.',
-  )}\n`;
-  body += `export type FetchLike = (\n`;
-  body += `  input: string,\n`;
-  body += `  init?: {\n`;
-  body += `    method?: string;\n`;
-  body += `    headers?: Record<string, string>;\n`;
-  body += `    body?: string;\n`;
-  body += `  },\n`;
-  body += `) => Promise<{ ok: boolean; status: number; text(): Promise<string>; json(): Promise<unknown> }>;\n\n`;
+  body += tsRpcBlock();
 
   for (const service of services) {
     body += tsService(service, input);
+    body += tsServiceListener(service, input, validators);
   }
 
   const header = tsFile(
     fileHeader('typescript', input.packageName),
     '',
-    tsDoc('JSON-over-HTTP service clients generated from the Bridge package.'),
+    tsDoc('JSON-over-HTTP clients and server adapters generated from the Bridge package.'),
   );
-  const importStatement = tsImportType('./types', refs.types);
+  const imports: string[] = [];
+  const typeImport = tsImportType('./types', [...refs.types, ...refs.opaque]);
+  if (typeImport !== undefined) imports.push(typeImport);
+  const validatorImports = [...new Set(validators.values())].sort();
+  if (validatorImports.length > 0) {
+    imports.push(
+      `import { ${validatorImports.map((name) => `validate${name}`).join(', ')} } from './validate';`,
+    );
+  }
   const parts = [header];
-  if (importStatement !== undefined) parts.push('', importStatement);
+  if (imports.length > 0) parts.push('', imports.join('\n'));
   parts.push('', body.trimEnd(), '');
   return generatedFile('src/services.ts', parts.join('\n'));
+}
+
+/**
+ * Shared RPC block: BridgeRpcError, the code→status mapping and the
+ * structural node:http request/response types used by the server adapters
+ * (keeps the generated package free of @types/node).
+ */
+function tsRpcBlock(): string {
+  let out = '';
+  out += `${tsDoc(
+    'Minimal structural fetch type; keeps the generated package independent of DOM lib types.',
+  )}\n`;
+  out += `export type FetchLike = (\n`;
+  out += `  input: string,\n`;
+  out += `  init?: {\n`;
+  out += `    method?: string;\n`;
+  out += `    headers?: Record<string, string>;\n`;
+  out += `    body?: string;\n`;
+  out += `  },\n`;
+  out += `) => Promise<{ ok: boolean; status: number; text(): Promise<string>; json(): Promise<unknown> }>;\n\n`;
+  out += `${tsDoc(
+    'Error thrown by generated clients and understood by generated servers;\ncarries the HTTP status and the Bridge wire error code.',
+  )}\n`;
+  out += `export class BridgeRpcError extends Error {\n`;
+  out += `  readonly status: number;\n`;
+  out += `  readonly code: string;\n\n`;
+  out += `  constructor(status: number, code: string, message: string) {\n`;
+  out += `    super(\`bridge rpc \${code} (status \${status}): \${message}\`);\n`;
+  out += `    this.name = 'BridgeRpcError';\n`;
+  out += `    this.status = status;\n`;
+  out += `    this.code = code;\n`;
+  out += `  }\n}\n\n`;
+  out += `${tsDoc('Maps a Bridge RPC error code to its canonical HTTP status; unknown codes map to 500.')}\n`;
+  out += `export function bridgeStatusForCode(code: string): number {\n`;
+  out += `  switch (code) {\n`;
+  for (const code of RPC_ERROR_CODES_SORTED) {
+    out += `    case ${JSON.stringify(code)}: return ${RPC_ERROR_STATUS[code]};\n`;
+  }
+  out += `    default: return 500;\n`;
+  out += `  }\n}\n\n`;
+
+  out += `${tsDoc(
+    'Minimal structural node:http types; keeps the generated package independent\nof @types/node. The listener returned by create<Service>RequestListener is\ndirectly usable with http.createServer.',
+  )}\n`;
+  out += `export interface BridgeNodeHttpRequest {\n`;
+  out += `  method?: string | undefined;\n`;
+  out += `  url?: string | undefined;\n`;
+  out += `  headers: { [header: string]: string | string[] | undefined };\n`;
+  out += `  on(eventName: 'data', listener: (chunk: unknown) => void): unknown;\n`;
+  out += `  on(eventName: 'end', listener: () => void): unknown;\n`;
+  out += `  on(eventName: 'error', listener: (error: Error) => void): unknown;\n`;
+  out += `}\n\n`;
+  out += `export interface BridgeNodeHttpResponse {\n`;
+  out += `  statusCode?: number | undefined;\n`;
+  out += `  setHeader(name: string, value: string): void;\n`;
+  out += `  end(body?: string): void;\n`;
+  out += `}\n\n`;
+  out += `export type BridgeNodeRequestListener = (\n`;
+  out += `  request: BridgeNodeHttpRequest,\n`;
+  out += `  response: BridgeNodeHttpResponse,\n`;
+  out += `) => Promise<void> | void;\n\n`;
+
+  out += `function writeBridgeJson(response: BridgeNodeHttpResponse, status: number, body: unknown): void {\n`;
+  out += `  response.statusCode = status;\n`;
+  out += `  response.setHeader('Content-Type', 'application/json');\n`;
+  out += `  response.end(JSON.stringify(body ?? null));\n`;
+  out += `}\n\n`;
+  out += `function writeBridgeError(response: BridgeNodeHttpResponse, code: string, message: string): void {\n`;
+  out += `  writeBridgeJson(response, bridgeStatusForCode(code), { code, message });\n`;
+  out += `}\n\n`;
+  out += `function bridgeErrorFromResponse(method: string, status: number, bodyText: string): BridgeRpcError {\n`;
+  out += `  let code = 'internal';\n`;
+  out += `  let message = \`non-2xx status \${status}: \${bodyText}\`;\n`;
+  out += `  try {\n`;
+  out += `    const parsed = JSON.parse(bodyText) as { code?: unknown; message?: unknown };\n`;
+  out += `    if (typeof parsed?.code === 'string') {\n`;
+  out += `      code = parsed.code;\n`;
+  out += `      if (typeof parsed.message === 'string') message = parsed.message;\n`;
+  out += `    }\n`;
+  out += `  } catch {\n`;
+  out += `    // Non-JSON error body: keep the raw text as the message.\n`;
+  out += `  }\n`;
+  out += `  return new BridgeRpcError(status, code, \`\${method}: \${message}\`);\n`;
+  out += `}\n\n`;
+  out += `function readRequestBody(request: BridgeNodeHttpRequest): Promise<string> {\n`;
+  out += `  return new Promise<string>((resolve, reject) => {\n`;
+  out += `    let body = '';\n`;
+  out += `    request.on('data', (chunk) => {\n`;
+  out += `      body += typeof chunk === 'string' ? chunk : String(chunk);\n`;
+  out += `    });\n`;
+  out += `    request.on('end', () => resolve(body));\n`;
+  out += `    request.on('error', (error) => reject(error));\n`;
+  out += `  });\n`;
+  out += `}\n\n`;
+  return out;
 }
 
 function tsService(service: IRService, input: GeneratorInput): string {
@@ -670,7 +798,7 @@ function tsService(service: IRService, input: GeneratorInput): string {
   out += `    });\n`;
   out += `    if (!response.ok) {\n`;
   out += `      const text = await response.text();\n`;
-  out += `      throw new Error(\`\${method}: non-2xx status \${response.status}: \${text}\`);\n`;
+  out += `      throw bridgeErrorFromResponse(\`\${routePrefix}/\${method}\`, response.status, text);\n`;
   out += `    }\n`;
   out += `    return (await response.json()) as TResponse;\n`;
   out += `  }\n`;
@@ -693,6 +821,108 @@ function methodTypeName(ref: TypeRef, input: GeneratorInput): string {
   return renderTypeRef(ref, input.render);
 }
 
+/**
+ * Server side: handler interface + node:http request listener. The listener
+ * parses the JSON body, runs the Bridge validator for the request struct,
+ * dispatches to the handler and maps errors onto the canonical
+ * {"code", "message"} body.
+ */
+function tsServiceListener(
+  service: IRService,
+  input: GeneratorInput,
+  validators: ReadonlyMap<string, string>,
+): string {
+  let out = '';
+  const handlerName = `${service.name}ServiceHandler`;
+  const listenerName = `create${service.name}RequestListener`;
+  const routePrefix = `/${input.packageName}/${service.name}/`;
+
+  const docLinesOut = [
+    ...docLines(service.docs),
+    `Server-side handler interface for the ${service.name} service.`,
+    `Routes: POST /${input.packageName}/${service.name}/<Method>.`,
+  ];
+  const doc = tsDoc(docLinesOut.join('\n'));
+  out += `${doc}\n`;
+  out += `export interface ${handlerName} {\n`;
+  for (const method of service.methods) {
+    const mdoc = tsDoc(method.docs, method.deprecated);
+    if (mdoc.length > 0) out += `${spaceIndent(mdoc)}\n`;
+    out += `  ${pascalToCamel(method.name)}(req: ${methodTypeName(method.input, input)}): ${methodTypeName(method.output, input)} | Promise<${methodTypeName(method.output, input)}>;\n`;
+  }
+  out += `}\n\n`;
+
+  out += `${tsDoc(
+    `Binds a ${handlerName} to the Bridge JSON-over-HTTP wire shape\n(POST ${routePrefix}<Method>) as a node:http request listener.\nMalformed or invalid requests become 400 {"code": "invalid_argument"};\nBridgeRpcError from the handler maps code → status; anything else is 500.`,
+  )}\n`;
+  out += `export function ${listenerName}(handler: ${handlerName}): BridgeNodeRequestListener {\n`;
+  out += `  const routePrefix = ${JSON.stringify(routePrefix)};\n`;
+  out += `  return async (request, response) => {\n`;
+  out += `    if ((request.method ?? 'GET') !== 'POST') {\n`;
+  out += `      writeBridgeError(response, 'method_not_allowed', 'Bridge RPC routes accept POST only');\n`;
+  out += `      return;\n`;
+  out += `    }\n`;
+  out += `    const path = (request.url ?? '').split('?')[0] ?? '';\n`;
+  out += `    if (!path.startsWith(routePrefix)) {\n`;
+  out += `      writeBridgeError(response, 'not_found', \`unknown route \${JSON.stringify(path)}\`);\n`;
+  out += `      return;\n`;
+  out += `    }\n`;
+  out += `    const method = path.slice(routePrefix.length);\n`;
+  out += `    let raw = '';\n`;
+  out += `    try {\n`;
+  out += `      raw = await readRequestBody(request);\n`;
+  out += `    } catch {\n`;
+  out += `      writeBridgeError(response, 'invalid_argument', 'failed to read request body');\n`;
+  out += `      return;\n`;
+  out += `    }\n`;
+  out += `    switch (method) {\n`;
+  for (const method of service.methods) {
+    const requestType = methodTypeName(method.input, input);
+    const validator = validators.get(`${service.name}.${method.name}`);
+    out += `      case ${JSON.stringify(method.name)}: {\n`;
+    out += `        let parsed: unknown;\n`;
+    out += `        try {\n`;
+    out += `          parsed = JSON.parse(raw) as unknown;\n`;
+    out += `        } catch (error) {\n`;
+    out += `          writeBridgeError(\n`;
+    out += `            response,\n`;
+    out += `            'invalid_argument',\n`;
+    out += `            \`decode ${requestType}: \${error instanceof Error ? error.message : String(error)}\`,\n`;
+    out += `          );\n`;
+    out += `          return;\n`;
+    out += `        }\n`;
+    if (validator !== undefined) {
+      out += `        const violations = validate${validator}(parsed);\n`;
+      out += `        if (violations.length > 0) {\n`;
+      out += `          writeBridgeError(response, 'invalid_argument', violations.join('; '));\n`;
+      out += `          return;\n`;
+      out += `        }\n`;
+    }
+    out += `        try {\n`;
+    out += `          const result = await handler.${pascalToCamel(method.name)}(parsed as ${requestType});\n`;
+    out += `          writeBridgeJson(response, 200, result);\n`;
+    out += `        } catch (error) {\n`;
+    out += `          if (error instanceof BridgeRpcError) {\n`;
+    out += `            writeBridgeError(response, error.code, error.message);\n`;
+    out += `          } else {\n`;
+    out += `            writeBridgeError(\n`;
+    out += `              response,\n`;
+    out += `              'internal',\n`;
+    out += `              error instanceof Error ? error.message : String(error),\n`;
+    out += `            );\n`;
+    out += `          }\n`;
+    out += `        }\n`;
+    out += `        return;\n`;
+    out += `      }\n`;
+  }
+  out += `      default:\n`;
+  out += `        writeBridgeError(response, 'not_found', \`unknown method \${JSON.stringify(method)}\`);\n`;
+  out += `    }\n`;
+  out += `  };\n`;
+  out += `}\n\n`;
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* src/events.ts                                                       */
 /* ------------------------------------------------------------------ */
@@ -708,30 +938,140 @@ function tsEventsFile(input: GeneratorInput): GeneratedFile | undefined {
   }
 
   let body = '';
-  body += `${tsDoc('Bridge wire envelope: {"event": name, "payload": {...}}.')}\n`;
-  body += `export interface BridgeEnvelope<TPayload> {\n`;
-  body += `  event: string;\n`;
-  body += `  payload: TPayload;\n`;
-  body += `}\n\n`;
+  body += tsEventEnvelopeBlock();
 
   for (const event of events) {
     body += tsEvent(event, input);
   }
 
+  body += tsEventDispatcher(events);
+
   const header = tsFile(
     fileHeader('typescript', input.packageName),
     '',
-    tsDoc('Event payloads and the Bridge wire envelope: {"event": name, "payload": {...}}.'),
+    tsDoc(
+      'Event payloads and the CloudEvents-style Bridge envelope:\n{specversion: "1.0", id, source, type: "<package>.<Event>", time, data}.\nid, source and time are ALWAYS caller-supplied: generated code contains\nno clocks and no uuid generation.',
+    ),
   );
-  const importStatement = tsImportType('./types', refs.types);
+  const imports: string[] = [];
+  const typeImport = tsImportType('./types', [...refs.types, ...refs.opaque]);
+  if (typeImport !== undefined) imports.push(typeImport);
+  const enumImport = tsImportType('./enums', refs.enums);
+  if (enumImport !== undefined) imports.push(enumImport);
   const parts = [header];
-  if (importStatement !== undefined) parts.push('', importStatement);
+  if (imports.length > 0) parts.push('', imports.join('\n'));
   parts.push('', body.trimEnd(), '');
   return generatedFile('src/events.ts', parts.join('\n'));
 }
 
-function tsEvent(event: IREvent, input: GeneratorInput): string {
+/** Shared envelope machinery: meta, envelope type, decode helper, publisher + bus. */
+function tsEventEnvelopeBlock(): string {
   let out = '';
+  out += `${tsDoc('CloudEvents spec version emitted in every Bridge event envelope.')}\n`;
+  out += `export const BRIDGE_EVENT_SPECVERSION = ${JSON.stringify(ENVELOPE_SPECVERSION)};\n\n`;
+  out += `${tsDoc(
+    'Caller-supplied envelope metadata. Generated code never reads the clock\nor generates ids, so publishers must provide all three values.',
+  )}\n`;
+  out += `export interface BridgeEventMeta {\n`;
+  out += `  id: string;\n`;
+  out += `  source: string;\n`;
+  out += `  time: string;\n`;
+  out += `}\n\n`;
+  out += `${tsDoc('CloudEvents-style Bridge event envelope; `data` carries the event payload.')}\n`;
+  out += `export interface BridgeEventEnvelope<TPayload> {\n`;
+  out += `  specversion: string;\n`;
+  out += `  id: string;\n`;
+  out += `  source: string;\n`;
+  out += `  type: string;\n`;
+  out += `  time: string;\n`;
+  out += `  data: TPayload;\n`;
+  out += `}\n\n`;
+  out += `${tsDoc(
+    'Decodes and validates the envelope shape (specversion "1.0", string type/id/source/time)\nwithout touching the payload. Per-event decode<T> helpers verify the type.',
+  )}\n`;
+  out += `export function decodeBridgeEventEnvelope(data: unknown): BridgeEventEnvelope<unknown> {\n`;
+  out += `  if (typeof data !== 'object' || data === null || Array.isArray(data)) {\n`;
+  out += `    throw new Error('bridge event envelope: expected object');\n`;
+  out += `  }\n`;
+  out += `  const envelope = data as {\n`;
+  out += `    specversion?: unknown;\n`;
+  out += `    id?: unknown;\n`;
+  out += `    source?: unknown;\n`;
+  out += `    type?: unknown;\n`;
+  out += `    time?: unknown;\n`;
+  out += `    data?: unknown;\n`;
+  out += `  };\n`;
+  out += `  if (envelope.specversion !== BRIDGE_EVENT_SPECVERSION) {\n`;
+  out += `    throw new Error(\`bridge event envelope: unsupported specversion \${JSON.stringify(envelope.specversion)}\`);\n`;
+  out += `  }\n`;
+  out += `  if (\n`;
+  out += `    typeof envelope.id !== 'string' ||\n`;
+  out += `    typeof envelope.source !== 'string' ||\n`;
+  out += `    typeof envelope.type !== 'string' ||\n`;
+  out += `    typeof envelope.time !== 'string'\n`;
+  out += `  ) {\n`;
+  out += `    throw new Error('bridge event envelope: expected string "id", "source", "type" and "time"');\n`;
+  out += `  }\n`;
+  out += `  return {\n`;
+  out += `    specversion: envelope.specversion,\n`;
+  out += `    id: envelope.id,\n`;
+  out += `    source: envelope.source,\n`;
+  out += `    type: envelope.type,\n`;
+  out += `    time: envelope.time,\n`;
+  out += `    data: envelope.data,\n`;
+  out += `  };\n`;
+  out += `}\n\n`;
+  out += `${tsDoc(
+    'Generic event publisher. Publishes a raw payload under an event type;\nthe transport (bus, broker, queue) builds the envelope from `meta`.',
+  )}\n`;
+  out += `export interface EventPublisher {\n`;
+  out += `  publish(type: string, payload: unknown, meta: BridgeEventMeta): Promise<void>;\n`;
+  out += `}\n\n`;
+  out += `${tsDoc(
+    'In-memory EventPublisher: hands envelopes to per-type subscribers.\nIdeal for tests and in-process wiring; swap for a real transport in prod.',
+  )}\n`;
+  out += `export class InMemoryEventBus implements EventPublisher {\n`;
+  out += `  private readonly subscribers = new Map<\n`;
+  out += `    string,\n`;
+  out += `    Array<(envelope: BridgeEventEnvelope<unknown>) => void | Promise<void>>,\n`;
+  out += `  >();\n\n`;
+  out += `  subscribe(\n`;
+  out += `    type: string,\n`;
+  out += `    subscriber: (envelope: BridgeEventEnvelope<unknown>) => void | Promise<void>,\n`;
+  out += `  ): () => void {\n`;
+  out += `    const list = this.subscribers.get(type) ?? [];\n`;
+  out += `    list.push(subscriber);\n`;
+  out += `    this.subscribers.set(type, list);\n`;
+  out += `    return () => {\n`;
+  out += `      const current = this.subscribers.get(type) ?? [];\n`;
+  out += `      this.subscribers.set(\n`;
+  out += `        type,\n`;
+  out += `        current.filter((entry) => entry !== subscriber),\n`;
+  out += `      );\n`;
+  out += `    };\n`;
+  out += `  }\n\n`;
+  out += `  async publish(type: string, payload: unknown, meta: BridgeEventMeta): Promise<void> {\n`;
+  out += `    const envelope: BridgeEventEnvelope<unknown> = {\n`;
+  out += `      specversion: BRIDGE_EVENT_SPECVERSION,\n`;
+  out += `      id: meta.id,\n`;
+  out += `      source: meta.source,\n`;
+  out += `      type,\n`;
+  out += `      time: meta.time,\n`;
+  out += `      data: payload,\n`;
+  out += `    };\n`;
+  out += `    for (const subscriber of [...(this.subscribers.get(type) ?? [])]) {\n`;
+  out += `      await subscriber(envelope);\n`;
+  out += `    }\n`;
+  out += `  }\n}\n\n`;
+  return out;
+}
+
+function tsEvent(event: IREvent, input: GeneratorInput): string {
+  const typeConst = `${event.name}Type`;
+  let out = '';
+  out += `${tsDoc(`Fully-qualified event type (${eventTypeName(input.packageName, event.name)}).`)}\n`;
+  out += `export const ${typeConst} = ${JSON.stringify(eventTypeName(input.packageName, event.name))};\n\n`;
+
   const doc = tsDoc(event.docs);
   if (doc.length > 0) out += `${doc}\n`;
   out += `export interface ${event.name} {\n`;
@@ -743,22 +1083,83 @@ function tsEvent(event: IREvent, input: GeneratorInput): string {
   }
   out += `}\n\n`;
 
-  out += `${tsDoc(`Wraps a ${event.name} in the Bridge wire envelope.`)}\n`;
-  out += `export function encode${event.name}(event: ${event.name}): BridgeEnvelope<${event.name}> {\n`;
-  out += `  return { event: ${JSON.stringify(event.name)}, payload: event };\n`;
+  out += `${tsDoc(`Handler for ${event.name} events, invoked with the decoded payload.`)}\n`;
+  out += `export interface ${event.name}Handler {\n`;
+  out += `  (event: ${event.name}, meta: BridgeEventMeta): void | Promise<void>;\n`;
   out += `}\n\n`;
 
-  out += `${tsDoc(`Decodes a ${event.name} envelope, verifying the event name.`)}\n`;
-  out += `export function decode${event.name}(data: unknown): BridgeEnvelope<${event.name}> {\n`;
-  out += `  if (typeof data !== 'object' || data === null) {\n`;
-  out += `    throw new Error(${JSON.stringify(`${event.name} envelope: expected object`)});\n`;
-  out += `  }\n`;
-  out += `  const envelope = data as { event?: unknown; payload?: unknown };\n`;
-  out += `  if (envelope.event !== ${JSON.stringify(event.name)}) {\n`;
-  out += `    throw new Error(\`${event.name} envelope: unexpected event \${JSON.stringify(envelope.event)}\`);\n`;
-  out += `  }\n`;
-  out += `  return { event: envelope.event, payload: envelope.payload as ${event.name} };\n`;
+  out += `${tsDoc(`Typed publisher for ${event.name} events.`)}\n`;
+  out += `export interface ${event.name}Publisher {\n`;
+  out += `  publish(event: ${event.name}, meta: BridgeEventMeta): Promise<void>;\n`;
   out += `}\n\n`;
+
+  out += `${tsDoc(`Builds a ${event.name}Publisher on top of any generic EventPublisher.`)}\n`;
+  out += `export function create${event.name}Publisher(publisher: EventPublisher): ${event.name}Publisher {\n`;
+  out += `  return {\n`;
+  out += `    publish: (event, meta) => publisher.publish(${typeConst}, event, meta),\n`;
+  out += `  };\n`;
+  out += `}\n\n`;
+
+  out += `${tsDoc(`Wraps a ${event.name} into the CloudEvents-style Bridge envelope.`)}\n`;
+  out += `export function encode${event.name}(\n`;
+  out += `  data: ${event.name},\n`;
+  out += `  meta: BridgeEventMeta,\n`;
+  out += `): BridgeEventEnvelope<${event.name}> {\n`;
+  out += `  return {\n`;
+  out += `    specversion: BRIDGE_EVENT_SPECVERSION,\n`;
+  out += `    id: meta.id,\n`;
+  out += `    source: meta.source,\n`;
+  out += `    type: ${typeConst},\n`;
+  out += `    time: meta.time,\n`;
+  out += `    data,\n`;
+  out += `  };\n`;
+  out += `}\n\n`;
+
+  out += `${tsDoc(`Decodes a ${event.name} envelope, verifying specversion and the event type.`)}\n`;
+  out += `export function decode${event.name}(data: unknown): BridgeEventEnvelope<${event.name}> {\n`;
+  out += `  const envelope = decodeBridgeEventEnvelope(data);\n`;
+  out += `  if (envelope.type !== ${typeConst}) {\n`;
+  out += `    throw new Error(\`${event.name} envelope: unexpected type \${JSON.stringify(envelope.type)}\`);\n`;
+  out += `  }\n`;
+  out += `  return envelope as BridgeEventEnvelope<${event.name}>;\n`;
+  out += `}\n\n`;
+  return out;
+}
+
+/** Routes decoded envelopes to the registered per-event handlers by `type`. */
+function tsEventDispatcher(events: readonly IREvent[]): string {
+  let out = '';
+  out += `${tsDoc(
+    'Routes Bridge event envelopes (decoded JSON or in-memory) to the registered\nper-event handlers by their `type`. Throws on unknown types.',
+  )}\n`;
+  out += `export class BridgeEventDispatcher {\n`;
+  out += `  private readonly handlers = new Map<\n`;
+  out += `    string,\n`;
+  out += `    Array<(payload: unknown, meta: BridgeEventMeta) => void | Promise<void>>,\n`;
+  out += `  >();\n\n`;
+  for (const event of events) {
+    out += `  ${tsDoc(`Registers a handler for ${event.name} events.`)}\n`;
+    out += `  on${event.name}(handler: ${event.name}Handler): this {\n`;
+    out += `    const list = this.handlers.get(${event.name}Type) ?? [];\n`;
+    out += `    list.push((payload, meta) => handler(payload as ${event.name}, meta));\n`;
+    out += `    this.handlers.set(${event.name}Type, list);\n`;
+    out += `    return this;\n`;
+    out += `  }\n\n`;
+  }
+  out += `  async dispatch(data: unknown): Promise<void> {\n`;
+  out += `    const envelope = decodeBridgeEventEnvelope(data);\n`;
+  out += `    const handlers = this.handlers.get(envelope.type);\n`;
+  out += `    if (handlers === undefined || handlers.length === 0) {\n`;
+  out += `      throw new Error(\`no handler registered for event type \${JSON.stringify(envelope.type)}\`);\n`;
+  out += `    }\n`;
+  out += `    const meta: BridgeEventMeta = { id: envelope.id, source: envelope.source, time: envelope.time };\n`;
+  out += `    for (const handler of [...handlers]) {\n`;
+  out += `      await handler(envelope.data, meta);\n`;
+  out += `    }\n`;
+  out += `  }\n\n`;
+  out += `  async dispatchJson(text: string): Promise<void> {\n`;
+  out += `    await this.dispatch(JSON.parse(text) as unknown);\n`;
+  out += `  }\n}\n\n`;
   return out;
 }
 
