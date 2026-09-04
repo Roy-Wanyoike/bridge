@@ -1,0 +1,33 @@
+// Bridge IDL: a billing contract for the Go + Python interop example.
+
+package billing.v1
+
+/// Money amount in the contract's smallest currency unit.
+type Money {
+    amount: int64
+    currency: string @length(3)
+}
+
+enum InvoiceStatus {
+    DRAFT
+    OPEN
+    PAID
+    VOID
+}
+
+type Invoice {
+    id: uuid
+    customer_id: uuid
+    total: Money
+    status: InvoiceStatus
+    due_at: timestamp
+}
+
+type CreateInvoiceRequest {
+    customer_id: uuid
+    total: Money
+}
+
+service Billing {
+    CreateInvoice(CreateInvoiceRequest) -> Invoice
+}

@@ -1,0 +1,40 @@
+// Bridge IDL: a catalog contract for the Go + TypeScript integration example.
+
+package catalog.v1
+
+/// Money amount in the contract's smallest currency unit.
+type Money {
+    amount: int64
+    currency: string @length(3)
+}
+
+enum Availability {
+    IN_STOCK
+    BACKORDER
+    DISCONTINUED
+}
+
+type Product {
+    id: uuid
+    name: string @length(1, 200)
+    price: Money
+    tags: list<string>
+    availability: Availability
+}
+
+type GetProductRequest {
+    id: uuid
+}
+
+type ListProductsRequest {
+    page_size: int32 @min(1) @max(100)
+}
+
+type ProductList {
+    items: list<Product>
+}
+
+service Catalog {
+    GetProduct(GetProductRequest) -> Product
+    ListProducts(ListProductsRequest) -> ProductList
+}

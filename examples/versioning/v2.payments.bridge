@@ -1,0 +1,30 @@
+// Bridge IDL: payments contract, revision 2 — the candidate.
+//
+// Changes vs revision 1:
+// - adds optional field  Payment.reference  (SAFE)
+// - adds enum value      PaymentStatus.REFUNDED  (WARNING)
+// - removes field        Payment.currency  (BREAKING — the denormalized
+//   currency is dropped; it is already carried by amount.currency)
+
+package payments.v1
+
+type Money {
+    amount: int64
+    currency: string @length(3)
+}
+
+enum PaymentStatus {
+    PENDING
+    COMPLETED
+    FAILED
+    REFUNDED
+}
+
+type Payment {
+    id: uuid
+    customer_id: uuid
+    amount: Money
+    status: PaymentStatus
+    reference: string? @length(1)
+    created_at: timestamp
+}
