@@ -1,0 +1,795 @@
+     1→/**
+     2→ * Go generator.
+     3→ *
+     4→ * Emits, in order: go.mod, types.go, enums.go, validate.go, services.go,
+     5→ * events.go. Files without content are skipped (e.g. enums.go when the
+     6→ * package declares no enums), keeping the emitted file list deterministic.
+     7→ *
+     8→ * Go-specific decisions (documented in generated files too):
+     9→ * - Fields are exported (CamelCase with initialism expansion: id -> ID,
+    10→ *   api -> API, url -> URL, ...); json tags keep the snake_case wire names.
+    11→ *   Optional fields are pointers with `json:"...,omitempty"`.
+    12→ * - `set<T>` becomes `Set[T]` — a generic `map[T]struct{}` wrapper whose
+    13→ *   MarshalJSON/UnmarshalJSON speak the JSON-array wire format, with
+    14→ *   SetToSlice/SliceToSet converters.
+    15→ * - Required-field presence is NOT enforced at runtime by Go Validate:
+    16→ *   JSON zero values are indistinguishable from missing fields for
+    17→ *   non-pointer fields. Go Validate covers constraints (first error,
+    18→ *   wrapped with fmt.Errorf) and nested struct validation.
+    19→ * - Defaults are documented as `Default:` comments (no builder machinery).
+    20→ * - Cross-package references become `type X = json.RawMessage` opaque
+    21→ *   aliases documented as "imported from <pkg>".
+    22→ * - Tagged unions map to a `Kind string` + `Value json.RawMessage` struct
+    23→ *   with typed constructors (`NewX<Variant>`) and accessors (`As<Variant>`).
+    24→ */
+    25→
+    26→import type {
+    27→  IRConstraint,
+    28→  IRField,
+    29→  IRService,
+    30→  IRTypeDefinition,
+    31→  TypeRef,
+    32→} from '@bridge/core';
+    33→import { generatedFile } from '../util';
+    34→import { fileHeader } from '../header';
+    35→import { docLines, goDoc } from '../docs';
+    36→import {
+    37→  NUMERIC_PRIMITIVES,
+    38→  STRING_LIKE_PRIMITIVES,
+    39→  defaultLiteral,
+    40→  goZeroValue,
+    41→  isLocalStructRef,
+    42→  renderTypeRef,
+    43→} from '../mappings';
+    44→import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes, usesSets } from '../analysis';
+    45→import {
+    46→  goExportedName,
+    47→  goPackageName,
+    48→  goReceiver,
+    49→  goSafeIdent,
+    50→  pascalFromScreaming,
+    51→  sanitizedPackageName,
+    52→} from '../naming';
+    53→import type { GeneratedFile, GeneratorInput } from './input';
+    54→
+    55→/** Shared regexes emitted once in validate.go when the package uses them. */
+    56→const GO_EMAIL_RE = 'reBridgeEmail';
+    57→const GO_URL_RE = 'reBridgeURL';
+    58→const GO_UUID_RE = 'reBridgeUUID';
+    59→
+    60→/** Generates the Go project for an IR package. */
+    61→export function generateGo(input: GeneratorInput): GeneratedFile[] {
+    62→  const files: GeneratedFile[] = [goModFile(input)];
+    63→  const types = goTypesFile(input);
+    64→  if (types !== undefined) files.push(types);
+    65→  const enums = goEnumsFile(input);
+    66→  if (enums !== undefined) files.push(enums);
+    67→  const validate = goValidateFile(input);
+    68→  if (validate !== undefined) files.push(validate);
+    69→  const services = goServicesFile(input);
+    70→  if (services !== undefined) files.push(services);
+    71→  const events = goEventsFile(input);
+    72→  if (events !== undefined) files.push(events);
+    73→  return files;
+    74→}
+    75→
+    76→/* ------------------------------------------------------------------ */
+    77→/* Per-file helpers                                                    */
+    78→/* ------------------------------------------------------------------ */
+    79→
+    80→/** Import accumulator; renders a deterministic gofmt-style import block. */
+    81→class GoImports {
+    82→  private readonly names = new Set<string>();
+    83→
+    84→  add(name: string): void {
+    85→    this.names.add(name);
+    86→  }
+    87→
+    88→  block(): string {
+    89→    if (this.names.size === 0) return '';
+    90→    const sorted = [...this.names].sort();
+    91→    if (sorted.length === 1) return `import ${JSON.stringify(sorted[0])}`;
+    92→    const lines = sorted.map((name) => `\t${JSON.stringify(name)}`).join('\n');
+    93→    return `import (\n${lines}\n)`;
+    94→  }
+    95→}
+    96→
+    97→/** Full doc block for a field: docs + deprecation + default note. */
+    98→function goFieldDoc(field: IRField): string {
+    99→  const lines = docLines(field.docs);
+   100→  if (field.deprecated !== undefined) {
+   101→    lines.push(field.deprecated === true ? 'Deprecated.' : `Deprecated: ${field.deprecated}`);
+   102→  }
+   103→  if (field.default !== undefined) lines.push(`Default: ${field.default}`);
+   104→  if (lines.length === 0) return '';
+   105→  return lines.map((line) => `// ${line}`).join('\n');
+   106→}
+   107→
+   108→/** Indents a doc/normal block by n tabs. */
+   109→function tab(block: string, levels = 1): string {
+   110→  const pad = '\t'.repeat(levels);
+   111→  return block
+   112→    .split('\n')
+   113→    .map((line) => (line.length > 0 ? pad + line : line))
+   114→    .join('\n');
+   115→}
+   116→
+   117→/** Package clause. */
+   118→function goPackageClause(packageName: string): string {
+   119→  return `package ${goPackageName(packageName)}`;
+   120→}
+   121→
+   122→/* ------------------------------------------------------------------ */
+   123→/* go.mod                                                              */
+   124→/* ------------------------------------------------------------------ */
+   125→
+   126→function goModFile(input: GeneratorInput): GeneratedFile {
+   127→  const content = [
+   128→    fileHeader('go', input.packageName),
+   129→    '',
+   130→    `module bridge/generated/${sanitizedPackageName(input.packageName)}`,
+   131→    '',
+   132→    'go 1.22',
+   133→    '',
+   134→  ].join('\n');
+   135→  return generatedFile('go.mod', content);
+   136→}
+   137→
+   138→/* ------------------------------------------------------------------ */
+   139→/* types.go                                                            */
+   140→/* ------------------------------------------------------------------ */
+   141→
+   142→function goTypesFile(input: GeneratorInput): GeneratedFile | undefined {
+   143→  const types = sortedTypes(input.ir);
+   144→  const structs = types.filter((t) => t.kind === 'struct');
+   145→  const unions = types.filter((t) => t.kind === 'union');
+   146→  const aliases = types.filter((t) => t.kind === 'alias');
+   147→  const opaque = crossPackageRefs(input.ir);
+   148→  const hasSets = usesSets(input.ir);
+   149→  const hasStructs = structs.length > 0;
+   150→  const hasUnions = unions.length > 0;
+   151→  const hasAliases = aliases.length > 0;
+   152→  if (!hasStructs && !hasUnions && !hasAliases && opaque.length === 0 && !hasSets) {
+   153→    return undefined;
+   154→  }
+   155→
+   156→  const imports = new GoImports();
+   157→  let body = '';
+   158→
+   159→  // Opaque aliases for cross-package references (may be referenced by the
+   160→  // declarations below, so they come first).
+   161→  for (const ref of opaque) {
+   162→    imports.add('encoding/json');
+   163→    const doc = goDoc(
+   164→      `${ref.name} is an opaque alias: imported from ${ref.fromPackage}; regenerate with that package for full types.`,
+   165→    );
+   166→    body += `${doc}\ntype ${ref.name} = json.RawMessage\n\n`;
+   167→  }
+   168→
+   169→  for (const alias of aliases) {
+   170→    const doc = goDoc(alias.docs, alias.deprecated);
+   171→    if (doc.length > 0) body += `${doc}\n`;
+   172→    body += `type ${alias.name} = ${renderTypeRef(alias.target, input.render)}\n\n`;
+   173→  }
+   174→
+   175→  for (const struct of structs) {
+   176→    const doc = goDoc(struct.docs, struct.deprecated);
+   177→    if (doc.length > 0) body += `${doc}\n`;
+   178→    body += `type ${struct.name} struct {\n`;
+   179→    for (const field of struct.fields) {
+   180→      const fieldDoc = goFieldDoc(field);
+   181→      if (fieldDoc.length > 0) body += `${tab(fieldDoc)}\n`;
+   182→      const tag = field.optional ? ` json:"${field.name},omitempty"` : ` json:"${field.name}"`;
+   183→      body += `\t${goExportedName(field.name)} ${goFieldType(field, input)} \`${tag}\`\n`;
+   184→    }
+   185→    body += '}\n\n';
+   186→  }
+   187→
+   188→  for (const union of unions) {
+   189→    body += goUnion(union as IRTypeDefinition & { kind: 'union' }, input, imports);
+   190→  }
+   191→
+   192→  if (hasSets) {
+   193→    body += goSetSupport();
+   194→  }
+   195→
+   196→  if (opaque.length > 0 || hasUnions || hasSets) imports.add('encoding/json');
+   197→  if (hasUnions || hasSets) imports.add('fmt');
+   198→  if (hasSets) imports.add('sort');
+   199→
+   200→  const parts = [fileHeader('go', input.packageName), '', goPackageClause(input.packageName)];
+   201→  const importBlock = imports.block();
+   202→  if (importBlock.length > 0) parts.push('', importBlock);
+   203→  parts.push('', body.trimEnd(), '');
+   204→  return generatedFile('types.go', parts.join('\n'));
+   205→}
+   206→
+   207→/** Go type for a field; optional fields are pointers. */
+   208→function goFieldType(field: IRField, input: GeneratorInput): string {
+   209→  const base = renderTypeRef(field.type, input.render);
+   210→  if (field.optional && field.type.kind !== 'optional') return `*${base}`;
+   211→  return base;
+   212→}
+   213→
+   214→function goUnion(
+   215→  union: IRTypeDefinition & { kind: 'union' },
+   216→  input: GeneratorInput,
+   217→  imports: GoImports,
+   218→): string {
+   219→  imports.add('encoding/json');
+   220→  imports.add('fmt');
+   221→  let out = '';
+   222→  const variantLines = union.variants.map(
+   223→    (v) => `  - ${v.name}: ${renderTypeRef(v.type, input.render)}`,
+   224→  );
+   225→  const docText = [
+   226→    `Tagged union. Wire format: {"kind": "<variant>", "value": <payload>}.`,
+   227→    'Variants:',
+   228→    ...variantLines,
+   229→  ];
+   230→  if (union.docs !== undefined) docText.unshift(...docLines(union.docs));
+   231→  const doc = goDoc(docText.join('\n'), union.deprecated);
+   232→  if (doc.length > 0) out += `${doc}\n`;
+   233→  out += `type ${union.name} struct {\n`;
+   234→  out += `${tab('// Kind selects the union variant.')}\n`;
+   235→  out += `\tKind string \`json:"kind"\`\n`;
+   236→  out += `${tab('// Value is the JSON payload for the selected variant.')}\n`;
+   237→  out += `\tValue json.RawMessage \`json:"value"\`\n`;
+   238→  out += '}\n\n';
+   239→
+   240→  const receiver = goReceiver(union.name);
+   241→  for (const variant of union.variants) {
+   242→    const variantGoName = goExportedName(variant.name);
+   243→    const payloadType = renderTypeRef(variant.type, input.render);
+   244→    const zero = goZeroValue(variant.type, input.render);
+   245→    const vdoc = goDoc(variant.docs, variant.deprecated);
+   246→
+   247→    if (vdoc.length > 0) out += `${vdoc}\n`;
+   248→    out += `${goDoc(`New${union.name}${variantGoName} builds a ${union.name} carrying the ${variant.name} variant.`)}\n`;
+   249→    out += `func New${union.name}${variantGoName}(value ${payloadType}) (${union.name}, error) {\n`;
+   250→    out += `\traw, err := json.Marshal(value)\n`;
+   251→    out += `\tif err != nil {\n`;
+   252→    out += `\t\treturn ${union.name}{}, fmt.Errorf("marshal ${variant.name}: %w", err)\n`;
+   253→    out += `\t}\n`;
+   254→    out += `\treturn ${union.name}{Kind: ${JSON.stringify(variant.name)}, Value: raw}, nil\n`;
+   255→    out += '}\n\n';
+   256→
+   257→    if (vdoc.length > 0) out += `${vdoc}\n`;
+   258→    out += `${goDoc(`As${variantGoName} returns the ${variant.name} payload when Kind == ${JSON.stringify(variant.name)}.`)}\n`;
+   259→    out += `func (${receiver} ${union.name}) As${variantGoName}() (${payloadType}, bool) {\n`;
+   260→    out += `\tif ${receiver}.Kind != ${JSON.stringify(variant.name)} {\n`;
+   261→    out += `\t\treturn ${zero}, false\n`;
+   262→    out += `\t}\n`;
+   263→    out += `\tvar out ${payloadType}\n`;
+   264→    out += `\tif err := json.Unmarshal(${receiver}.Value, &out); err != nil {\n`;
+   265→    out += `\t\treturn ${zero}, false\n`;
+   266→    out += `\t}\n`;
+   267→    out += `\treturn out, true\n`;
+   268→    out += '}\n\n';
+   269→  }
+   270→  return out;
+   271→}
+   272→
+   273→function goSetSupport(): string {
+   274→  let out = '';
+   275→  out += `${goDoc('Set is a set of comparable items. On the JSON wire it is an array.')}\n`;
+   276→  out += 'type Set[T comparable] map[T]struct{}\n\n';
+   277→  out += `${goDoc('MarshalJSON encodes the set as a JSON array in deterministic (stringified) key order.')}\n`;
+   278→  out += 'func (s Set[T]) MarshalJSON() ([]byte, error) {\n';
+   279→  out += '\titems := make([]T, 0, len(s))\n';
+   280→  out += '\tfor item := range s {\n';
+   281→  out += '\t\titems = append(items, item)\n';
+   282→  out += '\t}\n';
+   283→  out += '\tsort.Slice(items, func(i, j int) bool {\n';
+   284→  out += '\t\treturn fmt.Sprint(items[i]) < fmt.Sprint(items[j])\n';
+   285→  out += '\t})\n';
+   286→  out += '\treturn json.Marshal(items)\n';
+   287→  out += '}\n\n';
+   288→  out += `${goDoc('UnmarshalJSON decodes the set from a JSON array.')}\n`;
+   289→  out += 'func (s *Set[T]) UnmarshalJSON(data []byte) error {\n';
+   290→  out += '\tvar items []T\n';
+   291→  out += '\tif err := json.Unmarshal(data, &items); err != nil {\n';
+   292→  out += '\t\treturn err\n';
+   293→  out += '\t}\n';
+   294→  out += '\tout := make(Set[T], len(items))\n';
+   295→  out += '\tfor _, item := range items {\n';
+   296→  out += '\t\tout[item] = struct{}{}\n';
+   297→  out += '\t}\n';
+   298→  out += '\t*s = out\n';
+   299→  out += '\treturn nil\n';
+   300→  out += '}\n\n';
+   301→  out += `${goDoc('SetToSlice converts a Set into its JSON-array representation (deterministic order).')}\n`;
+   302→  out += 'func SetToSlice[T comparable](s Set[T]) []T {\n';
+   303→  out += '\traw, err := json.Marshal(s)\n';
+   304→  out += '\tif err != nil {\n';
+   305→  out += '\t\treturn nil\n';
+   306→  out += '\t}\n';
+   307→  out += '\tvar items []T\n';
+   308→  out += '\tif err := json.Unmarshal(raw, &items); err != nil {\n';
+   309→  out += '\t\treturn nil\n';
+   310→  out += '\t}\n';
+   311→  out += '\treturn items\n';
+   312→  out += '}\n\n';
+   313→  out += `${goDoc('SliceToSet converts a JSON-array representation into a Set.')}\n`;
+   314→  out += 'func SliceToSet[T comparable](items []T) Set[T] {\n';
+   315→  out += '\tout := make(Set[T], len(items))\n';
+   316→  out += '\tfor _, item := range items {\n';
+   317→  out += '\t\tout[item] = struct{}{}\n';
+   318→  out += '\t}\n';
+   319→  out += '\treturn out\n';
+   320→  out += '}\n\n';
+   321→  return out;
+   322→}
+   323→
+   324→/* ------------------------------------------------------------------ */
+   325→/* enums.go                                                            */
+   326→/* ------------------------------------------------------------------ */
+   327→
+   328→function goEnumsFile(input: GeneratorInput): GeneratedFile | undefined {
+   329→  const enums = sortedTypes(input.ir).filter((t) => t.kind === 'enum');
+   330→  if (enums.length === 0) return undefined;
+   331→  const imports = new GoImports();
+   332→  imports.add('encoding/json');
+   333→  imports.add('fmt');
+   334→  let body = '';
+   335→  for (const enumType of enums) {
+   336→    body += goEnum(enumType as IRTypeDefinition & { kind: 'enum' });
+   337→  }
+   338→  const parts = [
+   339→    fileHeader('go', input.packageName),
+   340→    '',
+   341→    goPackageClause(input.packageName),
+   342→    '',
+   343→    imports.block(),
+   344→    '',
+   345→    body.trimEnd(),
+   346→    '',
+   347→  ];
+   348→  return generatedFile('enums.go', parts.join('\n'));
+   349→}
+   350→
+   351→function goEnum(enumType: IRTypeDefinition & { kind: 'enum' }): string {
+   352→  let out = '';
+   353→  const doc = goDoc(enumType.docs, enumType.deprecated);
+   354→  if (doc.length > 0) out += `${doc}\n`;
+   355→  out += `type ${enumType.name} string\n\n`;
+   356→  out += `// ${enumType.name} variants.\n`;
+   357→  out += 'const (\n';
+   358→  for (const variant of enumType.variants) {
+   359→    const vdoc = goDoc(variant.docs, variant.deprecated);
+   360→    if (vdoc.length > 0) out += `${tab(vdoc)}\n`;
+   361→    out += `\t${goConstName(enumType, variant.name)} ${enumType.name} = ${JSON.stringify(variant.name)}\n`;
+   362→  }
+   363→  out += ')\n\n';
+   364→
+   365→  const parse = `${goSafeIdent('Parse')}${enumType.name}`;
+   366→  out += `${goDoc(`${parse} parses the wire representation into a ${enumType.name}.`)}\n`;
+   367→  out += `func ${parse}(value string) (${enumType.name}, error) {\n`;
+   368→  out += '\tswitch value {\n';
+   369→  for (const variant of enumType.variants) {
+   370→    out += `\tcase ${JSON.stringify(variant.name)}:\n`;
+   371→    out += `\t\treturn ${goConstName(enumType, variant.name)}, nil\n`;
+   372→  }
+   373→  out += '\t}\n';
+   374→  out += `\treturn "", fmt.Errorf("unknown ${enumType.name} value %q", value)\n`;
+   375→  out += '}\n\n';
+   376→
+   377→  out += `${goDoc(`MarshalJSON encodes ${enumType.name} as its wire representation.`)}\n`;
+   378→  out += `func (e ${enumType.name}) MarshalJSON() ([]byte, error) {\n`;
+   379→  out += '\tswitch e {\n';
+   380→  for (const variant of enumType.variants) {
+   381→    out += `\tcase ${goConstName(enumType, variant.name)}:\n`;
+   382→    out += `\t\treturn []byte(${JSON.stringify(JSON.stringify(variant.name))}), nil\n`;
+   383→  }
+   384→  out += '\t}\n';
+   385→  out += `\treturn nil, fmt.Errorf("cannot marshal invalid ${enumType.name} value %q", string(e))\n`;
+   386→  out += '}\n\n';
+   387→
+   388→  out += `${goDoc(`UnmarshalJSON decodes ${enumType.name} from its wire representation, erroring on unknown values.`)}\n`;
+   389→  out += `func (e *${enumType.name}) UnmarshalJSON(data []byte) error {\n`;
+   390→  out += '\tvar raw string\n';
+   391→  out += '\tif err := json.Unmarshal(data, &raw); err != nil {\n';
+   392→  out += '\t\treturn err\n';
+   393→  out += '\t}\n';
+   394→  out += `\tparsed, err := ${parse}(raw)\n`;
+   395→  out += '\tif err != nil {\n';
+   396→  out += '\t\treturn err\n';
+   397→  out += '\t}\n';
+   398→  out += '\t*e = parsed\n';
+   399→  out += '\treturn nil\n';
+   400→  out += '}\n\n';
+   401→  return out;
+   402→}
+   403→
+   404→function goConstName(enumType: IRTypeDefinition & { kind: 'enum' }, variant: string): string {
+   405→  return `${enumType.name}${pascalFromScreaming(variant)}`;
+   406→}
+   407→
+   408→/* ------------------------------------------------------------------ */
+   409→/* validate.go                                                         */
+   410→/* ------------------------------------------------------------------ */
+   411→
+   412→function goValidateFile(input: GeneratorInput): GeneratedFile | undefined {
+   413→  const structs = sortedTypes(input.ir).filter((t) => t.kind === 'struct');
+   414→  if (structs.length === 0) return undefined;
+   415→
+   416→  const imports = new GoImports();
+   417→  imports.add('fmt');
+   418→  let regexBlock = '';
+   419→  let usesEmail = false;
+   420→  let usesURL = false;
+   421→  let usesUUID = false;
+   422→
+   423→  // Shared + per-field regex variables.
+   424→  for (const struct of structs) {
+   425→    for (const field of (struct as IRTypeDefinition & { kind: 'struct' }).fields) {
+   426→      for (const constraint of field.constraints) {
+   427→        if (constraint.kind === 'pattern') {
+   428→          imports.add('regexp');
+   429→          const arg = constraint.args[0] ?? '';
+   430→          regexBlock += `// ${goPatternVar(struct.name, field.name)} matches the @pattern constraint on ${struct.name}.${goExportedName(field.name)}.\n`;
+   431→          regexBlock += `var ${goPatternVar(struct.name, field.name)} = regexp.MustCompile(${JSON.stringify(arg)})\n\n`;
+   432→        } else if (constraint.kind === 'email') {
+   433→          usesEmail = true;
+   434→        } else if (constraint.kind === 'url') {
+   435→          usesURL = true;
+   436→        } else if (constraint.kind === 'uuid') {
+   437→          usesUUID = true;
+   438→        }
+   439→      }
+   440→    }
+   441→  }
+   442→  if (usesEmail || usesURL || usesUUID) imports.add('regexp');
+   443→  if (usesEmail) {
+   444→    regexBlock = `// ${GO_EMAIL_RE} implements the @email constraint: ^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$\nvar ${GO_EMAIL_RE} = regexp.MustCompile("^[^@\\\\s]+@[^@\\\\s]+\\\\.[^@\\\\s]+$")\n\n${regexBlock}`;
+   445→  }
+   446→  if (usesURL) {
+   447→    regexBlock = `// ${GO_URL_RE} implements the @url constraint: ^https?://\\S+$\nvar ${GO_URL_RE} = regexp.MustCompile("^https?://\\\\S+$")\n\n${regexBlock}`;
+   448→  }
+   449→  if (usesUUID) {
+   450→    regexBlock = `// ${GO_UUID_RE} implements the @uuid constraint (8-4-4-4-12 hex).\nvar ${GO_UUID_RE} = regexp.MustCompile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")\n\n${regexBlock}`;
+   451→  }
+   452→
+   453→  let body = '';
+   454→  for (const struct of structs) {
+   455→    body += goValidateStruct(struct as IRTypeDefinition & { kind: 'struct' }, input, imports);
+   456→  }
+   457→
+   458→  const parts = [
+   459→    fileHeader('go', input.packageName),
+   460→    '',
+   461→    goPackageClause(input.packageName),
+   462→    '',
+   463→    imports.block(),
+   464→  ];
+   465→  if (regexBlock.length > 0) parts.push('', regexBlock.trimEnd());
+   466→  parts.push('', body.trimEnd(), '');
+   467→  return generatedFile('validate.go', parts.join('\n'));
+   468→}
+   469→
+   470→/** Variable name for a @pattern constraint regex. */
+   471→function goPatternVar(typeName: string, fieldName: string): string {
+   472→  return `re${typeName}${goExportedName(fieldName)}`;
+   473→}
+   474→
+   475→function goValidateStruct(
+   476→  struct: IRTypeDefinition & { kind: 'struct' },
+   477→  input: GeneratorInput,
+   478→  imports: GoImports,
+   479→): string {
+   480→  let out = '';
+   481→  out += `${goDoc(`Validate checks the constraints declared on ${struct.name}. The first violation is returned, wrapped with the field name.`)}\n`;
+   482→  const receiver = goReceiver(struct.name);
+   483→  out += `func (${receiver} ${struct.name}) Validate() error {\n`;
+   484→  for (const field of struct.fields) {
+   485→    out += goFieldValidation(struct, field, input, imports);
+   486→  }
+   487→  for (const field of struct.fields) {
+   488→    out += goNestedValidation(struct, field, input);
+   489→  }
+   490→  out += '\treturn nil\n';
+   491→  out += '}\n\n';
+   492→  return out;
+   493→}
+   494→
+   495→function goFieldValidation(
+   496→  struct: IRTypeDefinition & { kind: 'struct' },
+   497→  field: IRField,
+   498→  input: GeneratorInput,
+   499→  imports: GoImports,
+   500→): string {
+   501→  let out = '';
+   502→  const receiver = goReceiver(struct.name);
+   503→  const goField = goExportedName(field.name);
+   504→  const valueExpr = field.optional
+   505→    ? `*${receiver}.${goField}`
+   506→    : `${receiver}.${goField}`;
+   507→
+   508→  for (const constraint of field.constraints) {
+   509→    const rendered = goConstraintCheck(constraint, struct, field, valueExpr, input, imports);
+   510→    if (rendered === undefined) continue;
+   511→    if (field.optional) {
+   512→      out += `\tif ${receiver}.${goField} != nil {\n`;
+   513→      out += tab(rendered.trimEnd(), 1) + '\n';
+   514→      out += `\t}\n`;
+   515→    } else {
+   516→      out += rendered;
+   517→    }
+   518→  }
+   519→  return out;
+   520→}
+   521→
+   522→function goConstraintCheck(
+   523→  constraint: IRConstraint,
+   524→  struct: IRTypeDefinition & { kind: 'struct' },
+   525→  field: IRField,
+   526→  valueExpr: string,
+   527→  input: GeneratorInput,
+   528→  imports: GoImports,
+   529→): string | undefined {
+   530→  const fail = (fallback: string): string => {
+   531→    const msg = constraint.message ?? fallback;
+   532→    return `\t\treturn fmt.Errorf(${JSON.stringify(`${field.name}: ${msg}`)})\n`;
+   533→  };
+   534→  void input;
+   535→
+   536→  switch (constraint.kind) {
+   537→    case 'min':
+   538→    case 'max': {
+   539→      if (!isNumericField(field)) return undefined;
+   540→      const arg = constraint.args[0] ?? '';
+   541→      const op = constraint.kind === 'min' ? '<' : '>';
+   542→      const text = constraint.kind === 'min' ? `must be >= ${arg}` : `must be <= ${arg}`;
+   543→      return `\tif ${valueExpr} ${op} ${arg} {\n${fail(text)}\t}\n`;
+   544→    }
+   545→    case 'length': {
+   546→      if (!isStringLikeField(field)) return undefined;
+   547→      const arg = constraint.args[0] ?? '';
+   548→      // len() counts bytes; docs note the unicode caveat.
+   549→      return `\tif len(${valueExpr}) != ${arg} {\n${fail(`must be exactly ${arg} characters`)}\t}\n`;
+   550→    }
+   551→    case 'email': {
+   552→      if (!isStringLikeField(field)) return undefined;
+   553→      return `\tif !${GO_EMAIL_RE}.MatchString(${valueExpr}) {\n${fail('must be a valid email address')}\t}\n`;
+   554→    }
+   555→    case 'url': {
+   556→      if (!isStringLikeField(field)) return undefined;
+   557→      return `\tif !${GO_URL_RE}.MatchString(${valueExpr}) {\n${fail('must be a valid URL')}\t}\n`;
+   558→    }
+   559→    case 'uuid': {
+   560→      if (!isStringLikeField(field)) return undefined;
+   561→      return `\tif !${GO_UUID_RE}.MatchString(${valueExpr}) {\n${fail('must be a valid UUID')}\t}\n`;
+   562→    }
+   563→    case 'pattern': {
+   564→      if (!isStringLikeField(field)) return undefined;
+   565→      const arg = constraint.args[0] ?? '';
+   566→      const varName = goPatternVar(struct.name, field.name);
+   567→      return `\tif !${varName}.MatchString(${valueExpr}) {\n${fail(`must match pattern ${arg}`)}\t}\n`;
+   568→    }
+   569→    default:
+   570→      return undefined;
+   571→  }
+   572→}
+   573→
+   574→function goNestedValidation(
+   575→  struct: IRTypeDefinition & { kind: 'struct' },
+   576→  field: IRField,
+   577→  input: GeneratorInput,
+   578→): string {
+   579→  let ref: TypeRef = field.type;
+   580→  if (ref.kind === 'optional') ref = ref.inner;
+   581→  if (!isLocalStructRef(ref, input.ir)) return '';
+   582→  const receiver = goReceiver(struct.name);
+   583→  const goField = goExportedName(field.name);
+   584→  let out = '';
+   585→  if (field.optional) {
+   586→    out += `\tif ${receiver}.${goField} != nil {\n`;
+   587→    out += `\t\tif err := ${receiver}.${goField}.Validate(); err != nil {\n`;
+   588→    out += `\t\t\treturn fmt.Errorf("${field.name}: %w", err)\n`;
+   589→    out += `\t\t}\n`;
+   590→    out += `\t}\n`;
+   591→  } else {
+   592→    out += `\tif err := ${receiver}.${goField}.Validate(); err != nil {\n`;
+   593→    out += `\t\treturn fmt.Errorf("${field.name}: %w", err)\n`;
+   594→    out += `\t}\n`;
+   595→  }
+   596→  return out;
+   597→}
+   598→
+   599→function isNumericField(field: IRField): boolean {
+   600→  const t = unwrapOptional(field.type);
+   601→  return t.kind === 'primitive' && NUMERIC_PRIMITIVES.has(t.primitive);
+   602→}
+   603→
+   604→function isStringLikeField(field: IRField): boolean {
+   605→  const t = unwrapOptional(field.type);
+   606→  return t.kind === 'primitive' && STRING_LIKE_PRIMITIVES.has(t.primitive);
+   607→}
+   608→
+   609→function unwrapOptional(ref: TypeRef): TypeRef {
+   610→  return ref.kind === 'optional' ? ref.inner : ref;
+   611→}
+   612→
+   613→/* ------------------------------------------------------------------ */
+   614→/* services.go                                                         */
+   615→/* ------------------------------------------------------------------ */
+   616→
+   617→function goServicesFile(input: GeneratorInput): GeneratedFile | undefined {
+   618→  if (!input.generateServices) return undefined;
+   619→  const services = sortedServices(input.ir);
+   620→  if (services.length === 0) return undefined;
+   621→
+   622→  let body = '';
+   623→  body += `${goDoc('HTTPDoer executes HTTP requests. *http.Client implements it.')}\n`;
+   624→  body += 'type HTTPDoer interface {\n';
+   625→  body += '\tDo(req *http.Request) (*http.Response, error)\n';
+   626→  body += '}\n\n';
+   627→  for (const service of services) {
+   628→    body += goService(service, input);
+   629→  }
+   630→
+   631→  const parts = [
+   632→    fileHeader('go', input.packageName),
+   633→    '',
+   634→    goPackageClause(input.packageName),
+   635→    '',
+   636→    'import (\n\t"bytes"\n\t"context"\n\t"encoding/json"\n\t"fmt"\n\t"io"\n\t"net/http"\n\t"strings"\n)',
+   637→    '',
+   638→    body.trimEnd(),
+   639→    '',
+   640→  ];
+   641→  return generatedFile('services.go', parts.join('\n'));
+   642→}
+   643→
+   644→function goService(service: IRService, input: GeneratorInput): string {
+   645→  let out = '';
+   646→  const serverDocs = [`${service.name}Server is the server interface for the ${service.name} service.`];
+   647→  if (service.docs !== undefined) serverDocs.unshift(...docLines(service.docs));
+   648→  const sdoc = goDoc(serverDocs.join('\n'));
+   649→  if (sdoc.length > 0) out += `${sdoc}\n`;
+   650→  out += `type ${service.name}Server interface {\n`;
+   651→  for (const method of service.methods) {
+   652→    const mdoc = goDoc(method.docs, method.deprecated);
+   653→    if (mdoc.length > 0) out += `${tab(mdoc)}\n`;
+   654→    out += `\t${method.name}(ctx context.Context, req *${methodTypeName(method.input, input)}) (*${methodTypeName(method.output, input)}, error)\n`;
+   655→  }
+   656→  out += '}\n\n';
+   657→
+   658→  const clientDocs = [
+   659→    `${service.name}JSONClient is a JSON-over-HTTP client for the ${service.name} service.`,
+   660→    `Routes: POST /${input.packageName}/${service.name}/<Method>.`,
+   661→  ];
+   662→  out += `${goDoc(clientDocs.join('\n'))}\n`;
+   663→  out += `type ${service.name}JSONClient struct {\n`;
+   664→  out += '\tbaseURL string\n';
+   665→  out += '\thttp    HTTPDoer\n';
+   666→  out += '}\n\n';
+   667→  out += `${goDoc(`New${service.name}JSONClient creates a client. baseURL must not have a trailing slash.`)}\n`;
+   668→  out += `func New${service.name}JSONClient(doer HTTPDoer, baseURL string) *${service.name}JSONClient {\n`;
+   669→  out += `\treturn &${service.name}JSONClient{baseURL: baseURL, http: doer}\n`;
+   670→  out += '}\n\n';
+   671→
+   672→  for (const method of service.methods) {
+   673→    const mdoc = goDoc(method.docs, method.deprecated);
+   674→    if (mdoc.length > 0) out += `${mdoc}\n`;
+   675→    const inType = methodTypeName(method.input, input);
+   676→    const outType = methodTypeName(method.output, input);
+   677→    out += `func (c *${service.name}JSONClient) ${method.name}(req *${inType}) (*${outType}, error) {\n`;
+   678→    out += `\tvar out ${outType}\n`;
+   679→    out += `\tif err := c.do(${JSON.stringify(method.name)}, req, &out); err != nil {\n`;
+   680→    out += '\t\treturn nil, err\n';
+   681→    out += '\t}\n';
+   682→    out += '\treturn &out, nil\n';
+   683→    out += '}\n\n';
+   684→  }
+   685→
+   686→  out += goClientDoHelper(service, input.packageName);
+   687→  return out;
+   688→}
+   689→
+   690→function goClientDoHelper(service: IRService, packageName: string): string {
+   691→  let out = '';
+   692→  out += `${goDoc('do marshals req as JSON, POSTs it to /<package>/<Service>/<Method> and decodes the JSON response.')}\n`;
+   693→  out += `func (c *${service.name}JSONClient) do(method string, req any, out any) error {\n`;
+   694→  out += '\tbody, err := json.Marshal(req)\n';
+   695→  out += '\tif err != nil {\n';
+   696→  out += '\t\treturn fmt.Errorf("marshal request: %w", err)\n';
+   697→  out += '\t}\n';
+   698→  out += `\turl := strings.TrimSuffix(c.baseURL, "/") + ${JSON.stringify(`/${packageName}/${service.name}/`)} + method\n`;
+   699→  out += `\thttpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))\n`;
+   700→  out += '\tif err != nil {\n';
+   701→  out += '\t\treturn fmt.Errorf("build request: %w", err)\n';
+   702→  out += '\t}\n';
+   703→  out += '\thttpReq.Header.Set("Content-Type", "application/json")\n';
+   704→  out += '\tresp, err := c.http.Do(httpReq)\n';
+   705→  out += '\tif err != nil {\n';
+   706→  out += `\t\treturn fmt.Errorf("call %s: %w", method, err)\n`;
+   707→  out += '\t}\n';
+   708→  out += '\tdefer resp.Body.Close()\n';
+   709→  out += '\trespBody, err := io.ReadAll(resp.Body)\n';
+   710→  out += '\tif err != nil {\n';
+   711→  out += '\t\treturn fmt.Errorf("read response: %w", err)\n';
+   712→  out += '\t}\n';
+   713→  out += '\tif resp.StatusCode < 200 || resp.StatusCode > 299 {\n';
+   714→  out += `\t\treturn fmt.Errorf("%s: non-2xx status %d: %s", method, resp.StatusCode, string(respBody))\n`;
+   715→  out += '\t}\n';
+   716→  out += '\tif err := json.Unmarshal(respBody, out); err != nil {\n';
+   717→  out += '\t\treturn fmt.Errorf("unmarshal response: %w", err)\n';
+   718→  out += '\t}\n';
+   719→  out += '\treturn nil\n';
+   720→  out += '}\n\n';
+   721→  return out;
+   722→}
+   723→
+   724→/* ------------------------------------------------------------------ */
+   725→/* events.go                                                           */
+   726→/* ------------------------------------------------------------------ */
+   727→
+   728→function goEventsFile(input: GeneratorInput): GeneratedFile | undefined {
+   729→  if (!input.generateEvents) return undefined;
+   730→  const events = sortedEvents(input.ir);
+   731→  if (events.length === 0) return undefined;
+   732→
+   733→  let body = '';
+   734→  for (const event of events) {
+   735→    body += goEvent(event, input);
+   736→  }
+   737→
+   738→  const parts = [
+   739→    fileHeader('go', input.packageName),
+   740→    '',
+   741→    goPackageClause(input.packageName),
+   742→    '',
+   743→    'import (\n\t"encoding/json"\n\t"fmt"\n)',
+   744→    '',
+   745→    body.trimEnd(),
+   746→    '',
+   747→  ];
+   748→  return generatedFile('events.go', parts.join('\n'));
+   749→}
+   750→
+   751→function goEvent(event: import('@bridge/core').IREvent, input: GeneratorInput): string {
+   752→  let out = '';
+   753→  const doc = goDoc(event.docs);
+   754→  if (doc.length > 0) out += `${doc}\n`;
+   755→  out += `type ${event.name} struct {\n`;
+   756→  for (const field of event.fields) {
+   757→    const fdoc = goDoc(field.docs, field.deprecated);
+   758→    if (fdoc.length > 0) out += `${tab(fdoc)}\n`;
+   759→    const base = renderTypeRef(field.type, input.render);
+   760→    const goType = field.optional && field.type.kind !== 'optional' ? `*${base}` : base;
+   761→    const tag = field.optional ? ` json:"${field.name},omitempty"` : ` json:"${field.name}"`;
+   762→    out += `\t${goExportedName(field.name)} ${goType} \`${tag}\`\n`;
+   763→  }
+   764→  out += '}\n\n';
+   765→
+   766→  out += `type ${event.name}Envelope struct {\n`;
+   767→  out += `\tEvent string \`json:"event"\`\n`;
+   768→  out += `\tPayload ${event.name} \`json:"payload"\`\n`;
+   769→  out += '}\n\n';
+   770→
+   771→  out += `${goDoc(`Envelope wraps the ${event.name} in the Bridge wire envelope: {"event": name, "payload": {...}}.`)}\n`;
+   772→  out += `func (e ${event.name}) Envelope() ${event.name}Envelope {\n`;
+   773→  out += `\treturn ${event.name}Envelope{Event: ${JSON.stringify(event.name)}, Payload: e}\n`;
+   774→  out += '}\n\n';
+   775→
+   776→  out += `${goDoc(`Decode${event.name}Envelope decodes an envelope and verifies the event name.`)}\n`;
+   777→  out += `func Decode${event.name}Envelope(data []byte) (${event.name}Envelope, error) {\n`;
+   778→  out += `\tvar env ${event.name}Envelope\n`;
+   779→  out += '\tif err := json.Unmarshal(data, &env); err != nil {\n';
+   780→  out += `\t\treturn ${event.name}Envelope{}, err\n`;
+   781→  out += '\t}\n';
+   782→  out += `\tif env.Event != ${JSON.stringify(event.name)} {\n`;
+   783→  out += `\t\treturn ${event.name}Envelope{}, fmt.Errorf("unexpected event %q, want %q", env.Event, ${JSON.stringify(event.name)})\n`;
+   784→  out += '\t}\n';
+   785→  out += '\treturn env, nil\n';
+   786→  out += '}\n\n';
+   787→  return out;
+   788→}
+   789→
+   790→/** Method input/output type: named refs render as the type name. */
+   791→function methodTypeName(ref: TypeRef, input: GeneratorInput): string {
+   792→  if (ref.kind === 'named') return ref.name;
+   793→  return renderTypeRef(ref, input.render);
+   794→}
+   795→
