@@ -20,16 +20,20 @@
 import {
   compileSource,
   formatSource,
+  KEYWORDS,
+  PRIMITIVES,
   type CompileResult,
   type Diagnostic,
   type IRPackage,
 } from '@bridge/core';
 import {
+  CompletionItemKind,
   DiagnosticSeverity,
   Methods,
   TextDocumentSyncKind,
   type DocumentDiagnosticReport,
   type Hover,
+  type CompletionItem,
   type InitializeResult,
   type LspDiagnostic,
   type PublishDiagnosticsParams,
@@ -40,6 +44,7 @@ import {
   fullDocumentRange,
   identifierAt,
   toLspPosition,
+  wordPrefixAt,
 } from './positions';
 import { typeDeclToText } from './render';
 import { ErrorCodes, type JsonRpcErrorBody, type JsonRpcMessage } from './jsonrpc';
@@ -149,6 +154,8 @@ export class BridgeLspServer {
         return this.hover(id, params);
       case Methods.Formatting:
         return this.formatting(id, params);
+      case Methods.Completion:
+        return this.completion(id, params);
       case Methods.DocumentDiagnostic:
         return this.pullDiagnostics(id, params);
       default:
@@ -313,6 +320,55 @@ export class BridgeLspServer {
       newText: result.output,
     };
     this.respond(id, [edit]);
+  }
+
+  // ------------------------------------------------------------ completion
+
+  /**
+   * `textDocument/completion`: Bridge keywords + primitive types + the
+   * named types declared in the current document's IR (from the last clean
+   * compile while the text is broken). No trigger characters in v1; items
+   * are filtered by the typed prefix. Returns a plain `CompletionItem[]`.
+   */
+  private completion(id: number | string | null, params: unknown): void {
+    const parsed = hoverParams(params);
+    if (parsed === undefined) {
+      return this.respondError(id, ErrorCodes.InvalidParams, 'Invalid params: expected { textDocument: { uri }, position }.');
+    }
+    const uri = parsed.textDocument.uri;
+    const doc = this.documents.get(uri);
+    if (doc === undefined) return this.respond(id, []);
+
+    const prefix = wordPrefixAt(doc.text, parsed.position);
+    const startsWithPrefix = (label: string): boolean => label.startsWith(prefix);
+
+    const items: CompletionItem[] = [];
+    for (const keyword of KEYWORDS) {
+      if (startsWithPrefix(keyword)) {
+        items.push({ label: keyword, kind: CompletionItemKind.Keyword, detail: 'Bridge keyword', insertText: keyword });
+      }
+    }
+    for (const primitive of PRIMITIVES) {
+      if (startsWithPrefix(primitive)) {
+        items.push({ label: primitive, kind: CompletionItemKind.Class, detail: 'Bridge primitive type', insertText: primitive });
+      }
+    }
+
+    // Named types from the current document (last clean IR while broken).
+    this.compile(uri, doc.text);
+    const ir = this.lastGoodIr.get(uri);
+    for (const definition of ir?.types ?? []) {
+      if (!startsWithPrefix(definition.name)) continue;
+      const item: CompletionItem = {
+        label: definition.name,
+        kind: completionKind(definition),
+        detail: `${definition.kind} ${definition.name}`,
+      };
+      if (definition.docs !== undefined) item.documentation = definition.docs;
+      items.push(item);
+    }
+
+    this.respond(id, items);
   }
 
   // ---------------------------------------------------------- diagnostics
@@ -501,4 +557,16 @@ function hoverMarkdown(definition: import('@bridge/core').IRTypeDefinition): str
 
 function internalMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/** LSP CompletionItemKind for an IR type definition. */
+function completionKind(definition: import('@bridge/core').IRTypeDefinition): number {
+  switch (definition.kind) {
+    case 'struct':
+      return CompletionItemKind.Struct;
+    case 'enum':
+      return CompletionItemKind.Enum;
+    default:
+      return CompletionItemKind.Class; // unions and aliases
+  }
 }
