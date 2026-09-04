@@ -14,7 +14,7 @@ import type { IRPackage } from './types';
  * whitespace. Undefined properties are omitted.
  */
 export function canonicalJson(value: unknown): string {
-  return canonicalize(value) as string;
+  return JSON.stringify(canonicalize(value)) as string;
 }
 
 function canonicalize(value: unknown): unknown {
