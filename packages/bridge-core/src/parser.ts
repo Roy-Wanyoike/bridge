@@ -501,9 +501,11 @@ class Parser {
     // `parseType` consumes a trailing `?` itself (wrapping the type), so the
     // marker must be recovered from the node to keep `name: T?` and `name?: T`
     // equivalent at the field level.
-    if (this.atPunct('?') || parsedType.kind === 'optional') {
+    if (this.atPunct('?')) {
       optional = true;
       this.next();
+    } else if (parsedType.kind === 'optional') {
+      optional = true;
     }
 
     const constraints: ConstraintNode[] = [];
