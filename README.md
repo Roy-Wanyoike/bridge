@@ -35,18 +35,40 @@ service Payments {
 
 ## Status
 
-**⚠ Bridge is under active development.** The foundation (IDL parser, canonical IR, compatibility engine, generators, CLI) is being built out. See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for current progress.
+**Bridge 0.1.0 — the Phase 1 foundation is complete and tested (311 tests green).** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
 
 | Area | Status |
 |------|--------|
-| Bridge IDL (lexer, parser, AST) | 🟡 In progress |
-| Canonical IR + schema hashing | 🟡 In progress |
-| Compatibility engine (`bridge diff`) | 🟡 In progress |
-| Generators (Go / Rust / TypeScript / Python) | 🟡 In progress |
-| CLI | 🟡 In progress |
-| Registry | 🔲 Planned |
-| RPC + event contracts | 🔲 Planned |
+| Bridge IDL (lexer, parser, AST, semantic analysis) | ✅ Shipped |
+| Canonical IR + deterministic schema hashing | ✅ Shipped |
+| Canonical formatter (`bridge fmt`) | ✅ Shipped |
+| Compatibility engine (`bridge diff`) | ✅ Shipped |
+| Generators (Go / Rust / TypeScript / Python) | ✅ Shipped |
+| CLI (init/validate/fmt/lint/generate/diff/check/publish/pull/versions/inspect/search/doctor) | ✅ Shipped |
+| Local registry (immutable, content-addressed) | ✅ Shipped |
+| Examples + docs + verification scripts | ✅ Shipped |
+| RPC + event transports | 🔲 Planned |
+| Registry service (server, auth, multi-tenancy) | 🔲 Planned |
 | Dashboard | 🔲 Planned |
+| LSP / IDE integration | 🔲 Planned |
+| FFI (Go ↔ Rust) + WASM target | 🔲 Planned |
+
+## Quick start
+
+```sh
+git clone https://github.com/Roy-Wanyoike/bridge.git
+cd bridge
+npm install && npm run build
+alias bridge="node $(pwd)/packages/bridge-cli/dist/bin/bridge.js"
+
+bridge init payments-service
+cd payments-service
+bridge validate                # compile the scaffolded contract
+bridge generate --language go  # also: rust | typescript | python
+bridge doctor
+```
+
+Read the [Quickstart](docs/QUICKSTART.md), the [IDL reference](docs/IDL_REFERENCE.md), and the [compatibility guide](docs/COMPATIBILITY.md). Browse the [runnable examples](examples/).
 
 ## Vision
 
