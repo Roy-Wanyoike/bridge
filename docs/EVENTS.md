@@ -74,6 +74,13 @@ Language notes:
 - **Go**: `json.Marshal`-based envelope; handler interfaces per event.
 - **Rust**: `serde_json::Value` payload plumbing; handlers receive decoded
   typed payloads; errors return `Result<(), String>`.
+- **Java**: payload classes + a per-package `BridgeEvents` holder
+  (`BridgeEventMeta`, `BridgeEventEnvelope`, `InMemoryEventBus`,
+  per-event `*_TYPE` constants and registration helpers); envelopes are
+  `Map<String, Object>` based, matching the JSON wire shape.
+- **C#**: payload classes + the same shared machinery
+  (`IEventPublisher`, `InMemoryEventBus`, `DecodeBridgeEventEnvelope`);
+  dictionaries mirror the JSON envelope one-to-one.
 
 ## Publishing and consuming
 

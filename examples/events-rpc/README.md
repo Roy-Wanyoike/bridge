@@ -1,12 +1,10 @@
 # events-rpc example
 
-Events + RPC end to end: generate code for this contract, then run the
-cross-language verification:
+Events + RPC end to end. The verification script regenerates the code for
+`store.bridge` itself, so the only steps are:
 
 ```sh
 bridge validate store.bridge
-bridge generate store.bridge --language python --out generated/python
-bridge generate store.bridge --language typescript --out generated/ts
 ../../scripts/verify-events-rpc.sh
 ```
 

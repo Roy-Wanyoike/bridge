@@ -1,5 +1,7 @@
 # Bridge
 
+[![CI](https://github.com/Roy-Wanyoike/bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/Roy-Wanyoike/bridge/actions/workflows/ci.yml)
+
 > **One contract. Every language. Zero interoperability drift.**
 
 ## The problem
@@ -10,7 +12,7 @@ If your stack spans more than one language, you live this: the same data contrac
 
 Bridge is a polyglot contract compiler and compatibility platform. You define data and service contracts once in the Bridge IDL. The compiler produces a canonical, hashable IR and from it:
 
-- **generates** idiomatic, dependency-free Go / Rust / TypeScript / Python — types, enums, tagged unions, service clients, event envelopes — with **runtime validators for every constraint**, so the same rules are enforced in every runtime, not just one;
+- **generates** idiomatic, dependency-free Go / Rust / TypeScript / Python / Java / C# — types, enums, tagged unions, service clients, event envelopes — with **runtime validators for every constraint**, so the same rules are enforced in every runtime, not just one;
 - **detects breaking changes** before they ship: `bridge diff` classifies every change SAFE / WARNING / BREAKING / UNKNOWN against the IR, and `bridge check` fails your pipeline (strict mode fails undecidable changes too — never silently safe);
 - **governs contracts** in a content-addressed registry: SHA-256 identity, immutable versions, tamper detection, and a dependency graph (`dependents`, `dependencies`) so impact analysis becomes a query, not archaeology.
 
@@ -25,10 +27,11 @@ $ bridge validate payments.bridge
 $ bridge generate payments.bridge --language go
 ✓ wrote generated/go/enums.go
 ✓ wrote generated/go/go.mod
+✓ wrote generated/go/roundtrip_test.go
 ✓ wrote generated/go/services.go
 ✓ wrote generated/go/types.go
 ✓ wrote generated/go/validate.go
-5 file(s) written to generated/go (go)
+6 file(s) written to generated/go (go)
 
 $ bridge diff v1.payments.bridge v2.payments.bridge
 BRIDGE COMPATIBILITY REPORT
@@ -46,7 +49,7 @@ That last one is the point: the rename a code reviewer would wave through fails 
 
 ## Why it matters
 
-- **One contract, N languages — by compiler, not by discipline.** Hand-maintained bindings and per-language validators are where drift enters. Bridge generates all four languages and the validators from one IR, so parity is enforced, not hoped for.
+- **One contract, N languages — by compiler, not by discipline.** Hand-maintained bindings and per-language validators are where drift enters. Bridge generates all six languages and the validators from one IR, so parity is enforced, not hoped for.
 - **Breaking changes are caught at merge time, with honest classification.** Checks are built into the compiler (not bolted onto a spec parser), deterministic, and conservative — an undecidable change is reported as UNKNOWN and fails the default gate.
 - **The registry answers the question no other tool can:** "who consumes this contract, and what does this change do to them?" Content-addressed, immutable, with a real dependency graph — one registry for your services, events, and APIs, not one per wire format.
 - **Built for the AI-agent era.** Agents calling typed tools are just more consumers of contracts. Bridge's constraint parity, deterministic hashing, and compatibility gates apply to machine-to-machine and model-to-tool surfaces the same way they apply to your Go and Python services.
@@ -92,7 +95,7 @@ Every target below is generated from the same IR — types, enums, tagged unions
 | Python   | ✅ Shipped | stdlib dataclasses; `to_dict`/`from_dict` round-trip |
 | Java     | ✅ Shipped | JDK-only (zero deps, incl. a generated JSON runtime); Maven project file |
 | C#       | ✅ Shipped | System.Text.Json only; .csproj; structural value equality |
-| WASM     | ✅ Shipped | wasm-bindgen types with `fromJson`/`toJson`/`validate` from JS |
+| WASM     | ✅ Shipped | via `@bridge/ffi` (`wasm32` cdylib + wasm-bindgen types with `fromJson`/`toJson`/`validate` from JS) — not a `bridge generate --language` target |
 
 Every generated language is compile-verified in CI against the runnable
 examples, and every generated package ships a round-trip test. The FFI
@@ -101,7 +104,7 @@ see [docs/FFI.md](docs/FFI.md).
 
 ## Status
 
-**Bridge 0.2.0 — the roadmap through Phase 3 is shipped and tested: 569 tests green across nine packages, every generated language compile-verified, and the Go↔Rust FFI proven end to end on real builds.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
+**Bridge 0.2.0 — the roadmap through Phase 3 is shipped and tested: 669 tests green across nine packages (CLI 98, compat 101, core 154, FFI 10, generators 18, LSP 33, registry 65, registry-service 78, serialization 112), every generated language compile-verified, and the Go↔Rust FFI proven end to end on real builds.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
 
 | Area | Status |
 |------|--------|
@@ -109,8 +112,8 @@ see [docs/FFI.md](docs/FFI.md).
 | Canonical IR + deterministic schema hashing | ✅ Shipped |
 | Canonical formatter (`bridge fmt`) | ✅ Shipped |
 | Compatibility engine (`bridge diff`) | ✅ Shipped |
-| Generators (Go / Rust / TypeScript / Python) | ✅ Shipped |
-| CLI (init/validate/fmt/lint/generate/diff/check/publish/pull/versions/inspect/search/doctor) | ✅ Shipped |
+| Generators (Go / Rust / TypeScript / Python / Java / C#) | ✅ Shipped |
+| CLI (init/validate/fmt/lint/generate/diff/check/impact/publish/pull/versions/inspect/search/doctor/version) | ✅ Shipped |
 | Local registry (immutable, content-addressed) | ✅ Shipped |
 | Examples + docs + verification scripts | ✅ Shipped |
 | Cross-language serialization round-trip matrix (Go↔Rust↔TS↔Python) | ✅ Shipped |
@@ -122,7 +125,7 @@ see [docs/FFI.md](docs/FFI.md).
 | Registry service (OIDC auth, multi-tenancy, signing, audit, rate limits, in-memory + PostgreSQL) | ✅ Shipped ([#18](https://github.com/Roy-Wanyoike/bridge/issues/18)) |
 | Dashboard (Next.js: contracts, diff reports, dependency graph, audit) | ✅ Shipped ([#20](https://github.com/Roy-Wanyoike/bridge/issues/20)) |
 | FFI (Go ↔ Rust over C ABI) + WASM target | ✅ Shipped ([#22](https://github.com/Roy-Wanyoike/bridge/issues/22)) |
-| Release engineering (binaries, containers, SBOM, signing, npm) | ✅ Shipped ([#24](https://github.com/Roy-Wanyoike/bridge/issues/24)) |
+| Release engineering (binaries, containers, SBOM, signing, npm) | ✅ Pipeline shipped ([#24](https://github.com/Roy-Wanyoike/bridge/issues/24)) — first release not yet cut (CI blocked by an Actions billing issue, see [RELEASE.md](RELEASE.md)) |
 
 ## Quick start
 
@@ -150,6 +153,11 @@ Read the [Quickstart](docs/QUICKSTART.md), the [IDL reference](docs/IDL_REFERENC
 | [docs/QUICKSTART.md](docs/QUICKSTART.md) | From empty directory to generated, verified code |
 | [docs/IDL_REFERENCE.md](docs/IDL_REFERENCE.md) | The full Bridge IDL: enums, unions, services, events, constraints |
 | [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | The classification matrix, CI gates, GitHub Actions recipe |
+| [docs/IMPACT.md](docs/IMPACT.md) | Consumer-aware impact analysis + CI governance (`bridge impact`) |
+| [docs/EVENTS.md](docs/EVENTS.md) | Event contracts: CloudEvents-style envelopes, publishers, dispatchers |
+| [docs/RPC.md](docs/RPC.md) | Typed RPC clients + HTTP server adapters, error model |
+| [docs/SERIALIZATION.md](docs/SERIALIZATION.md) | Golden vectors: byte-identical wire round-trips (MessagePack/CBOR) |
+| [docs/TESTING.md](docs/TESTING.md) | Test layers, property-based testing, fuzzing, repro instructions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The pipeline, the frozen IR contract, determinism guarantees |
 | [docs/FFI.md](docs/FFI.md) | Go↔Rust FFI over the C ABI + WASM: symbols, ownership, panic containment |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Three-phase public roadmap, linked to issues |
@@ -161,12 +169,17 @@ Read the [Quickstart](docs/QUICKSTART.md), the [IDL reference](docs/IDL_REFERENC
 ```
 bridge/
 ├── packages/
-│   ├── bridge-core/         # IDL lexer, parser, AST, semantic analysis, canonical IR
-│   ├── bridge-compat/       # Compatibility engine: diff, classification, impact
-│   ├── bridge-generators/   # Code generators: Go, Rust, TypeScript, Python
-│   ├── bridge-registry/     # Contract registry (local + service)
-│   └── bridge-cli/          # The `bridge` command line interface
-├── examples/                # Seven complete, runnable examples with verified demos
+│   ├── bridge-core/             # IDL lexer, parser, AST, semantic analysis, canonical IR
+│   ├── bridge-generators/       # Code generators: Go, Rust, TypeScript, Python, Java, C#
+│   ├── bridge-compat/           # Compatibility engine: diff, classification, impact
+│   ├── bridge-serialization/    # Wire formats (MessagePack/CBOR) + golden vectors
+│   ├── bridge-registry/         # Contract registry (local, content-addressed)
+│   ├── bridge-registry-service/ # Multi-tenant registry HTTP service (OIDC, audit, signing)
+│   ├── bridge-ffi/              # Cross-language FFI (C ABI) + WASM target
+│   ├── bridge-lsp/              # Language server for the IDL (JSON-RPC over stdio)
+│   └── bridge-cli/              # The `bridge` command line interface
+├── examples/                # Eight complete, runnable examples (seven with verified demo runs)
+├── dashboard/               # Next.js registry console (demo mode + live client)
 └── docs/                    # Public documentation + strategy
 ```
 
@@ -180,7 +193,7 @@ npm run build
 npm test
 ```
 
-Requires Node.js >= 22. The test suite covers all five packages (compiler, generators, compat engine, registry, CLI); the `scripts/verify-*.sh` files additionally type-check and round-trip the generated code for every example.
+Requires Node.js >= 22. The test suite covers all nine packages (669 tests: compiler, generators, compat + impact, serialization, local registry, registry service, FFI, LSP, CLI); the `scripts/verify-*.sh` files additionally type-check and round-trip the generated code for every example, including the Java and C# targets.
 
 ## Contributing
 

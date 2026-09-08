@@ -17,7 +17,13 @@ You can expect an initial response within 72 hours. We will keep you informed of
 
 In scope:
 
-- The Bridge compiler, CLI, generators, and registry.
+- The Bridge compiler, CLI, generators, and local registry.
+- The registry service (`@bridge/registry-service`) and its HTTP API —
+  authentication (OIDC/static tokens), multi-tenancy isolation, artifact
+  signing, audit log, rate limiting, and its storage drivers (in-memory,
+  PostgreSQL).
+- The dashboard (`dashboard/`) — its client against the registry service,
+  demo/live data handling, and any server-rendered surface.
 - Vulnerabilities allowing arbitrary code execution, path traversal, or denial of service via malicious `.bridge` files or registry payloads.
 - Supply chain issues in release artifacts.
 

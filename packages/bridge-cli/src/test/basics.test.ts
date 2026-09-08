@@ -7,7 +7,14 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { unifiedDiff } from '../difftext';
+import { CLI_VERSION } from '../meta';
 import { BROKEN, GOOD, run, tmpdir, UGLY, UNPARSEABLE, WARNY, writeFile } from './helpers';
+import { GENERATOR_VERSION } from '@bridge/generators';
+
+/** Escape a version string for use inside a RegExp. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 const tempRoots: string[] = [];
 function fresh(label: string): string {
@@ -26,8 +33,10 @@ after(() => {
 test('version exits 0 and prints CLI and generator versions', () => {
   const r = run(['version']);
   assert.equal(r.status, 0);
-  assert.match(r.stdout, /bridge 0\.1\.0/);
-  assert.match(r.stdout, /generator 0\.1\.0/);
+  // Assert against the real constants so the test tracks version bumps
+  // instead of pinning a literal that drifts on every release.
+  assert.match(r.stdout, new RegExp(`bridge ${escapeRe(CLI_VERSION)}`));
+  assert.match(r.stdout, new RegExp(`generator ${escapeRe(GENERATOR_VERSION)}`));
 });
 
 test('help exits 0 and lists all commands', () => {
@@ -354,7 +363,7 @@ test('doctor exits 0 with ✓ lines in a sane environment', () => {
   for (const line of lines) assert.ok(line.startsWith('✓'), `all checks pass: ${line}`);
   assert.match(r.stdout, /node \d+\.\d+\.\d+/);
   assert.match(r.stdout, /compiler ok/);
-  assert.match(r.stdout, /generator 0\.1\.0 ok/);
+  assert.match(r.stdout, new RegExp(`generator ${escapeRe(GENERATOR_VERSION)} ok`));
   assert.match(r.stdout, /registry .*absent/);
 });
 
