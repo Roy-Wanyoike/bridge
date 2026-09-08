@@ -284,20 +284,27 @@ export class RestRegistryClient implements RegistryClient {
           project: c.project,
           verdict: c.latestVerdict as Classification,
         })),
-      recentPublishes: publishes.slice(0, 8).map((e) => ({
-        packageName: `${e.contract}.${e.version ?? ''}`,
-        base: e.contract,
-        version: e.version ?? 'v0',
-        hash: '',
-        shortHash: '',
-        imports: [],
-        publishedAt: e.at,
-        publisher: e.actor,
-        owner: '',
-        languages: [] as Language[],
-        org: e.org,
-        project: e.project,
-      })),
+      recentPublishes: publishes.slice(0, 8).map((e) => {
+        // Join the published contract's real metadata where we have it; never
+        // fabricate languages or package names the audit entry doesn't carry.
+        const summary = contracts.find(
+          (c) => c.org === e.org && c.project === e.project && c.base === e.contract,
+        );
+        return {
+          packageName: e.version ? `${e.contract}.${e.version}` : e.contract,
+          base: e.contract,
+          version: e.version ?? '',
+          hash: summary?.latestHash ?? '',
+          shortHash: summary?.latestShortHash ?? '',
+          imports: [],
+          publishedAt: e.at,
+          publisher: e.actor,
+          owner: summary?.owner ?? '',
+          languages: summary?.languages ?? ([] as Language[]),
+          org: e.org,
+          project: e.project,
+        };
+      }),
       recentBreaking,
       objectCount: contracts.reduce((n, c) => n + c.versionCount, 0),
       lastPublishAt: publishes[0]?.at,

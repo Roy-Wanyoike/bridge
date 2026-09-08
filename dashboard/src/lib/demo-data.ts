@@ -30,6 +30,7 @@ import type {
   VersionDetail,
   VersionMeta,
 } from './types';
+import { shortHash } from './format';
 
 interface DemoVersion {
   version: string;
@@ -50,8 +51,6 @@ interface DemoContract {
   repository: string;
   versions: DemoVersion[];
 }
-
-const LANGS_ALL: Language[] = ['typescript', 'go', 'rust', 'python'];
 
 const DEMO_CONTRACTS: DemoContract[] = [
   {
@@ -833,7 +832,7 @@ function buildAuditEntries(): AuditEntry[] {
         project: c.project,
         contract: c.base,
         version: v.version,
-        detail: `published ${c.base}.${v.version} (sha256:${v.hash.slice(0, 12)}) via bridge-cli/0.9.2`,
+        detail: `published ${c.base}.${v.version} (sha256:${shortHash(v.hash)}) via bridge-cli/0.9.2`,
       });
     }
   }
@@ -861,24 +860,85 @@ function buildAuditEntries(): AuditEntry[] {
     });
   }
 
-  const pulls: Array<[string, string, string, string]> = [
-    ['2026-08-29T06:41:00Z', 'gen-worker@acme.dev', 'acme', 'catalog.v2 for generation (typescript, go)'],
-    ['2026-08-28T09:04:10Z', 'gen-worker@acme.dev', 'acme', 'risk-engine.v2 for generation (typescript, go, rust, python)'],
-    ['2026-08-26T22:12:41Z', 'maya@acme.dev', 'acme', 'store.v2 for local validation'],
-    ['2026-08-25T08:15:27Z', 'gen-worker@globex.dev', 'globex', 'billing.v2 for generation (typescript, go, rust, python)'],
-    ['2026-08-22T10:02:55Z', 'jonas@acme.dev', 'acme', 'payments.v3 for local validation'],
-    ['2026-08-20T07:33:19Z', 'gen-worker@globex.dev', 'globex', 'reporting.v1 for generation (typescript, python)'],
+  // Pull rows carry their real org/project/contract scope — the audit page
+  // deep-links to `/contracts/${org}/${project}/${contract}`, so a wrong
+  // project here is a broken link (they used to be mis-derived from the
+  // detail string and 404'd).
+  const pulls: Array<{
+    at: string;
+    actor: string;
+    org: string;
+    project: string;
+    contract: string;
+    version: string;
+    detail: string;
+  }> = [
+    {
+      at: '2026-08-29T06:41:00Z',
+      actor: 'gen-worker@acme.dev',
+      org: 'acme',
+      project: 'commerce',
+      contract: 'catalog',
+      version: 'v2',
+      detail: 'catalog.v2 for generation (typescript, go)',
+    },
+    {
+      at: '2026-08-28T09:04:10Z',
+      actor: 'gen-worker@acme.dev',
+      org: 'acme',
+      project: 'payments',
+      contract: 'risk-engine',
+      version: 'v2',
+      detail: 'risk-engine.v2 for generation (typescript, go, rust, python)',
+    },
+    {
+      at: '2026-08-26T22:12:41Z',
+      actor: 'maya@acme.dev',
+      org: 'acme',
+      project: 'commerce',
+      contract: 'store',
+      version: 'v2',
+      detail: 'store.v2 for local validation',
+    },
+    {
+      at: '2026-08-25T08:15:27Z',
+      actor: 'gen-worker@globex.dev',
+      org: 'globex',
+      project: 'billing',
+      contract: 'billing',
+      version: 'v2',
+      detail: 'billing.v2 for generation (typescript, go, rust, python)',
+    },
+    {
+      at: '2026-08-22T10:02:55Z',
+      actor: 'jonas@acme.dev',
+      org: 'acme',
+      project: 'payments',
+      contract: 'payments',
+      version: 'v3',
+      detail: 'payments.v3 for local validation',
+    },
+    {
+      at: '2026-08-20T07:33:19Z',
+      actor: 'gen-worker@globex.dev',
+      org: 'globex',
+      project: 'billing',
+      contract: 'reporting',
+      version: 'v1',
+      detail: 'reporting.v1 for generation (typescript, python)',
+    },
   ];
-  for (const [at, actor, org, detail] of pulls) {
+  for (const p of pulls) {
     entries.push({
       id: nextId(),
-      at,
-      actor,
+      at: p.at,
+      actor: p.actor,
       action: 'pull',
-      org,
-      project: org === 'globex' ? 'billing' : 'commerce',
-      contract: detail.split('.')[0].replace(/^\w+ /, '').split(' ')[0].trim(),
-      detail: `pulled ${detail}`,
+      org: p.org,
+      project: p.project,
+      contract: p.contract,
+      version: p.version,
+      detail: `pulled ${p.detail}`,
     });
   }
 
@@ -914,7 +974,7 @@ export function demoContractSummary(c: DemoContract): ContractSummary {
     packageName: `${c.base}.${latest.version}`,
     latestVersion: latest.version,
     latestHash: latest.hash,
-    latestShortHash: latest.hash.slice(0, 12),
+    latestShortHash: shortHash(latest.hash),
     owner: c.owner,
     description: c.description,
     repository: c.repository,
@@ -950,7 +1010,7 @@ export function demoListVersions(org: string, project: string, base: string): Ve
     base: c.base,
     version: v.version,
     hash: v.hash,
-    shortHash: v.hash.slice(0, 12),
+    shortHash: shortHash(v.hash),
     imports: v.imports,
     publishedAt: v.publishedAt,
     publisher: v.publisher,
@@ -975,7 +1035,7 @@ export function demoGetVersion(
     base: c.base,
     version: v.version,
     hash: v.hash,
-    shortHash: v.hash.slice(0, 12),
+    shortHash: shortHash(v.hash),
     imports: v.imports,
     publishedAt: v.publishedAt,
     publisher: v.publisher,
@@ -994,13 +1054,14 @@ export function demoListConsumers(
 ): ConsumerRef[] {
   const c = contractsByKey.get(`${org}/${project}/${base}`);
   if (!c) return [];
-  const providerLatest = latestVersion(c).version;
-  const diff = c.versions.length >= 2
+  // Severity comes from the adjacent diff that produced the *requested*
+  // version (falling back to the latest adjacent diff), not always the
+  // latest one — the version parameter is honored.
+  const requestedIdx = c.versions.findIndex((v) => v.version === version);
+  const effectiveIdx = requestedIdx >= 1 ? requestedIdx : c.versions.length - 1;
+  const diff = effectiveIdx >= 1
     ? DEMO_DIFFS.find(
-        (d) =>
-          d.base === base &&
-          d.from === c.versions[c.versions.length - 2].version &&
-          d.to === providerLatest,
+        (d) => d.base === base && d.from === c.versions[effectiveIdx - 1].version && d.to === c.versions[effectiveIdx].version,
       )
     : undefined;
   const verdict = diff ? verdictOf(diff.changes) : 'SAFE';
@@ -1032,7 +1093,6 @@ export function demoGetDiff(
   if (!c) return null;
   const stored = DEMO_DIFFS.find((d) => d.base === base && d.from === from && d.to === to);
   const changes = stored ? stored.changes : [];
-  const toVersion = versionAt(c, to);
   const packageName = `${c.base}.${to}`;
 
   // Consumer impact: transitive dependents; severity propagates worst-case.
@@ -1088,12 +1148,19 @@ export function demoGetDiff(
   };
 }
 
+/**
+ * Demo dependency graph. Node ids are the fully-qualified storage key
+ * `org/project/base` — duplicate bases across orgs must not collide —
+ * while `base` keeps the human label for display and navigation.
+ */
 export function demoGetGraph(org?: string): GraphData {
-  const nodes = DEMO_CONTRACTS.filter((c) => !org || c.org === org).map((c) => {
+  const scoped = DEMO_CONTRACTS.filter((c) => !org || c.org === org);
+  const keyOf = (c: DemoContract) => `${c.org}/${c.project}/${c.base}`;
+  const nodes = scoped.map((c) => {
     const latest = latestVersion(c);
     const adj = adjacentDiffFor(c);
     return {
-      id: c.base,
+      id: keyOf(c),
       org: c.org,
       project: c.project,
       base: c.base,
@@ -1104,14 +1171,16 @@ export function demoGetGraph(org?: string): GraphData {
       verdict: adj?.verdict,
     };
   });
-  const ids = new Set(nodes.map((n) => n.id));
   const edges: GraphEdgeLocal[] = [];
-  for (const c of DEMO_CONTRACTS.filter((x) => !org || x.org === org)) {
+  for (const c of scoped) {
     const latest = latestVersion(c);
     for (const imp of latest.imports) {
-      const target = imp.replace(/\.v\d+$/, '');
-      if (ids.has(target) && target !== c.base) {
-        edges.push({ from: c.base, to: target });
+      const targetBase = imp.replace(/\.v\d+$/, '');
+      // Imports name a bare base; resolve it to the provider contract's
+      // fully-qualified key so cross-org duplicates can never be confused.
+      const provider = scoped.find((p) => p.base === targetBase);
+      if (provider && provider.base !== c.base) {
+        edges.push({ from: keyOf(c), to: keyOf(provider) });
       }
     }
   }
@@ -1148,7 +1217,7 @@ export function demoGetOverview(): OverviewData {
       base: c.base,
       version: v.version,
       hash: v.hash,
-      shortHash: v.hash.slice(0, 12),
+      shortHash: shortHash(v.hash),
       imports: v.imports,
       publishedAt: v.publishedAt,
       publisher: v.publisher,
@@ -1192,12 +1261,17 @@ export function demoGetOverview(): OverviewData {
   };
 }
 
-/** Publisher roll-up per contract (for the producers tab). */
-export function demoPublishers(org: string, project: string, base: string) {
+/**
+ * Publisher roll-up per contract (for the producers tab). When `version` is
+ * given, only versions up to and including it are rolled up.
+ */
+export function demoPublishers(org: string, project: string, base: string, version?: string) {
   const c = contractsByKey.get(`${org}/${project}/${base}`);
   if (!c) return [];
+  const requestedIdx = version ? c.versions.findIndex((v) => v.version === version) : -1;
+  const included = requestedIdx >= 0 ? c.versions.slice(0, requestedIdx + 1) : c.versions;
   const byPublisher = new Map<string, { versions: string[]; lastAt: string }>();
-  for (const v of c.versions) {
+  for (const v of included) {
     const entry = byPublisher.get(v.publisher) ?? { versions: [], lastAt: v.publishedAt };
     entry.versions.push(v.version);
     if (v.publishedAt > entry.lastAt) entry.lastAt = v.publishedAt;

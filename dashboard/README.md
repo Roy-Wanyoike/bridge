@@ -49,8 +49,16 @@ The REST client (`src/lib/registry-client.ts`) targets the service API:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `NEXT_PUBLIC_DEMO_MODE` | `true` | Render seeded demo data instead of calling the registry |
+| `NEXT_PUBLIC_DEMO_MODE` | `true` | Render seeded demo data instead of calling the registry. Only the exact values `false` / `0` enable live mode; any other value keeps demo mode on and logs a warning (booleans are not loosely coerced — `FALSE` does **not** go live) |
 | `NEXT_PUBLIC_REGISTRY_URL` | `http://localhost:8080` | Registry service base URL (live mode) |
+| `NEXT_PUBLIC_CONSOLE_URL` | `http://localhost:3000` | Console's own origin, used as the metadata/OG canonical base |
+
+## Theme
+
+The console is **intentionally dark-only** — one professional developer-infra
+theme (`#0a0a0c` base, dark browser chrome via `themeColor`/`colorScheme`),
+matching the CLI and docs aesthetic. There is no light theme and no toggle;
+contrast is tuned for WCAG 2.1 AA against the dark background.
 
 ## Scripts
 

@@ -29,12 +29,6 @@ export function formatDateTime(iso: string): string {
   ).format(d)} UTC`;
 }
 
-/** Relative age in days against a fixed reference (deterministic, no Date.now). */
-export function ageInDays(iso: string, reference = '2026-09-08T00:00:00Z'): number {
-  const ms = new Date(reference).getTime() - new Date(iso).getTime();
-  return Math.max(0, Math.round(ms / 86_400_000));
-}
-
 /** `35b333676c86...` — first 12 chars, ellipsis-free display form. */
 export function shortHash(hash: string, len = 12): string {
   return hash.slice(0, len);

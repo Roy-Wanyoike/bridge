@@ -16,7 +16,11 @@ import { cn } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 
-export const metadata = { title: 'Dependency graph' };
+export const metadata = {
+  title: 'Dependency graph',
+  description:
+    'Who consumes whom: layered dependency graph, most-consumed contracts and node census across the registry.',
+};
 
 type SP = Promise<{ org?: string }>;
 
@@ -26,7 +30,9 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
   const client = getRegistryClient();
   const graph = await client.getGraph(org || undefined);
   const contracts = await client.listAllContracts();
-  const byBase = new Map(contracts.map((c) => [c.base, c]));
+  // Key by the fully-qualified storage key — duplicate bases across orgs
+  // must not collide.
+  const byBase = new Map(contracts.map((c) => [`${c.org}/${c.project}/${c.base}`, c]));
 
   const scoped = org ? contracts.filter((c) => c.org === org) : contracts;
   const consumerRows = scoped
@@ -158,7 +164,7 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
                     </TableCell>
                     <TableCell className="text-center tabular-nums">{n.consumers}</TableCell>
                     <TableCell>
-                      <VerdictBadge verdict={byBase.get(n.base)?.latestVerdict} />
+                      <VerdictBadge verdict={byBase.get(`${n.org}/${n.project}/${n.base}`)?.latestVerdict} />
                     </TableCell>
                   </TableRow>
                 ))}

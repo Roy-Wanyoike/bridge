@@ -30,6 +30,12 @@ import { cn } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 
+export const metadata = {
+  title: 'Overview',
+  description:
+    'Registry-wide state: contracts, versions, compatibility verdicts, recent publishes and breaking-change attention list.',
+};
+
 const VERDICT_LABEL: Record<Classification, string> = {
   SAFE: 'Compatible',
   WARNING: 'Review advised',
@@ -161,9 +167,13 @@ export default async function OverviewPage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <Badge variant="secondary" className="font-mono">
-                        {p.version}
-                      </Badge>
+                      {p.version ? (
+                        <Badge variant="secondary" className="font-mono">
+                          {p.version}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
                     </TableCell>
                     <TableCell className="text-muted-foreground">{p.publisher}</TableCell>
                     <TableCell>

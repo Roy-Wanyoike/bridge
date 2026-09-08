@@ -6,7 +6,9 @@ import type { Classification, GraphData } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 const WIDTH = 940;
-const HEIGHT = 560;
+const HEIGHT_MIN = 420;
+/** Vertical room per node in the densest layer (circle + two label lines). */
+const LAYER_ROOM = 92;
 const MARGIN_X = 90;
 const MARGIN_Y = 70;
 
@@ -21,6 +23,7 @@ interface Positioned {
   id: string;
   org: string;
   project: string;
+  base: string;
   version: string;
   consumers: number;
   verdict?: Classification;
@@ -33,9 +36,10 @@ interface Positioned {
  * Deterministic layered layout: level(n) = 0 when the contract has no
  * in-graph dependencies, else 1 + max(level of dependencies). Foundational
  * contracts sit on the left; top-level consumers on the right. Nodes are
- * sized by direct consumer count.
+ * sized by direct consumer count. The canvas height adapts to the densest
+ * layer so wide graphs don't crush labels together.
  */
-function layout(data: GraphData): Positioned[] {
+function layout(data: GraphData): { positioned: Positioned[]; height: number } {
   const deps = new Map<string, string[]>();
   const consumersOf = new Map<string, number>();
   for (const e of data.edges) {
@@ -65,6 +69,9 @@ function layout(data: GraphData): Positioned[] {
   const layers: (typeof nodes)[] = Array.from({ length: maxLevel + 1 }, () => []);
   for (const n of nodes) layers[n.level].push(n);
 
+  const densest = Math.max(1, ...layers.map((l) => l.length));
+  const height = Math.max(HEIGHT_MIN, densest * LAYER_ROOM + 2 * MARGIN_Y);
+
   const positioned: Positioned[] = [];
   for (let l = 0; l <= maxLevel; l += 1) {
     const layer = layers[l].sort((a, b) => (a.id < b.id ? -1 : 1));
@@ -72,19 +79,19 @@ function layout(data: GraphData): Positioned[] {
     layer.forEach((n, i) => {
       const y =
         layer.length === 1
-          ? HEIGHT / 2
-          : MARGIN_Y + (i * (HEIGHT - 2 * MARGIN_Y)) / (layer.length - 1);
+          ? height / 2
+          : MARGIN_Y + (i * (height - 2 * MARGIN_Y)) / (layer.length - 1);
       positioned.push({ ...n, x, y });
     });
   }
-  return positioned;
+  return { positioned, height };
 }
 
 export function CompatGraph({ data }: { data: GraphData }) {
   const router = useRouter();
   const [hovered, setHovered] = React.useState<string | null>(null);
 
-  const nodes = React.useMemo(() => layout(data), [data]);
+  const { positioned: nodes, height } = React.useMemo(() => layout(data), [data]);
   const byId = React.useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
 
   const radiusOf = (consumers: number) => Math.min(26, 14 + consumers * 5);
@@ -101,12 +108,15 @@ export function CompatGraph({ data }: { data: GraphData }) {
   }
 
   return (
-    <svg
-      viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-      className="h-auto w-full select-none"
-      role="group"
-      aria-label="Contract dependency graph. Nodes are contracts sized by consumer count; edges are import dependencies."
-    >
+    // Horizontal scroll container: the diagram keeps a legible minimum width
+    // instead of shrinking to ~5px labels on narrow viewports.
+    <div className="w-full overflow-x-auto">
+      <svg
+        viewBox={`0 0 ${WIDTH} ${height}`}
+        className="h-auto w-full min-w-[860px] select-none"
+        role="group"
+        aria-label="Contract dependency graph. Nodes are contracts sized by consumer count; edges are import dependencies."
+      >
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M 0 1 L 9 5 L 0 9" fill="none" className="stroke-zinc-500" strokeWidth="1.6" />
@@ -156,15 +166,15 @@ export function CompatGraph({ data }: { data: GraphData }) {
             key={n.id}
             tabIndex={0}
             role="link"
-            aria-label={`${n.id} at ${n.version}, ${n.consumers} consumers. Open contract page.`}
+            aria-label={`${n.base} at ${n.version}, ${n.consumers} consumers. Open contract page.`}
             className="cursor-pointer focus:outline-none"
             onMouseEnter={() => setHovered(n.id)}
             onMouseLeave={() => setHovered(null)}
             onFocus={() => setHovered(n.id)}
             onBlur={() => setHovered(null)}
-            onClick={() => router.push(`/contracts/${n.org}/${n.project}/${n.id}`)}
+            onClick={() => router.push(`/contracts/${n.org}/${n.project}/${n.base}`)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') router.push(`/contracts/${n.org}/${n.project}/${n.id}`);
+              if (e.key === 'Enter') router.push(`/contracts/${n.org}/${n.project}/${n.base}`);
             }}
             opacity={dim ? 0.25 : 1}
           >
@@ -193,7 +203,7 @@ export function CompatGraph({ data }: { data: GraphData }) {
               className="fill-zinc-300 font-mono"
               fontSize={12.5}
             >
-              {n.id}
+              {n.base}
             </text>
             <text
               x={n.x}
@@ -207,7 +217,8 @@ export function CompatGraph({ data }: { data: GraphData }) {
           </g>
         );
       })}
-    </svg>
+      </svg>
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { ScrollText, SearchX } from 'lucide-react';
+import { SearchX } from 'lucide-react';
 import { AuditDetailDialog } from '@/components/audit-detail-dialog';
 import { ClassificationBadge } from '@/components/classification-badge';
 import { EmptyState } from '@/components/empty-state';
@@ -21,7 +21,10 @@ import { cn } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 
-export const metadata = { title: 'Audit log' };
+export const metadata = {
+  title: 'Audit log',
+  description: 'Publishes, pulls and compatibility checks recorded by the registry service.',
+};
 
 const ACTIONS = [
   { value: '', label: 'All actions' },
@@ -45,14 +48,16 @@ export default async function AuditPage({ searchParams }: { searchParams: SP }) 
   const contract = sp.contract ?? '';
 
   const client = getRegistryClient();
-  const entries = await client.listAudit({
-    action: action || undefined,
-    actor: actor || undefined,
-    contract: contract || undefined,
-  });
-
+  // One fetch of the trail; the actor dropdown options and the filtered view
+  // are both derived client-side (the API would otherwise be hit twice).
   const allEntries = await client.listAudit();
   const actors = [...new Set(allEntries.map((e) => e.actor))].sort();
+  const entries = allEntries.filter((e) => {
+    if (action && e.action !== action) return false;
+    if (actor && e.actor !== actor) return false;
+    if (contract && !e.contract.toLowerCase().includes(contract.toLowerCase())) return false;
+    return true;
+  });
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
