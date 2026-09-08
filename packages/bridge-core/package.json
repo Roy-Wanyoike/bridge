@@ -5,12 +5,17 @@
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "bridge-fuzz": "bin/bridge-fuzz.js"
+  },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "scripts": {
     "build": "tsc -p .",
-    "test": "tsc -p . && if [ -d dist/test ]; then node --test \"dist/test/*.test.js\"; else echo 'no tests yet'; fi"
+    "test": "tsc -p . && if [ -d dist/test ]; then node --test \"dist/test/*.test.js\" \"dist/test/property/*.test.js\"; else echo 'no tests yet'; fi",
+    "fuzz": "node bin/bridge-fuzz.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

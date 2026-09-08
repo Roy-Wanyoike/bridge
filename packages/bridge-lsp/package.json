@@ -1,0 +1,25 @@
+{
+  "name": "@bridge/lsp",
+  "version": "0.1.0",
+  "description": "Language Server Protocol server for the Bridge IDL — JSON-RPC over stdio, zero dependencies beyond @bridge/core",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b .",
+    "test": "tsc -b . && node --test \"dist/test/*.test.js\""
+  },
+  "dependencies": {
+    "@bridge/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "bin": {
+    "bridge-lsp": "dist/bin/bridge-lsp.js"
+  }
+}

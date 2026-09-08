@@ -7,12 +7,20 @@
  *
  * - `int64`/`uint64` map to `number` in TypeScript: values above 2^53 lose
  *   precision (documented caveat in generated JSDoc). Go/Rust/Python keep
- *   full width (int64/i64/int).
- * - `uuid`, `timestamp` and `decimal` map to strings everywhere. Timestamps
- *   are RFC 3339 strings (no chrono/datetime dependency); decimals are
- *   strings to avoid binary-float drift.
+ *   full width (int64/i64/int). Java maps both to `long` (uint32 too: int
+ *   cannot hold the full unsigned range; uint64 values are written/read via
+ *   the unsigned helpers). C# maps int32/int64 to int/long and
+ *   uint32/uint64 to uint/ulong (exact unsigned range; note these are
+ *   non-CLS-compliant types, which the generated assemblies accept).
+ * - `uuid`, `timestamp` and `decimal` map to strings everywhere. Java and
+ *   C# deliberately keep `timestamp` as String/string (RFC 3339
+ *   passthrough): a structured java.time.OffsetDateTime /
+ *   System.DateTimeOffset would re-normalize the wire text (e.g. dropping
+ *   zero seconds) and break byte-parity with the other targets. java.time
+ *   is still used for RFC 3339 validation helpers in generated Java.
+ *   Decimals are strings to avoid binary-float drift.
  * - `json` maps to `json.RawMessage` / `serde_json::Value` / `unknown` /
- *   `Any`.
+ *   `Any` / `Object` (Java) / `System.Text.Json.JsonElement` (C#).
  * - `bytes` maps to `[]byte` / `Vec<u8>` / `Uint8Array` / `bytes`. On the
  *   JSON wire, bytes are base64 strings; Python `from_dict`/`to_dict`
  *   convert, Go uses `[]byte`'s native base64 JSON encoding.
@@ -26,10 +34,13 @@
  * - Cross-package named references become opaque aliases of the raw JSON
  *   shape with a doc comment "imported from <pkg>; regenerate with that
  *   package for full types" (Go `= json.RawMessage`, Rust
- *   `= serde_json::Value`, TS `= unknown`, Python `= Any`). They always
- *   compile and keep output deterministic.
+ *   `= serde_json::Value`, TS `= unknown`, Python `= Any`, Java `Object`,
+ *   C# `JsonElement`). They always compile and keep output deterministic.
+ *   Java/C# have no cross-file type aliases, so local alias declarations
+ *   are substituted by their underlying type everywhere instead (see the
+ *   per-generator headers).
  * - Optional fields map to `*T` / `Option<T>` / `field?: T` /
- *   `field: T | None = None`.
+ *   `field: T | None = None` / `Optional<T>` (Java) / `T?` (C#).
  * - `@pattern` is compiled as a user regex in Go/TS/Python. In Rust it is
  *   NOT supported (no regex dependency): `validate()` reports
  *   "pattern validation not supported in generated Rust v1" for such
@@ -37,10 +48,10 @@
  */
 
 import type { IRPackage, IRTypeDefinition, PrimitiveKind, TypeRef } from '@bridge/core';
-import { goExportedName, rustFieldName, tsFieldName } from './naming';
+import { csharpPropertyName, goExportedName, javaFieldName, rustFieldName, tsFieldName } from './naming';
 
-/** The four supported target languages. */
-export type TargetLanguage = 'go' | 'rust' | 'typescript' | 'python';
+/** The six supported target languages. */
+export type TargetLanguage = 'go' | 'rust' | 'typescript' | 'python' | 'java' | 'csharp';
 
 /** Rendering style for a field name in a given language. */
 export interface FieldNameRender {
@@ -71,6 +82,14 @@ export function renderFieldName(language: TargetLanguage, snake: string): FieldN
       // true keywords need escaping.
       return { name: snake, wire: snake, escaped: false };
     }
+    case 'java': {
+      const java = javaFieldName(snake);
+      return { name: java.name, wire: snake, escaped: java.escaped };
+    }
+    case 'csharp': {
+      const cs = csharpPropertyName(snake);
+      return { name: cs.name, wire: snake, escaped: cs.escaped };
+    }
   }
 }
 
@@ -80,6 +99,8 @@ export interface PrimitiveMapping {
   readonly rust: string;
   readonly typescript: string;
   readonly python: string;
+  readonly java: string;
+  readonly csharp: string;
   /** Short human description used in generated docs. */
   readonly note: string;
 }
@@ -90,54 +111,67 @@ export interface PrimitiveMapping {
 export const PRIMITIVE_MAPPINGS: Readonly<Record<PrimitiveKind, PrimitiveMapping>> = {
   string: {
     go: 'string', rust: 'String', typescript: 'string', python: 'str',
+    java: 'String', csharp: 'string',
     note: 'UTF-8 string',
   },
   bool: {
     go: 'bool', rust: 'bool', typescript: 'boolean', python: 'bool',
+    java: 'boolean', csharp: 'bool',
     note: 'boolean',
   },
   int32: {
     go: 'int32', rust: 'i32', typescript: 'number', python: 'int',
+    java: 'int', csharp: 'int',
     note: 'signed 32-bit integer',
   },
   int64: {
     go: 'int64', rust: 'i64', typescript: 'number', python: 'int',
+    java: 'long', csharp: 'long',
     note: 'signed 64-bit integer; TS numbers lose precision above 2^53',
   },
   uint32: {
     go: 'uint32', rust: 'u32', typescript: 'number', python: 'int',
-    note: 'unsigned 32-bit integer',
+    java: 'long', csharp: 'uint',
+    note: 'unsigned 32-bit integer (Java maps to long: int cannot hold the full unsigned range)',
   },
   uint64: {
     go: 'uint64', rust: 'u64', typescript: 'number', python: 'int',
+    java: 'long', csharp: 'ulong',
     note: 'unsigned 64-bit integer; TS numbers lose precision above 2^53',
   },
   float32: {
     go: 'float32', rust: 'f32', typescript: 'number', python: 'float',
+    java: 'float', csharp: 'float',
     note: '32-bit float',
   },
   float64: {
     go: 'float64', rust: 'f64', typescript: 'number', python: 'float',
+    java: 'double', csharp: 'double',
     note: '64-bit float',
   },
   bytes: {
     go: '[]byte', rust: 'Vec<u8>', typescript: 'Uint8Array', python: 'bytes',
+    java: 'byte[]', csharp: 'byte[]',
     note: 'binary; base64 string on the JSON wire',
   },
   uuid: {
     go: 'string', rust: 'String', typescript: 'string', python: 'str',
+    java: 'String', csharp: 'string',
     note: 'UUID string (8-4-4-4-12 hex)',
   },
   timestamp: {
     go: 'string', rust: 'String', typescript: 'string', python: 'str',
+    java: 'String', csharp: 'string',
     note: 'RFC 3339 timestamp string (no chrono/datetime dependency)',
   },
   decimal: {
     go: 'string', rust: 'String', typescript: 'string', python: 'str',
+    java: 'String', csharp: 'string',
     note: 'decimal encoded as string to avoid float drift',
   },
   json: {
     go: 'json.RawMessage', rust: 'serde_json::Value', typescript: 'unknown', python: 'Any',
+    java: 'Object', csharp: 'System.Text.Json.JsonElement',
     note: 'arbitrary JSON value',
   },
 };
@@ -164,6 +198,13 @@ export interface RenderContext {
   readonly packageName: string;
   /** Local type names, used to resolve same-package references. */
   readonly localTypeNames: ReadonlySet<string>;
+  /**
+   * Local alias declarations (`type OrderId = uuid`). Languages without
+   * type aliases (Java, C#) substitute the underlying type everywhere;
+   * all other languages keep the alias as a real declaration and ignore
+   * this table.
+   */
+  readonly aliasTargets?: ReadonlyMap<string, TypeRef>;
 }
 
 /**
@@ -171,13 +212,47 @@ export interface RenderContext {
  * cross-package refs render as the (aliased) type name as well — the
  * generator emits an opaque alias for every cross-package name that does
  * not collide with a local type, so both cases render identically here.
+ *
+ * In Java/C# local aliases do not exist as declarations: the underlying
+ * target type is rendered instead (see {@link RenderContext.aliasTargets}).
  */
 function namedRefName(ref: { name: string; package?: string }, ctx: RenderContext): string {
+  if (ctx.aliasTargets !== undefined && (ctx.language === 'java' || ctx.language === 'csharp')) {
+    const target = ctx.aliasTargets.get(ref.name);
+    if (target !== undefined) return renderTypeRef(target, ctx);
+    // Java/C# have no opaque alias declarations: cross-package references
+    // become passthrough values (Object / JsonElement) instead.
+    if (
+      ref.package !== undefined &&
+      ref.package !== ctx.packageName &&
+      !ctx.localTypeNames.has(ref.name)
+    ) {
+      return ctx.language === 'java' ? 'Object' : 'System.Text.Json.JsonElement';
+    }
+  }
   // Same-package references and cross-package opaque aliases both render
   // as the bare type name. When a local type shares the name with a
   // cross-package reference, the local type wins (deterministic, and the
   // compiler rejects ambiguous contracts).
   return ref.name;
+}
+
+/**
+ * True when the reference points at a type from another package (and that
+ * name is not declared locally). Java/C# render such fields as opaque JSON
+ * passthrough values (`Object` / `JsonElement`); Go/Rust/TS/Python emit
+ * opaque alias declarations for them instead.
+ */
+export function isOpaqueCrossPackageRef(
+  ref: TypeRef,
+  ctx: RenderContext,
+  ir: IRPackage,
+): boolean {
+  let inner = ref;
+  if (inner.kind === 'optional') inner = inner.inner;
+  if (inner.kind !== 'named') return false;
+  if (inner.package === undefined || inner.package === ctx.packageName) return false;
+  return !ir.types.some((t) => t.name === inner.name);
 }
 
 /** Renders a TypeRef for the target language. */
@@ -206,6 +281,8 @@ export function primitiveType(primitive: PrimitiveKind, language: TargetLanguage
     case 'rust': return mapping.rust;
     case 'typescript': return mapping.typescript;
     case 'python': return mapping.python;
+    case 'java': return mapping.java;
+    case 'csharp': return mapping.csharp;
   }
 }
 
@@ -217,6 +294,23 @@ export function listType(element: TypeRef, ctx: RenderContext): string {
     case 'rust': return `Vec<${inner}>`;
     case 'typescript': return `${inner}[]`;
     case 'python': return `list[${inner}]`;
+    case 'java': return `List<${boxedJava(inner)}>`;
+    case 'csharp': return `List<${inner}>`;
+  }
+}
+
+/**
+ * Boxes a Java primitive type name for use inside generics (`int` →
+ * `Integer`, `long` → `Long`, ...). Other names pass through unchanged.
+ */
+export function boxedJava(name: string): string {
+  switch (name) {
+    case 'int': return 'Integer';
+    case 'long': return 'Long';
+    case 'float': return 'Float';
+    case 'double': return 'Double';
+    case 'boolean': return 'Boolean';
+    default: return name;
   }
 }
 
@@ -231,6 +325,8 @@ export function setType(element: TypeRef, ctx: RenderContext): string {
     case 'rust': return `BTreeSet<${inner}>`;
     case 'typescript': return `Set<${inner}>`;
     case 'python': return `set[${inner}]`;
+    case 'java': return `Set<${boxedJava(inner)}>`;
+    case 'csharp': return `HashSet<${inner}>`;
   }
 }
 
@@ -248,6 +344,8 @@ export function mapType(key: TypeRef, value: TypeRef, ctx: RenderContext): strin
     case 'rust': return `BTreeMap<${k}, ${v}>`;
     case 'typescript': return `Record<${k}, ${v}>`;
     case 'python': return `dict[${k}, ${v}]`;
+    case 'java': return `Map<String, ${boxedJava(v)}>`;
+    case 'csharp': return `Dictionary<string, ${v}>`;
   }
 }
 
@@ -277,6 +375,8 @@ export function optionalType(inner: TypeRef, ctx: RenderContext): string {
     case 'rust': return `Option<${t}>`;
     case 'typescript': return t;
     case 'python': return `${t} | None`;
+    case 'java': return `Optional<${boxedJava(t)}>`;
+    case 'csharp': return `${t}?`;
   }
 }
 
