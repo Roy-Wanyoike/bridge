@@ -133,13 +133,22 @@ function visitTypeRef(t: TypeRef, visit: (ref: NamedRef) => void): void {
 }
 
 /**
- * Names the IR references from a specific target package (qualified
- * references whose package matches the target's full name or base).
+ * Qualified foreign references of an IR, indexed by the *referenced* package
+ * name. Built in a single O(IR size) walk; {@link computeContacts} then
+ * answers each source lookup in O(refs to that source) instead of re-walking
+ * the whole IR once per source package (the previous O(consumers² × IR)
+ * behavior, multiplied again by the taint fixed-point rounds).
  */
-function collectRefsTo(ir: IRPackage, target: { name: string; base: string }): Set<string> {
-  const names = new Set<string>();
+function indexRefsByPackage(ir: IRPackage): Map<string, Set<string>> {
+  const byPackage = new Map<string, Set<string>>();
   const add = (r: NamedRef): void => {
-    if (r.package === target.name || r.package === target.base) names.add(r.name);
+    if (r.package === undefined) return;
+    let names = byPackage.get(r.package);
+    if (names === undefined) {
+      names = new Set<string>();
+      byPackage.set(r.package, names);
+    }
+    names.add(r.name);
   };
   for (const t of ir.types) {
     if (t.kind === 'struct') for (const f of t.fields) visitTypeRef(f.type, add);
@@ -153,7 +162,7 @@ function collectRefsTo(ir: IRPackage, target: { name: string; base: string }): S
     }
   }
   for (const e of ir.events) for (const f of e.fields) visitTypeRef(f.type, add);
-  return names;
+  return byPackage;
 }
 
 /**
@@ -321,16 +330,25 @@ interface Node {
   taint: Map<string, Set<number>>;
   /** Contacts computed against all other nodes (source name → contact). */
   contacts: Map<string, Contact>;
+  /** Qualified refs of `ir` indexed by referenced package (lazy cache). */
+  refIndex: Map<string, Set<string>> | undefined;
 }
 
 /**
  * Compute a consumer's contacts against every known node: qualified
  * references intersected with the source's taint, plus the anchor-only
  * event/rename rules for direct dependents.
+ *
+ * The consumer's qualified refs are indexed once per node (memoized on the
+ * node across fixed-point rounds); each per-source check is then a pair of
+ * map lookups, keeping the whole contact pass O(consumers × IR + contacts)
+ * instead of the previous O(consumers² × IR) per round.
  */
 function computeContacts(node: Node, nodes: ReadonlyMap<string, Node>, marks: Marks, anchorName: string): Map<string, Contact> {
   const contacts = new Map<string, Contact>();
   if (node.ir === undefined) return contacts;
+  if (node.refIndex === undefined) node.refIndex = indexRefsByPackage(node.ir);
+  const refIndex = node.refIndex;
 
   for (const source of nodes.values()) {
     if (source === node) continue;
@@ -339,7 +357,12 @@ function computeContacts(node: Node, nodes: ReadonlyMap<string, Node>, marks: Ma
     const hasRename = isAnchor && marks.renameIndex !== undefined;
     if (source.taint.size === 0 && !hasEventMarks && !hasRename) continue;
 
-    const refNames = collectRefsTo(node.ir, { name: source.name, base: source.base });
+    // Names `node` references from this source package (full name or base).
+    const refNames = new Set<string>();
+    for (const pkg of [source.name, source.base]) {
+      const names = refIndex.get(pkg);
+      if (names !== undefined) for (const name of names) refNames.add(name);
+    }
     const changes = new Set<number>();
     const types = new Set<string>();
     for (const name of refNames) {
@@ -595,6 +618,7 @@ export function computeImpact(options: ImpactOptions): ImpactReport {
     parent: undefined,
     taint: new Map(),
     contacts: new Map(),
+    refIndex: undefined,
   };
   for (const [name, indices] of marks.types) anchor.taint.set(name, new Set(indices));
 
@@ -632,6 +656,7 @@ export function computeImpact(options: ImpactOptions): ImpactReport {
           parent: current,
           taint: new Map(),
           contacts: new Map(),
+          refIndex: undefined,
         };
         nodes.set(meta.packageName, node);
         queue.push(node);

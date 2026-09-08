@@ -8,7 +8,9 @@
  *   - value options        `--out dir`, `--out=dir`, `--language typescript`;
  *   - `--` terminator (everything after it is positional).
  *
- * Unknown flags and missing values throw {@link UsageError} (exit 2).
+ * Unknown flags and missing values throw {@link UsageError} (exit 2), as do
+ * flag-shaped option values (`--registry --json`) and empty inline values
+ * (`--out=`); use the `--out=<value>` form for values that start with `-`.
  */
 import { UsageError } from './errors';
 
@@ -52,11 +54,19 @@ export function parseArgs(argv: readonly string[], spec: ArgSpec, command: strin
       throw new UsageError(`unknown option '${name}' for 'bridge ${command}'`);
     }
     if (inline !== undefined) {
+      if (inline.length === 0) {
+        throw new UsageError(`option '${name}' requires a non-empty value (nothing after '=' in '${name}=')`);
+      }
       values.set(name, inline);
       return i;
     }
     const next = tokens[i + 1];
     if (next === undefined) throw new UsageError(`option '${name}' requires a value`);
+    if (next.startsWith('--')) {
+      throw new UsageError(
+        `option '${name}' requires a value — '${next}' is a flag, not a value (use '${name}=<value>' for values that start with '-')`,
+      );
+    }
     values.set(name, next);
     return i + 1;
   };

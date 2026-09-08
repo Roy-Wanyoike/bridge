@@ -68,6 +68,20 @@ function splitLines(text: string): string[] {
 /**
  * Render a unified diff (`---`/`+++` headers plus `@@` hunks) between two
  * source texts. Returns one array element per output line.
+ *
+ * Hunk headers follow git's conventions (verified byte-for-byte against
+ * `git diff --no-index`):
+ *   - `@@ -aStart,aCount +bStart,bCount @@`, with the count omitted when it
+ *     is exactly 1 (`@@ -1 +1 @@`);
+ *   - a pure-insertion hunk (no a-side lines) reports the a-side position
+ *     *before* the insertion — `-0,0` when it is at the very start of the
+ *     file; a pure-deletion hunk reports the b-side position after the last
+ *     deleted line (`+0,0` when the whole file is deleted);
+ *   - two changes separated by up to `2 * context` unchanged lines are
+ *     merged into one hunk (git's rule with the default inter-hunk context
+ *     of 0);
+ *   - the optional trailing funcname annotation git appends after the
+ *     closing `@@` is deliberately not emitted (no language heuristics).
  */
 export function unifiedDiff(oldText: string, newText: string, label: string, context = 3): string[] {
   const a = splitLines(oldText);
@@ -75,97 +89,75 @@ export function unifiedDiff(oldText: string, newText: string, label: string, con
   const ops = diffOps(a, b);
   if (ops.every((op) => op.type === 'same')) return [];
 
+  // 1-based line numbers per op index: aLine[k] is the old-file line that
+  // ops[k] consumes on the a-side (bLine for the b-side). The extra final
+  // entry is the line *after* the last op, so counts are index differences.
+  const aLine = new Uint32Array(ops.length + 1);
+  const bLine = new Uint32Array(ops.length + 1);
+  let aNext = 1;
+  let bNext = 1;
+  for (let k = 0; k < ops.length; k++) {
+    aLine[k] = aNext;
+    bLine[k] = bNext;
+    const op = ops[k]!;
+    if (op.type === 'same') {
+      aNext++;
+      bNext++;
+    } else if (op.type === 'del') {
+      aNext++;
+    } else {
+      bNext++;
+    }
+  }
+  aLine[ops.length] = aNext;
+  bLine[ops.length] = bNext;
+
+  // Indices of changed ops, grouped into hunks. Consecutive changes merge
+  // while ≤ 2*context unchanged lines separate them.
+  const changes: number[] = [];
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k]!.type !== 'same') changes.push(k);
+  }
+
   const lines: string[] = [`--- a/${label}`, `+++ b/${label}`];
-  let aLine = 0;
-  let bLine = 0;
-  let idx = 0;
-
-  while (idx < ops.length) {
-    if (ops[idx]!.type === 'same') {
-      aLine++;
-      bLine++;
-      idx++;
-      continue;
+  let g = 0;
+  while (g < changes.length) {
+    let last = changes[g]!;
+    let next = g + 1;
+    while (next < changes.length && changes[next]! - (changes[next - 1]! + 1) <= 2 * context) {
+      last = changes[next]!;
+      next++;
     }
 
-    // Hunk start: include up to `context` preceding unchanged lines.
-    let start = idx;
-    let lead = 0;
-    while (start > 0 && ops[start - 1]!.type === 'same' && lead < context) {
-      start--;
-      lead++;
+    // Hunk range: up to `context` unchanged lines before the first change
+    // and after the last one, clamped to the file edges.
+    const start = Math.max(0, changes[g]! - context);
+    let end = last + 1;
+    for (let trail = 0; end < ops.length && trail < context && ops[end]!.type === 'same'; trail++) {
+      end++;
     }
 
-    // Hunk end: extend through changes, stopping after `context` trailing
-    // unchanged lines (or at end of input).
-    let end = idx;
-    let sameRun = 0;
-    for (let k = idx; k < ops.length; k++) {
-      end = k + 1;
-      if (ops[k]!.type === 'same') {
-        sameRun++;
-        if (sameRun > context) {
-          end = k;
-          break;
-        }
-      } else {
-        sameRun = 0;
-      }
-    }
+    const aCount = aLine[end]! - aLine[start]!;
+    const bCount = bLine[end]! - bLine[start]!;
+    let aHeader = aLine[start]!;
+    let bHeader = bLine[start]!;
+    // Pure-insertion / pure-deletion hunks report the position *before* the
+    // change (0 when it is at the very start of the file).
+    if (aCount === 0) aHeader--;
+    if (bCount === 0) bHeader--;
 
-    // Header line numbers from the running counters.
-    let aHeader = aLine + 1;
-    let bHeader = bLine + 1;
-    for (let k = 0; k < start; k++) {
-      const op = ops[k]!;
-      if (op.type === 'same') {
-        aHeader++;
-        bHeader++;
-      } else if (op.type === 'del') {
-        aHeader++;
-      } else {
-        bHeader++;
-      }
-    }
-
-    let aCount = 0;
-    let bCount = 0;
-    const body: string[] = [];
+    lines.push(`@@ -${range(aHeader, aCount)} +${range(bHeader, bCount)} @@`);
     for (let k = start; k < end; k++) {
       const op = ops[k]!;
-      if (op.type === 'same') {
-        aCount++;
-        bCount++;
-        body.push(' ' + op.text);
-      } else if (op.type === 'del') {
-        aCount++;
-        body.push('-' + op.text);
-      } else {
-        bCount++;
-        body.push('+' + op.text);
-      }
+      lines.push(op.type === 'same' ? ' ' + op.text : op.type === 'del' ? '-' + op.text : '+' + op.text);
     }
-    // Pure-insertion hunks report the position *before* the insertion.
-    if (aCount === 0) aHeader = Math.max(1, aHeader - 1);
-    if (bCount === 0) bHeader = Math.max(1, bHeader - 1);
-
-    lines.push(`@@ -${aHeader},${aCount} +${bHeader},${bCount} @@`);
-    for (const bodyLine of body) lines.push(bodyLine);
-
-    // Advance the running counters past everything consumed.
-    for (let k = 0; k < end; k++) {
-      const op = ops[k]!;
-      if (op.type === 'same') {
-        aLine++;
-        bLine++;
-      } else if (op.type === 'del') {
-        aLine++;
-      } else {
-        bLine++;
-      }
-    }
-    idx = end;
+    g = next;
   }
 
   return lines;
+}
+
+/** One side of a hunk header: git omits the count when it is exactly 1. */
+function range(header: number, count: number): string {
+  return count === 1 ? String(header) : `${header},${count}`;
 }

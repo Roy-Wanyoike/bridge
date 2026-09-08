@@ -6,7 +6,7 @@ import { compileSource, formatDiagnostics } from '@bridge/core';
 import { ParsedArgs } from '../args';
 import { inputFiles, readText } from '../files';
 import { CliError } from '../errors';
-import { out, CHECK, WARN } from '../output';
+import { out, errOut, CHECK, WARN } from '../output';
 
 export function run(args: ParsedArgs): void {
   const strict = args.flags.has('--strict');
@@ -43,6 +43,6 @@ export function run(args: ParsedArgs): void {
   }
   if (findings > 0 && !strict) {
     // tolerated — note it on stderr so CI logs show why exit is still 0
-    out(`${WARN} ${findings} finding(s) tolerated (lint passes; use --strict to fail on warnings)`);
+    errOut(`${WARN} ${findings} finding(s) tolerated (lint passes; use --strict to fail on warnings)`);
   }
 }

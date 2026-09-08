@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { unifiedDiff } from '../difftext';
 import { BROKEN, GOOD, run, tmpdir, UGLY, UNPARSEABLE, WARNY, writeFile } from './helpers';
 
 const tempRoots: string[] = [];
@@ -189,6 +190,38 @@ test('validate --json: broken output parses with located diagnostics', () => {
   assert.equal(first.column, 13);
 });
 
+test('validate --json: read failure still emits one JSON entry per file', () => {
+  const dir = fresh('validate-json-read-failure');
+  const good = writeFile(dir, 'good.bridge', GOOD);
+  const missing = path.join(dir, 'missing.bridge');
+  const r = run(['validate', '--json', good, missing]);
+  assert.equal(r.status, 1);
+  const parsed = JSON.parse(r.stdout) as Array<{
+    file: string;
+    ok: boolean;
+    diagnostics: Array<{ severity: string; message: string }>;
+  }>;
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0]!.file, good);
+  assert.equal(parsed[0]!.ok, true);
+  assert.equal(parsed[1]!.file, missing);
+  assert.equal(parsed[1]!.ok, false);
+  assert.equal(parsed[1]!.diagnostics.length, 1);
+  assert.equal(parsed[1]!.diagnostics[0]!.severity, 'error');
+  assert.match(parsed[1]!.diagnostics[0]!.message, /file not found/);
+});
+
+test('validate: read failure does not abort the remaining files', () => {
+  const dir = fresh('validate-read-failure-continue');
+  const missing = path.join(dir, 'missing.bridge');
+  const bad = writeFile(dir, 'broken.bridge', BROKEN);
+  const r = run(['validate', missing, bad]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /file not found/);
+  assert.match(r.all, /broken\.bridge:9:13/); // later file still validated
+  assert.match(r.stderr, /2 of 2 file\(s\) failed/);
+});
+
 test('validate without files or config is a usage error', () => {
   const dir = fresh('validate-empty');
   const r = run(['validate'], { cwd: dir });
@@ -247,6 +280,18 @@ test('fmt: unparseable file exits 1 with diagnostics', () => {
   assert.match(r.stderr, /could not be formatted/);
 });
 
+test('fmt: diff hunk headers carry git-verified values', () => {
+  // UGLY formats to: blank line inserted after line 1 + 2-space re-indent.
+  // a-side: package / 'type Money {' / '  amount: int64' / '}' → 4 lines;
+  // b-side: package / '' / 'type Money {' / '    amount: int64' / '}' → 5.
+  const dir = fresh('fmt-headers');
+  const file = writeFile(dir, 'ugly.bridge', UGLY);
+  const r = run(['fmt', file]);
+  assert.equal(r.status, 1);
+  const headers = r.stdout.split('\n').filter((l) => l.startsWith('@@'));
+  assert.deepEqual(headers, ['@@ -1,4 +1,5 @@']);
+});
+
 // ---------------------------------------------------------------------------
 // lint
 // ---------------------------------------------------------------------------
@@ -275,6 +320,16 @@ test('lint --strict: warning fails (exit 1)', () => {
   const r = run(['lint', '--strict', file]);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /lint failed \(--strict\)/);
+});
+
+test('lint: tolerated-findings note goes to stderr, not stdout', () => {
+  const dir = fresh('lint-warn-stderr');
+  const file = writeFile(dir, 'warny.bridge', WARNY);
+  const r = run(['lint', file]);
+  assert.equal(r.status, 0);
+  assert.match(r.stderr, /⚠ 1 finding\(s\) tolerated/);
+  assert.ok(!r.stdout.includes('tolerated'), 'note must not be on stdout');
+  assert.match(r.stdout, /warny\.bridge:3:1: warning BR\d+/); // report stays on stdout
 });
 
 test('lint: error-severity diagnostic fails (exit 1)', () => {
@@ -309,4 +364,98 @@ test('doctor fails when the registry path is a file (not a directory)', () => {
   const r = run(['doctor', '--registry', bogus], { cwd: dir });
   assert.equal(r.status, 1);
   assert.match(r.all, /✗ registry .*not a directory/);
+});
+
+// ---------------------------------------------------------------------------
+// argument parsing (flag-as-value / empty inline values)
+// ---------------------------------------------------------------------------
+
+test('args: a flag is rejected as an option value (exit 2)', () => {
+  const r = run(['doctor', '--registry', '--json']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /'--registry' requires a value/);
+  assert.match(r.stderr, /'--json' is a flag, not a value/);
+});
+
+test('args: empty inline option value is rejected (exit 2)', () => {
+  const r = run(['doctor', '--registry=']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /requires a non-empty value/);
+});
+
+// ---------------------------------------------------------------------------
+// help completeness (six languages, check --json/--format precedence)
+// ---------------------------------------------------------------------------
+
+test('help lists all six generate languages', () => {
+  const general = run(['help']);
+  assert.equal(general.status, 0);
+  assert.match(general.stdout, /Go\/Rust\/TypeScript\/Python\/Java\/C# code/);
+  const generate = run(['help', 'generate']);
+  assert.equal(generate.status, 0);
+  for (const lang of ['go', 'rust', 'typescript', 'python', 'java', 'csharp']) {
+    assert.ok(generate.stdout.includes(lang), `generate help lists ${lang}`);
+  }
+});
+
+test('help check documents --json vs --format precedence', () => {
+  const r = run(['help', 'check']);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /--json/);
+  assert.match(r.stdout, /explicit --format\s+wins when both are given/);
+});
+
+// ---------------------------------------------------------------------------
+// unified-diff hunk headers (byte-identical to `git diff --no-index`)
+// ---------------------------------------------------------------------------
+
+const L = (n: number, from = 0): string[] => Array.from({ length: n }, (_, i) => `line${i + 1 + from}`);
+const linesOf = (lines: string[]): string => (lines.length === 0 ? '' : lines.map((l) => `${l}\n`).join(''));
+const headers = (lines: string[]): string[] => lines.filter((l) => l.startsWith('@@'));
+
+test('difftext: insertion-only and deletion-only hunks report git-identical ranges', () => {
+  // git: @@ -3,6 +3,7 @@ (context 3 before + insertion + context 3 after)
+  const inserted = unifiedDiff(linesOf([...L(4), 'alpha', ...L(4, 4)]), linesOf([...L(4), 'alpha', 'INSERTED', ...L(4, 4)]), 'f');
+  assert.deepEqual(headers(inserted), ['@@ -3,6 +3,7 @@']);
+  // git: @@ -2,7 +2,6 @@
+  const deleted = unifiedDiff(linesOf([...L(4), 'alpha', ...L(4, 4)]), linesOf([...L(4), ...L(4, 4)]), 'f');
+  assert.deepEqual(headers(deleted), ['@@ -2,7 +2,6 @@']);
+});
+
+test('difftext: multi-hunk numbering counts only preceding a-side lines', () => {
+  const old = linesOf([...L(2), 'a-old', ...L(20, 2), 'b-old', ...L(2, 22)]);
+  const neu = linesOf([...L(2), 'a-new', ...L(20, 2), 'b-new', ...L(2, 22)]);
+  assert.deepEqual(headers(unifiedDiff(old, neu, 'f')), ['@@ -1,6 +1,6 @@', '@@ -21,6 +21,6 @@']);
+});
+
+test('difftext: trailing context is clipped at EOF', () => {
+  const old = linesOf([...L(9), 'last-old']);
+  const neu = linesOf([...L(9), 'last-new']);
+  assert.deepEqual(headers(unifiedDiff(old, neu, 'f')), ['@@ -7,4 +7,4 @@']);
+});
+
+test('difftext: empty-file and whole-file edges use git conventions', () => {
+  // whole-file add: old side is position 0 with count 0
+  assert.deepEqual(headers(unifiedDiff('', linesOf(L(3)), 'f')), ['@@ -0,0 +1,3 @@']);
+  // whole-file delete: new side is position 0 with count 0
+  assert.deepEqual(headers(unifiedDiff(linesOf(L(3)), '', 'f')), ['@@ -1,3 +0,0 @@']);
+  // single-line counts are omitted (git prints @@ -1 +1 @@, not @@ -1,1 +1,1 @@)
+  assert.deepEqual(headers(unifiedDiff('only\n', 'ONLY\n', 'f')), ['@@ -1 +1 @@']);
+  // whole-file replace keeps explicit counts
+  assert.deepEqual(headers(unifiedDiff('a\nb\nc\nd\n', 'A\nB\nC\nD\n', 'f')), ['@@ -1,4 +1,4 @@']);
+  // identical inputs produce no diff at all
+  assert.deepEqual(unifiedDiff('same\n', 'same\n', 'f'), []);
+});
+
+test('difftext: hunks separated by ≤ 2×context unchanged lines merge (git rule)', () => {
+  const wrap = (gap: number): string[] =>
+    headers(
+      unifiedDiff(
+        linesOf([...L(1), 'a-old', ...L(gap, 1), 'b-old', ...L(1, 1 + gap)]),
+        linesOf([...L(1), 'a-new', ...L(gap, 1), 'b-new', ...L(1, 1 + gap)]),
+        'f',
+      ),
+    );
+  assert.deepEqual(wrap(6), ['@@ -1,10 +1,10 @@']); // 6 apart: one merged hunk
+  assert.deepEqual(wrap(7), ['@@ -1,5 +1,5 @@', '@@ -7,5 +7,5 @@']); // 7 apart: two hunks
 });
