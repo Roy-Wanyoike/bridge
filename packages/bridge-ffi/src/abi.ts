@@ -134,7 +134,3 @@ export function sortedServiceMethods(
   return out;
 }
 
-/** `#[no_mangle] pub extern "C"` Rust declaration for a symbol. */
-export function rustExternC(symbol: string, params: string, ret: string): string {
-  return `#[no_mangle]\npub extern "C" fn ${symbol}(${params}) -> ${ret}`;
-}

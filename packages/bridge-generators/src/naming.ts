@@ -56,11 +56,11 @@ const RUST_RAW_KEYWORDS: ReadonlySet<string> = new Set([
 ]);
 
 const RUST_NON_RAW_KEYWORDS: ReadonlySet<string> = new Set([
-  'self', 'self', 'Self', 'super', 'crate',
+  'self', 'Self', 'super', 'crate',
 ]);
 
 /** Python reserved keywords (Python 3.12 keyword list). */
-const PYTHON_KEYWORDS: ReadonlySet<string> = new Set([
+export const PYTHON_KEYWORDS: ReadonlySet<string> = new Set([
   'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
   'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally',
   'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal',
@@ -133,12 +133,6 @@ export function goExportedName(snake: string): string {
       return capitalize(part);
     })
     .join('');
-}
-
-/** Go local (unexported) identifier from a snake_case name. */
-export function goLocalName(snake: string): string {
-  const exported = goExportedName(snake);
-  return exported.charAt(0).toLowerCase() + exported.slice(1);
 }
 
 /**

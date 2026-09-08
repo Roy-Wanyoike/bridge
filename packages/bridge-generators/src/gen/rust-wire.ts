@@ -356,6 +356,19 @@ export function rustServerPrelude(): string {
 
 /** Per-service client + server emission over the stdlib HTTP plumbing. */
 export function rustServiceHttp(service: IRService, input: GeneratorInput): string {
+  // Server-side request validators: one per method whose input is a local
+  // struct (validate.rs emits validate for every local struct).
+  // Cross-package/optional-composite inputs are opaque aliases
+  // (serde_json::Value) without a validate method — they must not be
+  // dereferenced (same guard as the Go generator's validator table).
+  const validators = new Set<string>();
+  for (const method of service.methods) {
+    const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+    if (ref.kind === 'named' && isLocalStructRef(ref, input.ir)) {
+      validators.add(method.name);
+    }
+  }
+
   let out = '';
   const snakeService = camelToLowerSnake(service.name);
   const routePrefix = `/${input.packageName}/${service.name}`;
@@ -431,14 +444,16 @@ export function rustServiceHttp(service: IRService, input: GeneratorInput): stri
     out += `            let parsed: Result<${inputType}, String> = serde_json::from_value(body).map_err(|err| err.to_string());\n`;
     out += '            match parsed {\n';
     out += '                Ok(req) => {\n';
-    out += '                    if let Err(validation_error) = req.validate() {\n';
-    out += '                        write_http_response(\n';
-    out += '                            stream,\n';
-    out += '                            400,\n';
-    out += '                            &serde_json::json!({"code": "invalid_argument", "message": format!("{}: {}", validation_error.field, validation_error.message)}),\n';
-    out += '                        );\n';
-    out += '                        return;\n';
-    out += '                    }\n';
+    if (validators.has(method.name)) {
+      out += '                    if let Err(validation_error) = req.validate() {\n';
+      out += '                        write_http_response(\n';
+      out += '                            stream,\n';
+      out += '                            400,\n';
+      out += '                            &serde_json::json!({"code": "invalid_argument", "message": format!("{}: {}", validation_error.field, validation_error.message)}),\n';
+      out += '                        );\n';
+      out += '                        return;\n';
+      out += '                    }\n';
+    }
     out += '                    match handler.' + snakeMethod + '(&req) {\n';
     out += '                        Ok(result) => {\n';
     out += '                            let body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);\n';

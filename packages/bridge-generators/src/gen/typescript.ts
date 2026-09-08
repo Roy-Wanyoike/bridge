@@ -392,8 +392,8 @@ function tsEnum(enumType: IRTypeDefinition & { kind: 'enum' }): string {
   const doc = tsDoc(enumType.docs, enumType.deprecated);
   if (doc.length > 0) out += `${doc}\n`;
   out += `export type ${enumType.name} =\n`;
-  enumType.variants.forEach((variant, index) => {
-    const bar = index === 0 ? '  |' : '  |';
+  enumType.variants.forEach((variant) => {
+    const bar = '  |';
     out += `${bar} ${JSON.stringify(variant.name)}\n`;
   });
   out += ';\n\n';
@@ -502,7 +502,10 @@ function tsValidateStruct(
   let nested = '';
 
   for (const field of struct.fields) {
-    const local = tsSafeIdent(field.name);
+    // Validator locals are __bridge_-prefixed: field names like value,
+    // obj or errors would otherwise redeclare the function's own locals
+    // (value/obj/errors) and fail tsc with duplicate declarations.
+    const local = `__bridge_${tsSafeIdent(field.name)}`;
     checks += `  const ${local} = obj[${JSON.stringify(field.name)}];\n`;
     for (const constraint of field.constraints) {
       const rendered = tsConstraintCheck(constraint, field, local, struct, prelude);

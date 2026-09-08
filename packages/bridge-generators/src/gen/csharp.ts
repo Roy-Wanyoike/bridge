@@ -178,8 +178,11 @@ function serializeExpr(ref: TypeRef, value: string, input: GeneratorInput): stri
     case 'list':
       return `new List<object>(${value}.Select(item => (object)${serializeExpr(ref.element, 'item', input)}).ToList())`;
     case 'set':
-      // Deterministic wire output: ordinal sort (UTF-16 code units).
-      return `new List<object>(${value}.OrderBy(x => x, StringComparer.Ordinal).Select(item => (object)${serializeExpr(ref.element, 'item', input)}).ToList())`;
+      // Deterministic wire output: ordinal sort of the STRING projection
+      // (UTF-16 code units). Projecting via x?.ToString() keeps non-string
+      // sets (set<int32>, ...) compilable — StringComparer is not an
+      // IComparer<T> for non-string element types.
+      return `new List<object>(${value}.OrderBy(x => x?.ToString(), StringComparer.Ordinal).Select(item => (object)${serializeExpr(ref.element, 'item', input)}).ToList())`;
     case 'map':
       return `new Dictionary<string, object>(${value}.ToDictionary(kv => kv.Key, kv => (object)${serializeExpr(ref.value, 'kv.Value', input)}))`;
     case 'optional':
@@ -285,11 +288,6 @@ function csprojFile(input: GeneratorInput): GeneratedFile {
 /* Enums.cs                                                            */
 /* ------------------------------------------------------------------ */
 
-/** Kept for future gating of the shared expect* JSON helper block. */
-function needsJsonHelpers(input: GeneratorInput): boolean {
-  return sortedTypes(input.ir).some((t) => t.kind === 'struct' || t.kind === 'union');
-}
-
 /** Emits Enums.cs with one readonly record struct per Bridge enum. */
 function csharpEnumsFile(input: GeneratorInput): GeneratedFile | undefined {
   const enums = sortedTypes(input.ir).filter(
@@ -351,7 +349,6 @@ function csharpModelsFile(input: GeneratorInput): GeneratedFile | undefined {
   if (types.length === 0) return undefined;
 
   const blocks: string[] = [];
-  const cross = crossPackageRefs(input.ir);
 
   // Shared JSON helper methods (expect*) for untrusted input conversion.
   blocks.push(jsonHelpersBlock());
@@ -376,7 +373,6 @@ function csharpModelsFile(input: GeneratorInput): GeneratedFile | undefined {
     joinBlocks(blocks),
     '',
   ].join('\n');
-  void cross;
   return generatedFile('Models.cs', content);
 }
 
@@ -1057,21 +1053,25 @@ function renderServiceClientCs(input: GeneratorInput, service: IRService): strin
   lines.push('    }');
   lines.push('');
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Signatures render through the type table so cross-package (opaque)
+    // and alias-substituted method types stay compilable; serialization
+    // degrades to passthrough for those (same guard as the Go generator).
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     const mName = camelToPascal(method.name);
     const mdoc = csDoc(method.docs, method.deprecated, '    ');
     if (mdoc !== undefined) lines.push(mdoc);
     lines.push(`    public ${outputType} ${mName}(${inputType} request) {`);
     lines.push(`        var url = this.baseUrl + "/${input.packageName}/${service.name}/${method.name}";`);
-    lines.push('        var body = JsonSerializer.Serialize(request.ToDict());');
+    lines.push(`        var body = JsonSerializer.Serialize(${serializeExpr(method.input, 'request', input)});`);
     lines.push('        using var content = new StringContent(body, Encoding.UTF8, "application/json");');
     lines.push('        using var response = this.http.PostAsync(url, content).GetAwaiter().GetResult();');
     lines.push('        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();');
     lines.push('        if (!response.IsSuccessStatusCode) {');
     lines.push('            throw new BridgeServiceError((int)response.StatusCode, text);');
     lines.push('        }');
-    lines.push(`        return ${outputType}.FromDict(JsonSerializer.Deserialize<JsonElement>(text));`);
+    lines.push('        var parsed = JsonSerializer.Deserialize<JsonElement>(text);');
+    lines.push(`        return ${deserializeExpr(method.output, 'parsed', input, 'response')};`);
     lines.push('    }');
     lines.push('');
   }
@@ -1115,8 +1115,10 @@ function renderServiceServerCs(input: GeneratorInput, service: IRService): strin
   lines.push('    /// <summary>Handler interface for the ' + service.name + ' service.</summary>');
   lines.push(`    public interface ${handler} {`);
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Signatures render through the type table so cross-package (opaque)
+    // and alias-substituted method types stay compilable.
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     lines.push(`        ${outputType} ${camelToPascal(method.name)}(${inputType} request);`);
   }
   lines.push('    }');
@@ -1152,30 +1154,34 @@ function renderServiceServerCs(input: GeneratorInput, service: IRService): strin
   lines.push('        JsonElement data;');
   lines.push('        try {');
   lines.push('            data = JsonSerializer.Deserialize<JsonElement>(bodyText);');
-  lines.push('            if (data.ValueKind != JsonValueKind.Object) { throw new ArgumentException("expected object"); }');
   lines.push('        } catch (Exception) {');
   lines.push('            RespondError(response, "invalid_argument");');
   lines.push('            return;');
   lines.push('        }');
   for (const methodDef of service.methods) {
-    const inputType = (methodDef.input as { name: string }).name;
-    const outputType = (methodDef.output as { name: string }).name;
     const mName = camelToPascal(methodDef.name);
+    // Request decode degrades to passthrough for opaque cross-package
+    // inputs; validation only applies to local struct inputs (same guard
+    // as the Go generator's validator table).
+    const ref = methodDef.input.kind === 'optional' ? methodDef.input.inner : methodDef.input;
+    const validates = ref.kind === 'named' && isLocalStructRef(ref, input.ir);
     lines.push(`        if ("${methodDef.name}" == method) {`);
-    lines.push(`            ${inputType} typedRequest;`);
+    lines.push(`            ${renderTypeRef(methodDef.input, input.render)} typedRequest;`);
     lines.push('            try {');
-    lines.push(`                typedRequest = ${inputType}.FromDict(data);`);
+    lines.push(`                typedRequest = ${deserializeExpr(methodDef.input, 'data', input, 'request')};`);
     lines.push('            } catch (Exception) {');
     lines.push('                RespondError(response, "invalid_argument");');
     lines.push('                return;');
     lines.push('            }');
-    lines.push('            if (BridgeValidation.Validate' + inputType + '(typedRequest).Count > 0) {');
-    lines.push('                RespondError(response, "invalid_argument");');
-    lines.push('                return;');
-    lines.push('            }');
+    if (validates && ref.kind === 'named') {
+      lines.push(`            if (BridgeValidation.Validate${ref.name}(typedRequest).Count > 0) {`);
+      lines.push('                RespondError(response, "invalid_argument");');
+      lines.push('                return;');
+      lines.push('            }');
+    }
     lines.push('            try {');
     lines.push(`                var resp = this.handler.${mName}(typedRequest);`);
-    lines.push('                RespondJson(response, 200, JsonSerializer.Serialize(resp.ToDict()));');
+    lines.push(`                RespondJson(response, 200, JsonSerializer.Serialize(${serializeExpr(methodDef.output, 'resp', input)}));`);
     lines.push('            } catch (Exception) {');
     lines.push('                RespondError(response, "internal");');
     lines.push('            }');
@@ -1398,19 +1404,6 @@ function csharpEventsFile(input: GeneratorInput): GeneratedFile | undefined {
   return generatedFile('Events.cs', content);
 }
 
-/** C# property type for an event field. */
-function csharpEventType(field: IRField, input: GeneratorInput): string {
-  return renderTypeRef(field.type, input.render);
-}
-
-/** SCREAMING_SNAKE constant name for a CamelCase event name. */
-function ScreamingSnake(name: string): string {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    .toUpperCase();
-}
-
 /* ------------------------------------------------------------------ */
 /* RoundTripTest.cs                                                    */
 /* ------------------------------------------------------------------ */
@@ -1440,13 +1433,13 @@ function csharpRoundtripFile(input: GeneratorInput): GeneratedFile | undefined {
   lines.push('{');
   lines.push('    public static void Main() {');
   lines.push('        int checks = 0;');
-  for (const structType of structs.slice(0, 2)) {
+  for (const structType of structs) {
     lines.push(`        checks += RoundTrip${structType.name}(Sample${structType.name}());`);
   }
   lines.push('        Console.WriteLine("RoundTripTest: " + checks + " checks passed");');
   lines.push('    }');
   lines.push('');
-  for (const structType of structs.slice(0, 2)) {
+  for (const structType of structs) {
     lines.push(`    private static int RoundTrip${structType.name}(${structType.name} value) {`);
     lines.push('        var encoded = JsonSerializer.Serialize(value.ToDict());');
     lines.push('        var parsed = JsonSerializer.Deserialize<JsonElement>(encoded);');
@@ -1519,6 +1512,13 @@ function csSampleValue(field: IRField, input: GeneratorInput, owner: string): st
       if (local !== undefined && local.kind === 'enum') {
         return `${target.name}.Parse(${JSON.stringify(local.variants[0]!.name)})`;
       }
+      if (local !== undefined && local.kind === 'union') {
+        // Unions have no public constructor: build the sample through the
+        // first variant's factory so required union fields still decode.
+        const first = local.variants[0]!;
+        const payload = csSampleValue({ ...field, type: first.type, optional: false, default: undefined }, input, owner);
+        return `${target.name}.${csharpSafeIdent(pascal(first.name))}(${payload})`;
+      }
       if (local !== undefined && local.kind === 'struct') {
         return `Sample${target.name}()`;
       }
@@ -1535,4 +1535,3 @@ function csSampleValue(field: IRField, input: GeneratorInput, owner: string): st
   }
 }
 
-/* __CSHARP_PART5__ */

@@ -184,3 +184,16 @@ test('generateServices: false omits method surfaces', () => {
   assert.ok(ffi !== undefined);
   assert.ok(!ffi.content.includes('bridge_payments_v1_payments_create_payment_call'));
 });
+
+test('wasm: module declarations gated on file presence (enum-less package)', () => {
+  const minimal = makeMinimalIR();
+  const files = generateFfi(minimal, { target: 'wasm' });
+  const paths = files.map((f) => f.path);
+  const lib = byPath(files, 'src/lib.rs');
+  if (!paths.includes('src/enums.rs')) {
+    assert.doesNotMatch(lib.content, /pub mod enums;/, 'lib.rs declares enums module with no enums.rs emitted');
+  }
+  if (paths.includes('src/types.rs')) {
+    assert.match(lib.content, /pub mod types;/);
+  }
+});
