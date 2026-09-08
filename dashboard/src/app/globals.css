@@ -1,0 +1,106 @@
+@import 'tailwindcss';
+
+/*
+ * BRIDGE Console - dark, professional developer-infra theme.
+ * Token names follow the shadcn/ui convention so handcrafted ui components
+ * stay drop-in familiar. Dark-only by design.
+ */
+
+:root {
+  --background: #0a0a0c;
+  --foreground: #f4f4f5;
+  --card: #101013;
+  --card-foreground: #f4f4f5;
+  --popover: #141417;
+  --popover-foreground: #f4f4f5;
+  --primary: #34d399;
+  --primary-foreground: #052e1c;
+  --secondary: #1c1c20;
+  --secondary-foreground: #e4e4e7;
+  --muted: #1c1c20;
+  --muted-foreground: #a1a1aa;
+  --accent: #1f2a24;
+  --accent-foreground: #6ee7b7;
+  --destructive: #f87171;
+  --destructive-foreground: #450a0a;
+  --border: #232329;
+  --input: #26262c;
+  --ring: #34d399;
+  --radius: 0.5rem;
+
+  /* classification palette */
+  --safe: #34d399;
+  --safe-soft: rgba(52, 211, 153, 0.12);
+  --warning: #fbbf24;
+  --warning-soft: rgba(251, 191, 36, 0.12);
+  --breaking: #f87171;
+  --breaking-soft: rgba(248, 113, 113, 0.12);
+  --unknown: #c084fc;
+  --unknown-soft: rgba(192, 132, 252, 0.12);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono:
+    ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(52, 211, 153, 0.25);
+}
+
+/* Slim, dark scrollbars for long lists */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2e2e35 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2e2e35;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
