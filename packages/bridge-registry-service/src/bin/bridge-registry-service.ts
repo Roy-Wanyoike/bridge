@@ -15,7 +15,8 @@
 import { readFileSync } from 'node:fs';
 import { start } from '../server';
 import { InMemoryDriver } from '../storage/memory';
-import { PostgresDriver } from '../storage/postgres/driver';
+import { PostgresDriver, parseDsn } from '../storage/postgres/driver';
+import type { PgConnectOptions } from '../storage/postgres/driver';
 import type { RegistryRole, RegistryServiceOptions, RegistryTokenInfo, StorageDriver } from '../types';
 
 const USAGE = `bridge-registry-service — multi-tenant Bridge contract registry
@@ -38,17 +39,41 @@ Options:
                                  key is configured, signed publishes are
                                  REQUIRED unless --signing-optional is passed.
   --signing-optional             Allow unsigned publishes when keys are set
+  --production-profile           Hardened defaults for internet-facing
+                                 deployments: rate limiting ON, publish
+                                 signing REQUIRED (needs at least one
+                                 --signing-key; incompatible with
+                                 --signing-optional), strict TLS for
+                                 postgres (sslmode=require unless the DSN
+                                 pins verify-full; sslmode=disable is
+                                 refused).
   --audit <file.jsonl>           Mirror audit entries to an append-only JSONL
                                  file (entries always also go to the driver)
+  --audit-retention-days <days>  Postgres only: delete bridge_audit rows older
+                                 than <days> (boot sweep, then every 6h).
+                                 Default: no pruning. Env:
+                                 BRIDGE_REGISTRY_AUDIT_RETENTION_DAYS
   -h, --help                     Show this help
+
+Defaults (issue #48 hardening):
+  - Rate limiting is ON with conservative buckets (auth: 120 capacity @
+    30/s per IP; publish: 30 @ 5/s per principal). A boot log line says so.
+  - A DSN without sslmode defaults to sslmode=prefer (TLS when the server
+    supports it); cleartext password auth is refused on plaintext
+    connections.
+  - Missing signing configuration boots with a loud warning: unsigned
+    publishes are accepted until keys are configured.
 
 Environment (equivalents):
   BRIDGE_REGISTRY_PORT, BRIDGE_REGISTRY_DRIVER, PG_DSN,
-  BRIDGE_REGISTRY_TOKEN (repeatable via ';': secret=org:role;secret2=org:role)
+  BRIDGE_REGISTRY_TOKEN (repeatable via ';': secret=org:role;secret2=org:role),
+  BRIDGE_REGISTRY_PRODUCTION=1 (same as --production-profile)
 
 Examples:
   bridge-registry-service --token dev-acme=acme:write --token ro=acme:read
   bridge-registry-service --driver postgres --pg-dsn postgres://bridge@localhost/bridge
+  bridge-registry-service --production-profile --signing-key k1=./publisher.pub --driver postgres \\
+    --pg-dsn postgres://bridge@db/bridge?sslmode=verify-full
 
 Health:   curl http://127.0.0.1:4350/healthz
 API doc:  curl http://127.0.0.1:4350/v1/openapi.json
@@ -60,7 +85,7 @@ Publish:  curl -X PUT -H 'Authorization: Bearer dev-acme' \\
 /** Internal marker for command-line misuse (distinct from runtime errors). */
 class UsageError extends Error {}
 
-interface Config {
+export interface Config {
   port: number;
   host?: string;
   driver: 'memory' | 'postgres';
@@ -69,7 +94,10 @@ interface Config {
   oidc?: { issuer: string; audience: string; jwksUrl?: string };
   signingKeys: Record<string, string>;
   signingOptional: boolean;
+  productionProfile: boolean;
   auditFile?: string;
+  /** Audit retention window (postgres only); `undefined` disables pruning. */
+  auditRetentionDays?: number;
 }
 
 function envTokens(): Record<string, RegistryTokenInfo> {
@@ -96,7 +124,18 @@ function parseArgs(argv: string[]): Config {
     tokens: envTokens(),
     signingKeys: {},
     signingOptional: false,
+    productionProfile:
+      process.env['BRIDGE_REGISTRY_PRODUCTION'] === '1' ||
+      process.env['BRIDGE_REGISTRY_PRODUCTION'] === 'true',
   };
+  const envRetention = process.env['BRIDGE_REGISTRY_AUDIT_RETENTION_DAYS'];
+  if (envRetention !== undefined && envRetention.length > 0) {
+    const days = Number(envRetention);
+    if (!Number.isInteger(days) || days < 1) {
+      throw new UsageError(`BRIDGE_REGISTRY_AUDIT_RETENTION_DAYS must be an integer >= 1, got '${envRetention}'`);
+    }
+    config.auditRetentionDays = days;
+  }
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) config.port = 4350;
 
   for (let i = 0; i < argv.length; i++) {
@@ -175,9 +214,21 @@ function parseArgs(argv: string[]): Config {
       case '--signing-optional':
         config.signingOptional = true;
         break;
+      case '--production-profile':
+        config.productionProfile = true;
+        break;
       case '--audit':
         config.auditFile = value();
         break;
+      case '--audit-retention-days': {
+        const raw = value();
+        const days = Number(raw);
+        if (!Number.isInteger(days) || days < 1) {
+          throw new UsageError(`--audit-retention-days must be an integer >= 1, got '${raw}'`);
+        }
+        config.auditRetentionDays = days;
+        break;
+      }
       default:
         throw new UsageError(`unknown option '${arg}' (see --help)`);
     }
@@ -192,9 +243,69 @@ function parseArgs(argv: string[]): Config {
   return config;
 }
 
+/**
+ * Strict-TLS rule for the production profile (issue #48): cleartext is
+ * refused, `prefer` (fallible) is upgraded to `require`, explicit
+ * `verify-full` is respected.
+ */
+export function productionProfileSsl(ssl: PgConnectOptions['ssl']): PgConnectOptions['ssl'] {
+  if (ssl === 'disable') {
+    throw new UsageError(
+      '--production-profile: PG_DSN explicitly sets sslmode=disable — TLS is mandatory in the production profile',
+    );
+  }
+  return ssl === 'verify-full' ? 'verify-full' : 'require';
+}
+
+/** Build the service options from a parsed config (exported for tests). */
+export function buildOptions(config: Config): RegistryServiceOptions {
+  if (config.productionProfile) {
+    // The production profile is only honest when signing is actually
+    // enforced (issue #48): unsigned publishes must not be accepted. This is
+    // validated HERE (not just in parseArgs) so every path into the options
+    // — CLI or programmatic — gets the same guarantee.
+    if (Object.keys(config.signingKeys).length === 0) {
+      throw new UsageError(
+        '--production-profile requires at least one --signing-key (signed publishes are mandatory)',
+      );
+    }
+    if (config.signingOptional) {
+      throw new UsageError('--production-profile cannot be combined with --signing-optional');
+    }
+  }
+  const options: RegistryServiceOptions = {
+    driver: buildDriver(config),
+    auth: {
+      tokens: Object.keys(config.tokens).length > 0 ? config.tokens : undefined,
+      oidc:
+        config.oidc !== undefined
+          ? { issuer: config.oidc.issuer, audience: config.oidc.audience, jwksUrl: config.oidc.jwksUrl }
+          : undefined,
+    },
+    signing:
+      Object.keys(config.signingKeys).length > 0
+        ? { keys: config.signingKeys, mode: config.signingOptional ? 'optional' : 'required' }
+        : undefined,
+    host: config.host,
+  };
+  if (config.productionProfile) {
+    // Hardened defaults (issue #48): throttling on, signing required,
+    // strict TLS for the postgres transport.
+    options.rateLimit = { enabled: true };
+    options.signing = { keys: config.signingKeys, mode: 'required' };
+    if (config.driver === 'postgres') {
+      const parsed = parseDsn(config.pgDsn!);
+      parsed.ssl = productionProfileSsl(parsed.ssl);
+      parsed.sslDefaulted = false;
+      options.driver = new PostgresDriver({ options: parsed, auditRetentionDays: config.auditRetentionDays });
+    }
+  }
+  return options;
+}
+
 function buildDriver(config: Config): StorageDriver {
   if (config.driver === 'postgres') {
-    return new PostgresDriver({ dsn: config.pgDsn! });
+    return new PostgresDriver({ dsn: config.pgDsn!, auditRetentionDays: config.auditRetentionDays });
   }
   return new InMemoryDriver();
 }
@@ -213,21 +324,7 @@ function run(argv: string[]): number {
   }
 
   try {
-    const options: RegistryServiceOptions = {
-      driver: buildDriver(config),
-      auth: {
-        tokens: Object.keys(config.tokens).length > 0 ? config.tokens : undefined,
-        oidc:
-          config.oidc !== undefined
-            ? { issuer: config.oidc.issuer, audience: config.oidc.audience, jwksUrl: config.oidc.jwksUrl }
-            : undefined,
-      },
-      signing:
-        Object.keys(config.signingKeys).length > 0
-          ? { keys: config.signingKeys, mode: config.signingOptional ? 'optional' : 'required' }
-          : undefined,
-      host: config.host,
-    };
+    const options = buildOptions(config);
     if (config.auditFile !== undefined) {
       // Lazy import avoided on purpose: the FileAuditSink lives in audit.ts
       // and is part of this package.
@@ -248,7 +345,9 @@ function run(argv: string[]): number {
     });
     const shutdown = (): void => {
       server.close(() => process.exit(0));
-      // Force-exit if graceful close hangs (open keep-alive sockets).
+      // Do not wait on idle keep-alive sockets (issue #48).
+      server.closeIdleConnections();
+      // Force-exit if graceful close still hangs (in-flight requests).
       setTimeout(() => process.exit(0), 5_000).unref();
     };
     process.on('SIGTERM', shutdown);

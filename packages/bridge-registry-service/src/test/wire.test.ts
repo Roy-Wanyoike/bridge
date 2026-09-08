@@ -11,9 +11,22 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Mutex } from '../storage/postgres/wire';
+import { Mutex, parseDsn } from '../storage/postgres/wire';
 
 const tick = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('parseDsn: sslmode defaults to prefer, flagged for the boot log (issue #48)', () => {
+  const defaulted = parseDsn('postgres://u:p@localhost:5432/bridge');
+  assert.equal(defaulted.ssl, 'prefer', 'a DSN without sslmode must not silently disable TLS');
+  assert.equal(defaulted.sslDefaulted, true);
+
+  const explicit = ['disable', 'prefer', 'require', 'verify-full'] as const;
+  for (const mode of explicit) {
+    const parsed = parseDsn(`postgres://u:p@localhost:5432/bridge?sslmode=${mode}`);
+    assert.equal(parsed.ssl, mode);
+    assert.equal(parsed.sslDefaulted, false);
+  }
+});
 
 test('mutex: interleaved queries resolve in submission order (FIFO)', async () => {
   const mutex = new Mutex();

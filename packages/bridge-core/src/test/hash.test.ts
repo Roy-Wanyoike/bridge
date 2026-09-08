@@ -158,3 +158,26 @@ test('shortHash is a 12-char prefix of the package hash', () => {
   assert.equal(short.length, 12);
   assert.equal(hash.startsWith(short), true);
 });
+
+// ------------------------------------------- issue #48: additive depth cap
+
+test('canonicalJson: maxDepth bounds recursion; the default stays unbounded', () => {
+  // Build a ~1500-deep document — deep enough that unbounded recursion is
+  // the old behavior, shallow enough that JSON.stringify/canonicalize stay
+  // far inside the default stack.
+  let deep: unknown = { leaf: 1 };
+  for (let i = 0; i < 1500; i++) deep = { nested: deep };
+
+  // Default argument: behavior is byte-identical to before the change.
+  assert.equal(typeof canonicalJson(deep), 'string');
+  // A cap turns stack exhaustion into a deterministic RangeError…
+  assert.throws(() => canonicalJson(deep, 128), RangeError);
+  // …while documents inside the cap are untouched.
+  assert.equal(canonicalJson({ a: { b: { c: 1 } } }, 128), '{"a":{"b":{"c":1}}}');
+});
+
+test('hashPackage: optional maxDepth leaves the default digest unchanged', () => {
+  const ir = compile(SCHEMA, 'a.bridge');
+  assert.equal(hashPackage(ir), hashPackage(ir, Number.POSITIVE_INFINITY));
+  assert.equal(typeof hashPackage(ir), 'string');
+});

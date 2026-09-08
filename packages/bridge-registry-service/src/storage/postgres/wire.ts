@@ -16,7 +16,7 @@
 
 import { createHash, createHmac, randomBytes, pbkdf2Sync } from 'node:crypto';
 import { connect as tcpConnect, type Socket } from 'node:net';
-import { connect as tlsConnect, type TLSSocket } from 'node:tls';
+import { connect as tlsConnect, TLSSocket } from 'node:tls';
 
 // ------------------------------------------------------------------ options
 export interface PgConnectOptions {
@@ -25,8 +25,10 @@ export interface PgConnectOptions {
   user: string;
   password?: string;
   database: string;
-  /** `disable` (default), `prefer` (upgrade when the server supports it), `require`, `verify-full`. */
+  /** `prefer` (default — TLS when the server supports it), `disable`, `require`, `verify-full`. */
   ssl?: 'disable' | 'prefer' | 'require' | 'verify-full';
+  /** True when `ssl` was NOT present in the DSN and was defaulted (boot-log flag). */
+  sslDefaulted?: boolean;
   applicationName?: string;
   connectionTimeoutMs?: number;
 }
@@ -48,9 +50,11 @@ export function parseDsn(dsn: string): PgConnectOptions {
   const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
   if (!database) throw new TypeError('PG_DSN: database is required');
   const sslParam = url.searchParams.get('sslmode') ?? undefined;
+  // issue #48: a DSN without sslmode defaults to 'prefer' (TLS when the
+  // server supports it) instead of silently disabling TLS.
   const ssl =
     sslParam === undefined
-      ? undefined
+      ? 'prefer'
       : sslParam === 'disable' || sslParam === 'prefer' || sslParam === 'require' || sslParam === 'verify-full'
         ? (sslParam as PgConnectOptions['ssl'])
         : undefined;
@@ -68,6 +72,7 @@ export function parseDsn(dsn: string): PgConnectOptions {
     password: url.password === '' ? undefined : decodeURIComponent(url.password),
     database,
     ssl,
+    sslDefaulted: sslParam === undefined,
     applicationName: url.searchParams.get('application_name') ?? undefined,
   };
 }
@@ -412,6 +417,8 @@ export class PgClient {
   private buffer: Buffer = Buffer.alloc(0);
   private waiter: { resolve: (msg: PgMessage) => void; reject: (err: Error) => void } | null = null;
   private closed = false;
+  /** True when the transport was TLS-upgraded (cleartext-auth gate). */
+  private readonly tlsActive: boolean;
   /**
    * Serializes query()/simpleQuery() per connection (issue #47): the wire
    * protocol allows exactly one exchange in flight — concurrent callers
@@ -422,6 +429,7 @@ export class PgClient {
 
   private constructor(socket: Socket | TLSSocket) {
     this.socket = socket;
+    this.tlsActive = socket instanceof TLSSocket;
     socket.on('data', (chunk: Buffer) => {
       this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
       this.pump();
@@ -449,7 +457,13 @@ export class PgClient {
     const socket = await tcpConnectPromise(options, timeoutMs);
     let active: Socket | TLSSocket = socket;
 
-    const ssl = options.ssl ?? 'disable';
+    // issue #48: default 'prefer' — upgrade to TLS when the server supports
+    // it, continue in clear text only when it does not (and then refuse to
+    // send a cleartext password; see authenticate()).
+    const ssl = options.ssl ?? 'prefer';
+    if (options.ssl === undefined) {
+      console.warn('[bridge-registry-service] postgres: no sslmode configured; defaulting to sslmode=prefer');
+    }
     if (ssl !== 'disable') {
       socket.write(encodeSSLRequest());
       const decision = await readExact(socket, 1, timeoutMs);
@@ -504,6 +518,17 @@ export class PgClient {
       if (code === 0) continue; // AuthenticationOk
       if (code === 3) {
         if (typeof options.password !== 'string') throw new Error('postgres: server requested a password but none was configured');
+        if (!this.tlsActive) {
+          // issue #48: a cleartext password on a plaintext connection ships
+          // the credential to anyone on the path. Refuse with a clear
+          // message; SCRAM-SHA-256 (code 10) remains available over plain
+          // text because the password never crosses the wire.
+          throw new Error(
+            'postgres: server requested CLEARTEXT password auth over a plaintext connection — ' +
+              'the password would be sent unencrypted. Use sslmode=require (or verify-full), ' +
+              'or switch the server to SCRAM-SHA-256 / trust auth for non-TLS local development.',
+          );
+        }
         this.socket.write(encodePasswordMessage(options.password));
         continue;
       }

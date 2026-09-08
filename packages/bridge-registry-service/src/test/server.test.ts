@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
+import http, { Agent } from 'node:http';
 import { canonicalJson } from '@bridge/core';
 import type { AddressInfo } from 'node:net';
 import { InMemoryDriver } from '../storage/memory';
@@ -411,4 +412,167 @@ test('startTestServer helper binds and closes cleanly', async () => {
   const health = await request(handle.url, 'GET', '/healthz');
   assert.equal(health.status, 200);
   await handle.close();
+});
+
+// --------------------------------------------- issue #48: hardened defaults
+
+test('server pins explicit timeouts (issue #48)', () => {
+  const driver = new InMemoryDriver();
+  const server = serviceCreateServer({
+    driver,
+    auth: { tokens: { t: { tenant: 'acme', role: 'read' } } },
+    rateLimit: { enabled: false },
+  } as never);
+  assert.equal(server.requestTimeout, 120_000);
+  assert.equal(server.headersTimeout, 15_000);
+  assert.equal(server.keepAliveTimeout, 5_000);
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+test('rate limiting is ON by default and openapi.json sits below the limiter (issue #48)', async () => {
+  // `rateLimit: undefined` overrides withServer's explicit-off default so the
+  // options object reaching createServer has NO rateLimit key at all — the
+  // shipped CLI situation before the fix.
+  await withServer({ rateLimit: undefined }, async ({ url }) => {
+    const responses = await Promise.all(
+      Array.from({ length: 200 }, () => fetch(`${url}/v1/openapi.json`)),
+    );
+    const statuses = responses.map((r) => r.status);
+    assert.ok(statuses.includes(429), 'a burst must hit the default-enabled limiter');
+    assert.ok(statuses.includes(200), 'part of the burst must still be served');
+    // /healthz is deliberately outside the limiter.
+    const health = await request(url, 'GET', '/healthz');
+    assert.equal(health.status, 200);
+  });
+});
+
+test('413: the envelope is delivered before the connection is destroyed (issue #48)', async () => {
+  await withServer({}, async ({ url }) => {
+    const oversized = Buffer.alloc(8 * 1024 * 1024 + 1, 0x61);
+    const response = await fetch(`${url}/v1/orgs/acme/projects/payments/contracts/payments.v1`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${WRITE}`, 'content-type': 'application/json' },
+      body: oversized,
+    });
+    assert.equal(response.status, 413);
+    // The regression: the socket used to be destroyed mid-upload, so clients
+    // got ECONNRESET instead of this envelope.
+    const json = (await response.json()) as { error: { code: string } };
+    assert.equal(json.error.code, 'payload-too-large');
+  });
+});
+
+test('graceful shutdown: closeIdleConnections unblocks close() on idle keep-alive sockets (issue #48)', async () => {
+  const driver = new InMemoryDriver();
+  await driver.init();
+  const server = serviceCreateServer({
+    driver,
+    auth: { tokens: { [READ]: { tenant: 'acme', role: 'read' } } },
+    rateLimit: { enabled: false },
+  } as never);
+  server.listen(0);
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  const address = server.address() as AddressInfo;
+  const url = `http://127.0.0.1:${address.port}`;
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+  try {
+    // Park one idle keep-alive socket in the agent pool.
+    await new Promise<void>((resolve, reject) => {
+      const req = http.get(`${url}/healthz`, { agent }, (res) => {
+        res.resume();
+        res.on('end', resolve);
+      });
+      req.on('error', reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50)); // socket back to the pool
+    const started = Date.now();
+    const elapsed = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('server.close() hung on an idle keep-alive socket')), 2_500);
+      server.closeIdleConnections();
+      server.close(() => {
+        clearTimeout(timer);
+        resolve(Date.now() - started);
+      });
+    });
+    assert.ok(elapsed < 2_000, `close() took ${elapsed}ms — it waited on the idle socket`);
+  } catch (err) {
+    server.closeAllConnections();
+    throw err;
+  } finally {
+    agent.destroy();
+  }
+});
+
+test('audit hygiene: pre-auth noise is skipped, failed bearer tokens record action auth (issue #48)', async () => {
+  await withServer({}, async ({ url }) => {
+    // Missing header → pre-auth noise, NOT stored.
+    const noToken = await request(url, 'GET', '/v1/search?q=x');
+    assert.equal(noToken.status, 401);
+    // Wrong scheme → pre-auth noise, NOT stored.
+    const wrongScheme = await fetch(`${url}/v1/search?q=x`, {
+      headers: { authorization: 'Basic dXNlcjpwYXNz' },
+    });
+    assert.equal(wrongScheme.status, 401);
+    // A well-formed but wrong bearer token IS a security event → stored.
+    const badToken = await request(url, 'GET', '/v1/search?q=x', { token: 'wrong' });
+    assert.equal(badToken.status, 401);
+
+    const entries = await request(url, 'GET', '/v1/audit?action=auth', { token: ADMIN });
+    assert.equal(entries.status, 200);
+    assert.equal(entries.json.entries.length, 1, 'exactly the failed bearer attempt is stored');
+    assert.equal(entries.json.entries[0].action, 'auth');
+    assert.equal(entries.json.entries[0].status, 401);
+    assert.equal(entries.json.entries[0].ok, false);
+  });
+});
+
+test('audit hygiene: rate-limited requests are not persisted (issue #48)', async () => {
+  await withServer(
+    { rateLimit: { enabled: true, auth: { capacity: 2, refillPerSecond: 1 } } },
+    async ({ url }) => {
+      assert.equal((await request(url, 'GET', '/v1/search?q=x', { token: READ })).status, 200);
+      assert.equal((await request(url, 'GET', '/v1/search?q=x', { token: READ })).status, 200);
+      assert.equal((await request(url, 'GET', '/v1/search?q=x', { token: READ })).status, 429);
+      // Let one token refill, then inspect the ring as admin.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const entries = await request(url, 'GET', '/v1/audit', { token: ADMIN });
+      assert.equal(entries.status, 200);
+      const statuses = entries.json.entries.map((e: { status: number }) => e.status);
+      assert.ok(!statuses.includes(429), '429s must not pollute the audit ring');
+      assert.ok(statuses.includes(200), 'legitimate traffic stays recorded');
+    },
+  );
+});
+
+test('publishTime must be a valid ISO-8601 timestamp (issue #48)', async () => {
+  await withServer({}, async ({ url }) => {
+    const bad = await request(url, 'PUT', '/v1/orgs/acme/projects/payments/contracts/payments.v1', {
+      token: WRITE,
+      body: { ir: makeIR(), publishTime: 'last tuesday' },
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.error.code, 'invalid_argument');
+    assert.match(bad.json.error.message, /publishTime/);
+
+    const good = await request(url, 'PUT', '/v1/orgs/acme/projects/payments/contracts/payments.v1', {
+      token: WRITE,
+      body: { ir: makeIR(), publishTime: new Date().toISOString() },
+    });
+    assert.equal(good.status, 201);
+  });
+});
+
+test('audit from/to bounds must be valid ISO-8601 (issue #48)', async () => {
+  await withServer({}, async ({ url }) => {
+    const bad = await request(url, 'GET', '/v1/audit?from=not-a-date', { token: ADMIN });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.error.code, 'invalid_argument');
+    const ok = await request(
+      url,
+      'GET',
+      `/v1/audit?from=${encodeURIComponent(new Date(Date.now() - 60_000).toISOString())}`,
+      { token: ADMIN },
+    );
+    assert.equal(ok.status, 200);
+  });
 });

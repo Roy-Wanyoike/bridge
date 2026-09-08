@@ -13,11 +13,13 @@ import {
   authenticateStaticToken,
   createAuthenticator,
   extractBearerToken,
+  OidcAuthenticator,
   parseJwks,
   requireLevel,
   scopesToLevel,
   verifyJwt,
 } from '../auth';
+import { ServiceError } from '../errors';
 import { generateSigningKey, mintJwt } from './helpers';
 import { verifyPublishSignature } from '../signing';
 import type { OidcConfig } from '../types';
@@ -38,6 +40,22 @@ test('static tokens: bearer extraction and lookup', () => {
   assert.equal(principal.org, 'acme');
   assert.equal(principal.level, 2);
   assert.throws(() => authenticateStaticToken({ s: { tenant: 'acme', role: 'write' } }, 'Bearer wrong'));
+});
+
+test('static tokens: prototype-chain names never authenticate (issue #48)', () => {
+  // The old `tokens[token]` lookup walked the prototype chain, so bearers
+  // spelled like inherited Object properties resolved (fail-closed, but to a
+  // nonsense principal). Own-property lookup only now.
+  const tokens = { 'real-secret': { tenant: 'acme', role: 'write' as const } };
+  for (const trick of ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf']) {
+    assert.throws(
+      () => authenticateStaticToken(tokens, `Bearer ${trick}`),
+      /missing or invalid bearer token/,
+      `bearer '${trick}' must not authenticate`,
+    );
+  }
+  // The real token still works and the table stays untouched.
+  assert.equal(authenticateStaticToken(tokens, 'Bearer real-secret').org, 'acme');
 });
 
 test('levels: requireLevel enforces the scope hierarchy', () => {
@@ -171,6 +189,105 @@ test('OIDC: an authenticator with no mechanisms fails closed', () => {
   assert.throws(() => createAuthenticator({}), /at least one mechanism/);
 });
 
+test('OIDC: unknown-kid misses are negatively cached, briefly (issue #48)', async () => {
+  const { mint, key } = generateSigningKey('RS256');
+  let clock = Date.now();
+  let fetches = 0;
+  const authenticator = new OidcAuthenticator({
+    issuer: 'https://issuer.example.com',
+    audience: 'bridge-registry',
+    jwksUrl: 'https://issuer.example.com/jwks.json',
+    fetchJwks: async () => {
+      fetches += 1;
+      return { keys: [mint.jwk] };
+    },
+    now: () => clock,
+  });
+
+  // Warm the cache: one fetch.
+  const good = `Bearer ${mintJwt(key, 'RS256', mint.kid, baseClaims())}`;
+  assert.equal((await authenticator.authenticate(good)).org, 'acme');
+  assert.equal(fetches, 1);
+
+  const bad = `Bearer ${mintJwt(key, 'RS256', 'ghost-kid', baseClaims())}`;
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  assert.equal(fetches, 2, 'the first unknown kid forces exactly one refresh');
+
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  assert.equal(fetches, 2, 'the negative cache answers repeats without fetching');
+
+  // After the miss TTL lapses exactly one re-check is allowed — and it may
+  // not turn the service into a per-request fetch amplifier.
+  clock += 61_000;
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  assert.equal(fetches, 3, 'an expired negative entry allows a single re-check');
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  assert.equal(fetches, 3, 'the re-checked miss is negatively cached again');
+});
+
+test('OIDC: concurrent unknown-kid misses share one refresh (single-flight, issue #48)', async () => {
+  const { mint, key } = generateSigningKey('RS256');
+  let fetches = 0;
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const authenticator = new OidcAuthenticator({
+    issuer: 'https://issuer.example.com',
+    audience: 'bridge-registry',
+    fetchJwks: async () => {
+      fetches += 1;
+      if (fetches === 1) return { keys: [mint.jwk] }; // warm-up
+      await gate; // hold the forced refresh open
+      return { keys: [mint.jwk] };
+    },
+  });
+
+  const good = `Bearer ${mintJwt(key, 'RS256', mint.kid, baseClaims())}`;
+  assert.equal((await authenticator.authenticate(good)).org, 'acme');
+  assert.equal(fetches, 1);
+
+  const bad = `Bearer ${mintJwt(key, 'RS256', 'flood-kid', baseClaims())}`;
+  const attempts = Array.from({ length: 5 }, () =>
+    authenticator.authenticate(bad).then(
+      () => 'authenticated',
+      (err: Error) => err.message,
+    ),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 25)); // let them pile up
+  assert.equal(fetches, 2, 'the burst must be inside a single in-flight refresh');
+
+  releaseGate();
+  const outcomes = await Promise.all(attempts);
+  assert.equal(fetches, 2, 'no caller may trigger an extra fetch');
+  for (const message of outcomes) {
+    assert.match(message, /unknown key/);
+  }
+  // The shared refresh confirmed the miss → negatively cached afterwards.
+  await assert.rejects(() => authenticator.authenticate(bad), /unknown key/);
+  assert.equal(fetches, 2);
+});
+
+test('OIDC: JWKS fetch failures never disclose the URL to clients (issue #48)', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('boom', { status: 500 })) as typeof fetch;
+  try {
+    const authenticator = new OidcAuthenticator({
+      issuer: 'https://secret-idp.example.test',
+      audience: 'bridge-registry',
+      jwksUrl: 'https://secret-idp.example.test/internal-keys',
+    });
+    await assert.rejects(
+      () => authenticator.authenticate('Bearer aaa.bbb.ccc'),
+      (err: Error) =>
+        /temporarily unavailable/.test(err.message) && !err.message.includes('secret-idp.example.test'),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('OIDC: end-to-end authentication via createAuthenticator', async () => {
   const { mint, key } = generateSigningKey('RS256');
   const authenticator = createAuthenticator({
@@ -222,6 +339,36 @@ test('signing: unsigned publish passes in optional mode', () => {
   const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
   const result = verifyPublishSignature({ ir: makeIrBody() }, {}, { keys: { k1: pem }, mode: 'optional' });
   assert.equal(result.signed, false);
+});
+
+test('signing: bodies beyond the canonical-JSON depth cap are a 400, not a 500 (issue #48)', () => {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
+  // The CLIENT canonicalizes uncapped, so it can legitimately sign a deep
+  // body; the server must answer 400 instead of dying on a RangeError.
+  let deep: Record<string, unknown> = { leaf: true };
+  for (let i = 0; i < 600; i++) deep = { nested: deep };
+  const body = { ir: makeIrBody(), pad: deep };
+  const signature = cryptoSign(null, Buffer.from(canonicalJson(body), 'utf8'), privateKey);
+  assert.throws(
+    () =>
+      verifyPublishSignature(
+        body,
+        { 'x-bridge-key-id': 'k1', 'x-bridge-signature': signature.toString('base64') },
+        { keys: { k1: pem } },
+      ),
+    (err: unknown) =>
+      err instanceof ServiceError && err.status === 400 && /canonical-JSON depth/.test(err.message),
+  );
+  // A shallow body still verifies fine.
+  const shallow = { ir: makeIrBody() };
+  const okSignature = cryptoSign(null, Buffer.from(canonicalJson(shallow), 'utf8'), privateKey);
+  const result = verifyPublishSignature(
+    shallow,
+    { 'x-bridge-key-id': 'k1', 'x-bridge-signature': okSignature.toString('base64') },
+    { keys: { k1: pem } },
+  );
+  assert.equal(result.signed, true);
 });
 
 function makeIrBody(): Record<string, unknown> {

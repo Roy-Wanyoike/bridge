@@ -54,8 +54,17 @@ const MAX_AUTH_HEADER = 16 * 1024;
 const DEFAULT_LEEWAY_SEC = 60;
 /** Default JWKS cache TTL in ms. */
 const DEFAULT_CACHE_TTL_MS = 600_000;
+/** Negative-cache TTL for unknown `kid`s (issue #48). */
+const KID_MISS_TTL_MS = 60_000;
+/** Upper bound on simultaneously negatively-cached kids (kid-spray defense). */
+const MAX_KID_MISSES = 10_000;
+/** Minimum interval between forced JWKS refreshes (unique-kid flood defense). */
+const MIN_FORCED_REFRESH_INTERVAL_MS = 1_000;
 /** Minimum RSA modulus size we accept: 2048 bits = 256 bytes. */
 const MIN_RSA_MODULUS_BYTES = 256;
+
+/** Exact failure message used to recognize an unknown-kid verification result. */
+const UNKNOWN_KEY_MESSAGE = 'token signed by an unknown key (kid not in JWKS)';
 
 function unauthenticated(message: string): ServiceError {
   return new ServiceError(401, 'unauthenticated', message);
@@ -63,7 +72,7 @@ function unauthenticated(message: string): ServiceError {
 
 /** Distinct failure used to trigger a one-shot JWKS refresh on unknown kids. */
 function unknownKey(): ServiceError {
-  return new ServiceError(401, 'unauthenticated', 'token signed by an unknown key (kid not in JWKS)');
+  return new ServiceError(401, 'unauthenticated', UNKNOWN_KEY_MESSAGE);
 }
 
 // ---------------------------------------------------------- static tokens
@@ -113,8 +122,22 @@ export function extractBearerToken(authorization: string | undefined): string {
 /** Static-token lookup → {@link Principal}. Throws 401 when unknown. */
 export function authenticateStaticToken(tokens: TokenTable, authorization: string | undefined): Principal {
   const token = extractBearerToken(authorization);
+  // Own-property lookup only (issue #48): `tokens[token]` walks the
+  // prototype chain, so a bearer token spelled `constructor`/`toString`
+  // resolved to an inherited value and produced a principal with an
+  // undefined org (it failed closed downstream, but only after noise).
+  //
+  // Constant-time note: a keyed map lookup is not constant-time. That is
+  // acceptable here because bearer tokens must be high-entropy secrets
+  // (≥128 bits) — timing signals on the table index are then impractical
+  // to exploit. A truly constant-time comparison over a token TABLE would
+  // require HMAC-ing every candidate key; use the OIDC mechanism for
+  // production fleets.
+  if (!Object.prototype.hasOwnProperty.call(tokens, token)) {
+    throw unauthenticated('missing or invalid bearer token');
+  }
   const info = tokens[token];
-  if (info === undefined) throw unauthenticated('missing or invalid bearer token');
+  if (info === undefined || info === null) throw unauthenticated('missing or invalid bearer token');
   return {
     kind: 'token',
     subject: `token:${info.tenant}`,
@@ -362,6 +385,12 @@ export class OidcAuthenticator implements RequestAuthenticator {
   private readonly ttlMs: number;
   private cache: Map<string, KeyObject> = new Map();
   private fetchedAt = -Infinity;
+  /** kid → miss expiry (ms, injectable clock). Negative cache (issue #48). */
+  private readonly kidMisses = new Map<string, number>();
+  /** In-flight forced refresh — concurrent misses share one fetch. */
+  private refreshing: Promise<Map<string, KeyObject>> | null = null;
+  /** Clock of the last forced refresh (throttles unique-kid floods). */
+  private lastForcedRefreshAt = -Infinity;
 
   constructor(cfg: OidcConfig) {
     if (typeof cfg.issuer !== 'string' || cfg.issuer.length === 0) {
@@ -399,6 +428,57 @@ export class OidcAuthenticator implements RequestAuthenticator {
     return this.cache;
   }
 
+  /** True while `kid` is negatively cached (recently confirmed missing). */
+  private isKidNegative(kid: string): boolean {
+    const expires = this.kidMisses.get(kid);
+    if (expires === undefined) return false;
+    if (expires <= this.now()) {
+      this.kidMisses.delete(kid);
+      return false;
+    }
+    return true;
+  }
+
+  /** Record a confirmed kid miss for {@link KID_MISS_TTL_MS}, bounded. */
+  private markKidNegative(kid: string): void {
+    if (this.kidMisses.size >= MAX_KID_MISSES) {
+      const nowMs = this.now();
+      for (const [k, exp] of this.kidMisses) {
+        if (exp <= nowMs) this.kidMisses.delete(k);
+      }
+      while (this.kidMisses.size >= MAX_KID_MISSES) {
+        const oldest = this.kidMisses.keys().next().value;
+        if (oldest === undefined) break;
+        this.kidMisses.delete(oldest);
+      }
+    }
+    this.kidMisses.set(kid, this.now() + KID_MISS_TTL_MS);
+  }
+
+  /**
+   * Single-flight forced refresh (key rotation must not wait out the TTL):
+   * concurrent callers share one fetch, and refreshes are throttled to at
+   * most one per {@link MIN_FORCED_REFRESH_INTERVAL_MS} so a spray of
+   * unique garbage kids cannot turn the service into a per-request fetch
+   * amplifier against the IdP (issue #48). When the throttle skips the
+   * fetch the CURRENT cache is returned (stale-serve semantics) and
+   * `fetched` is false, so the result cannot poison the negative cache.
+   */
+  private async refreshKeys(): Promise<{ keys: Map<string, KeyObject>; fetched: boolean }> {
+    if (this.cfg.jwks !== undefined) return { keys: this.cache, fetched: false }; // static injection
+    if (this.now() - this.lastForcedRefreshAt < MIN_FORCED_REFRESH_INTERVAL_MS) {
+      return { keys: this.cache, fetched: false };
+    }
+    if (this.refreshing === null) {
+      this.lastForcedRefreshAt = this.now();
+      this.refreshing = this.loadKeys(true).finally(() => {
+        this.refreshing = null;
+      });
+    }
+    const keys = await this.refreshing;
+    return { keys, fetched: true };
+  }
+
   /** Verify the bearer JWT and produce a {@link Principal}. */
   public async authenticate(authorization: string | undefined): Promise<Principal> {
     const token = extractBearerToken(authorization);
@@ -407,12 +487,39 @@ export class OidcAuthenticator implements RequestAuthenticator {
     try {
       claims = verifyJwt(token, this.cfg, keys);
     } catch (err) {
-      if (err instanceof ServiceError && err.message === 'token signed by an unknown key (kid not in JWKS)') {
-        // One forced refresh per attempt (key rotation without waiting out the TTL).
-        keys = await this.loadKeys(true);
+      if (!isUnknownKeyError(err)) throw err;
+      const kid = peekKid(token);
+      // Negative cache (issue #48): a kid confirmed missing within the TTL
+      // is answered immediately — never with a per-request fetch.
+      if (kid !== null && this.isKidNegative(kid)) {
+        throw unknownKey();
+      }
+      // Single-flight refresh, serving STALE keys when it fails so an IdP
+      // outage degrades instead of amplifying.
+      let refreshFetched = false;
+      try {
+        const refreshed = await this.refreshKeys();
+        keys = refreshed.keys;
+        refreshFetched = refreshed.fetched;
+      } catch (refreshErr) {
+        console.error(
+          `[bridge-registry-service] JWKS refresh failed (${(refreshErr as Error).message}); serving ${this.cache.size} stale key(s)`,
+        );
+        if (this.cache.size === 0) {
+          throw unauthenticated('token rejected: the authentication key set is temporarily unavailable');
+        }
+        keys = this.cache;
+      }
+      try {
         claims = verifyJwt(token, this.cfg, keys);
-      } else {
-        throw err;
+      } catch (secondErr) {
+        // Only a refresh that actually Fetched may poison the negative
+        // cache: a throttled skip or failed refresh proves nothing about
+        // the kid's existence.
+        if (refreshFetched && kid !== null && isUnknownKeyError(secondErr)) {
+          this.markKidNegative(kid);
+        }
+        throw secondErr;
       }
     }
 
@@ -438,19 +545,48 @@ export class OidcAuthenticator implements RequestAuthenticator {
   }
 }
 
+/**
+ * Best-effort `kid` extraction from a compact JWT header (no verification,
+ * no throw — used only to key the negative cache).
+ */
+function peekKid(token: string): string | null {
+  const dot = token.indexOf('.');
+  if (dot <= 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(token.slice(0, dot), 'base64url').toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const kid = (parsed as Record<string, unknown>)['kid'];
+    return typeof kid === 'string' && kid.length > 0 && kid.length <= 256 ? kid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isUnknownKeyError(err: unknown): boolean {
+  return err instanceof ServiceError && err.message === UNKNOWN_KEY_MESSAGE;
+}
+
 /** Default JWKS fetcher: `fetch` with a hard 10s timeout. */
 async function defaultFetchJwks(url: string): Promise<JwksDocument> {
   let response: Response;
   try {
     response = await fetch(url, { signal: AbortSignal.timeout(10_000), redirect: 'error' });
   } catch (err) {
-    throw unauthenticated(`could not fetch JWKS from ${url}: ${(err as Error).name}`);
+    // Generic to clients (issue #48): the JWKS URL is server configuration
+    // and must never be disclosed to unauthenticated callers. Real detail
+    // goes to the log only.
+    console.error(`[bridge-registry-service] JWKS fetch failed for ${url}: ${(err as Error).name}`);
+    throw unauthenticated('token rejected: the authentication key set is temporarily unavailable');
   }
-  if (!response.ok) throw unauthenticated(`JWKS endpoint responded ${response.status}`);
+  if (!response.ok) {
+    console.error(`[bridge-registry-service] JWKS endpoint responded ${response.status} for ${url}`);
+    throw unauthenticated('token rejected: the authentication key set is temporarily unavailable');
+  }
   try {
     return (await response.json()) as JwksDocument;
   } catch {
-    throw unauthenticated('JWKS endpoint returned invalid JSON');
+    console.error(`[bridge-registry-service] JWKS endpoint returned invalid JSON for ${url}`);
+    throw unauthenticated('token rejected: the authentication key set returned invalid data');
   }
 }
 
