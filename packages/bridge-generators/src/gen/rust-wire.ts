@@ -326,7 +326,7 @@ export function rustServerPrelude(): string {
   out += '    let _ = stream.write_all(response.as_bytes());\n}\n\n';
   out += 'pub(crate) fn parse_http_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json::Value)> {\n';
   out += '    use std::io::{BufRead, BufReader, Read};\n';
-  out += '    let mut reader = BufReader::new(stream);\n';
+  out += '    let mut reader = BufReader::new(&mut *stream);\n';
   out += '    let mut request_line = String::new();\n';
   out += '    reader.read_line(&mut request_line).ok()?;\n';
   out += '    let mut parts = request_line.split_whitespace();\n';
