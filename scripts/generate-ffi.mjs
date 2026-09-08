@@ -4,7 +4,7 @@
 // one example contract into examples/<name>/generated/ffi/<target>/ —
 // gitignored, regenerated on every verify run.
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { compileSource } from '@bridge/core';
 import { generateFfi } from '@bridge/ffi';
 
@@ -24,9 +24,9 @@ for (const target of TARGETS) {
     mkdirSync(outDir, { recursive: true });
     const files = generateFfi(ir, { target: ffiTarget });
     for (const file of files) {
-      const path = join(outDir, file.path);
-      mkdirSync(path.slice(0, path.lastIndexOf('/')), { recursive: true });
-      writeFileSync(path, file.content);
+      const filePath = join(outDir, file.path);
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, file.content);
     }
     console.log(`${ir.name} -> ${ffiTarget} (${files.length} files)`);
   }

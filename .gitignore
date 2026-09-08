@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 .pnpm-store/
+# Bun lockfiles are never authoritative — npm workspaces + package-lock.json
+# are the source of truth (bun is used only for release binary compilation).
+bun.lock
+bun.lockb
 
 # Build outputs
 dist/
