@@ -216,6 +216,124 @@ export function goSafeIdent(name: string): string {
   return name;
 }
 
+/**
+ * Java reserved words that cannot be used as identifiers. Contextual
+ * keywords (`record`, `sealed`, `var`, `yield`, `permits`) are included
+ * too — escaping them keeps generated code valid on older javac and
+ * avoids confusion.
+ */
+const JAVA_KEYWORDS: ReadonlySet<string> = new Set([
+  'abstract', 'assert', 'boolean', 'break', 'byte', 'case', 'catch', 'char',
+  'class', 'const', 'continue', 'default', 'do', 'double', 'else', 'enum',
+  'extends', 'final', 'finally', 'float', 'for', 'goto', 'if', 'implements',
+  'import', 'instanceof', 'int', 'interface', 'long', 'native', 'new',
+  'package', 'private', 'protected', 'public', 'return', 'short', 'static',
+  'strictfp', 'super', 'switch', 'synchronized', 'this', 'throw', 'throws',
+  'transient', 'try', 'void', 'volatile', 'while',
+  'true', 'false', 'null',
+  'var', 'record', 'sealed', 'yield', 'permits',
+]);
+
+/** C# reserved keywords (identifier escapes via trailing underscore). */
+const CSHARP_KEYWORDS: ReadonlySet<string> = new Set([
+  'abstract', 'as', 'base', 'bool', 'break', 'byte', 'case', 'catch',
+  'char', 'checked', 'class', 'const', 'continue', 'decimal', 'default',
+  'delegate', 'do', 'double', 'else', 'enum', 'event', 'explicit', 'extern',
+  'false', 'finally', 'fixed', 'float', 'for', 'foreach', 'goto', 'if',
+  'implicit', 'in', 'int', 'interface', 'internal', 'is', 'lock', 'long',
+  'namespace', 'new', 'null', 'object', 'operator', 'out', 'override',
+  'params', 'private', 'protected', 'public', 'readonly', 'ref', 'return',
+  'sbyte', 'sealed', 'short', 'sizeof', 'stackalloc', 'static', 'string',
+  'struct', 'switch', 'this', 'throw', 'true', 'try', 'typeof', 'uint',
+  'ulong', 'unchecked', 'unsafe', 'ushort', 'using', 'virtual', 'void',
+  'volatile', 'while',
+]);
+
+/**
+ * Java field name from a snake_case wire name: lowerCamelCase, keyword
+ * collisions get a trailing underscore. The wire name stays the declared
+ * snake_case name — generated Java writes JSON keys explicitly, mirroring
+ * how the Rust generator renames fields and keeps a serde rename.
+ */
+export function javaFieldName(snake: string): { name: string; escaped: boolean } {
+  const parts = snakeParts(snake);
+  if (parts.length === 0) return { name: '_', escaped: false };
+  let name = parts[0]!;
+  for (let i = 1; i < parts.length; i++) name += capitalize(parts[i]!);
+  if (JAVA_KEYWORDS.has(name)) return { name: `${name}_`, escaped: true };
+  return { name, escaped: false };
+}
+
+/** Java identifier that is safe for local declarations (statics, params). */
+export function javaSafeIdent(name: string): string {
+  if (JAVA_KEYWORDS.has(name)) return `${name}_`;
+  return name;
+}
+
+/**
+ * C# property name from a snake_case wire name (PascalCase). Returns the
+ * identifier plus a flag telling whether the declared name had to be
+ * changed; the wire name always stays the declared snake_case name.
+ */
+export function csharpPropertyName(snake: string): { name: string; escaped: boolean } {
+  const pascal = pascalCase(snake);
+  if (CSHARP_KEYWORDS.has(pascal)) return { name: `${pascal}_`, escaped: true };
+  return { name: pascal, escaped: false };
+}
+
+/** C# identifier that is safe for local declarations (fields, params). */
+export function csharpSafeIdent(name: string): string {
+  if (CSHARP_KEYWORDS.has(name)) return `${name}_`;
+  if (name.length > 0 && /^[0-9]/.test(name)) return `_${name}`;
+  return name;
+}
+
+/**
+ * Java package for a Bridge package: prefixed with `bridge.` to keep out
+ * of the default/global package space; each dotted segment is lowercased
+ * and sanitized to a legal Java identifier (`payments.v1` →
+ * `bridge.payments.v1`, `2023.data` → `bridge._2023.data`).
+ */
+export function javaPackageName(pkg: string): string {
+  const segments = pkg
+    .toLowerCase()
+    .split('.')
+    .map((segment) => {
+      let s = segment.replace(/[^a-z0-9_]/g, '');
+      if (s.length === 0) s = '_';
+      if (/^[0-9]/.test(s)) s = `_${s}`;
+      return s;
+    });
+  return ['bridge', ...segments].join('.');
+}
+
+/** Dots-only path suffix for the Java package directory layout. */
+export function javaPackagePath(pkg: string): string {
+  return javaPackageName(pkg).split('.').join('/');
+}
+
+/**
+ * C# namespace: `bridge.` prefix + one PascalCase segment per dotted part
+ * (`payments.v1` → `Bridge.Payments.V1`). Illegal characters are stripped
+ * and digit-leading segments get an underscore prefix.
+ */
+export function csharpNamespace(pkg: string): string {
+  const segments = pkg
+    .split('.')
+    .map((segment) => {
+      let s = segment.replace(/[^A-Za-z0-9_]/g, '');
+      if (s.length === 0) s = '_';
+      if (/^[0-9]/.test(s)) s = `_${s}`;
+      return capitalize(s.charAt(0).toLowerCase() + s.slice(1));
+    });
+  return ['Bridge', ...segments].join('.');
+}
+
+/** .csproj / assembly name derived from the C# namespace. */
+export function csharpProjectName(pkg: string): string {
+  return csharpNamespace(pkg);
+}
+
 /** Package name for Go: dots -> underscores, lowercased (`payments.v1` -> `payments_v1`). */
 export function goPackageName(pkg: string): string {
   return pkg.toLowerCase().replace(/\./g, '_').replace(/[^a-z0-9_]/g, '');

@@ -74,6 +74,45 @@ jobs:
         run: |
           if [ -f scripts/verify-rust.sh ]; then bash scripts/verify-rust.sh; else echo "verify-rust.sh not yet present — skipping"; fi
 
+  java-generator-verify:
+    name: Verify generated Java code
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: npm ci
+      - run: npm run build
+      - name: Generate + javac compile + round-trip Java output
+        run: |
+          if [ -f scripts/verify-java.sh ]; then bash scripts/verify-java.sh; else echo "verify-java.sh not yet present — skipping"; fi
+
+  csharp-generator-verify:
+    name: Verify generated C# code
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: npm ci
+      - run: npm run build
+      - name: Generate + dotnet build + round-trip C# output
+        run: |
+          if [ -f scripts/verify-csharp.sh ]; then bash scripts/verify-csharp.sh; else echo "verify-csharp.sh not yet present — skipping"; fi
+
   serialization-matrix:
     name: Cross-language serialization matrix
     runs-on: ubuntu-latest

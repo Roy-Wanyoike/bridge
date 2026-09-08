@@ -13,7 +13,7 @@ import { bridgeCompiler, compileSource } from '@bridge/core';
 import { generate } from '@bridge/generators';
 
 const ROOT = join(import.meta.dirname, '..');
-const LANGUAGES = ['go', 'rust', 'typescript', 'python'];
+const LANGUAGES = ['go', 'rust', 'typescript', 'python', 'java', 'csharp'];
 
 /**
  * One entry per example that materializes generated code. Examples whose

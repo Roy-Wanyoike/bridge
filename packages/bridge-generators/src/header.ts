@@ -48,6 +48,8 @@ export function commentPrefix(language: TargetLanguage): string | null {
     case 'go':
     case 'rust':
     case 'typescript':
+    case 'java':
+    case 'csharp':
       return '//';
     case 'python':
       return '#';

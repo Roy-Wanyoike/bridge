@@ -9,6 +9,8 @@
 #   scripts/verify-ts.sh            — workspace tsc over generated packages
 #   scripts/verify-go.sh            — go vet + go build (skips w/o toolchain)
 #   scripts/verify-rust.sh          — cargo check + clippy (skips w/o toolchain)
+#   scripts/verify-java.sh          — javac/ecj compile + round-trip (skips w/o toolchain)
+#   scripts/verify-csharp.sh        — dotnet build + round-trip (skips w/o toolchain)
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,6 +35,8 @@ run "verify-python" bash scripts/verify-python.sh
 run "verify-ts"     bash scripts/verify-ts.sh
 run "verify-go"     bash scripts/verify-go.sh
 run "verify-rust"   bash scripts/verify-rust.sh
+run "verify-java"   bash scripts/verify-java.sh
+run "verify-csharp" bash scripts/verify-csharp.sh
 
 echo
 echo "===== SUMMARY ====="

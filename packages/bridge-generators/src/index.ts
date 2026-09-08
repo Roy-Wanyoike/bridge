@@ -23,6 +23,8 @@ import { generateGo } from './gen/go';
 import { generateRust } from './gen/rust';
 import { generateTypeScript } from './gen/typescript';
 import { generatePython } from './gen/python';
+import { generateJava } from './gen/java';
+import { generateCSharp } from './gen/csharp';
 import type { RenderContext, TargetLanguage } from './mappings';
 import { localTypeNames } from './analysis';
 import type { GenerateOptions } from './options';
@@ -55,6 +57,7 @@ export function generate(ir: IRPackage, options: GenerateOptions): GeneratedFile
       language: options.language,
       packageName,
       localTypeNames: localTypeNames(ir),
+      aliasTargets: localAliasTargets(ir),
     } satisfies RenderContext,
   };
 
@@ -67,7 +70,24 @@ export function generate(ir: IRPackage, options: GenerateOptions): GeneratedFile
       return generateTypeScript(input);
     case 'python':
       return generatePython(input);
+    case 'java':
+      return generateJava(input);
+    case 'csharp':
+      return generateCSharp(input);
   }
+}
+
+/**
+ * Local alias declarations by name. Java and C# have no type-alias
+ * declarations, so their generators substitute the underlying type
+ * everywhere; the table is ignored by the other targets.
+ */
+function localAliasTargets(ir: IRPackage): ReadonlyMap<string, import('@bridge/core').TypeRef> {
+  const targets = new Map<string, import('@bridge/core').TypeRef>();
+  for (const type of ir.types) {
+    if (type.kind === 'alias') targets.set(type.name, type.target);
+  }
+  return targets;
 }
 
 /** Re-exported so consumers can generate without depending on core types. */
