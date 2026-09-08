@@ -46,3 +46,7 @@ bridge.lock
 # Serialization runtimes build output
 packages/bridge-serialization/runtimes/rust/target/
 packages/bridge-serialization/runtimes/go/bridge-serialization-verify
+worktrees/
+# Local tool outputs (never commit)
+tool-results/
+worktrees/

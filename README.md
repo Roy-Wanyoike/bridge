@@ -60,16 +60,25 @@ That last one is the point: the rename a code reviewer would wave through fails 
                          │
     ┌──────────┬─────────┼─────────┬──────────┐
     ▼          ▼         ▼         ▼          ▼
-   Go        Rust        TS     Python      WASM*
-    └──────────┴─────────┼─────────┴──────────┘
-                         │
-              Compatibility Engine
-        (SAFE / WARNING / BREAKING / UNKNOWN)
-                         │
+   Go      Rust      TS     Python     Java      C#
+    └──────────┴─────┼─────┴──────────┬──┘
+                     │                │
+                     │          FFI / WASM (one contract,
+                     │          callable across languages)
+                     ▼                ▼
+          Compatibility Engine   Registry Service
+    (SAFE / WARNING / BREAKING / UNKNOWN)  (OIDC, tenancy,
+                     │                     signing, audit)
         Contract Graph → Registry → CI Governance
+                     │
+              Dashboard (Next.js)
 ```
 
-\* planned. The five packages behind this diagram (`bridge-core`, `bridge-compat`, `bridge-generators`, `bridge-registry`, `bridge-cli`) communicate only through the frozen IR — details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The nine packages behind this diagram (`bridge-core`, `bridge-compat`,
+`bridge-generators`, `bridge-registry`, `bridge-cli`, `bridge-lsp`,
+`bridge-serialization`, `bridge-registry-service`, `bridge-ffi`)
+communicate only through the frozen IR — details in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Language support
 
@@ -81,12 +90,18 @@ Every target below is generated from the same IR — types, enums, tagged unions
 | Rust     | ✅ Shipped | serde; `@pattern` limitations documented |
 | TypeScript | ✅ Shipped | strict types; documented `int64` (2^53) caveat |
 | Python   | ✅ Shipped | stdlib dataclasses; `to_dict`/`from_dict` round-trip |
-| Java / C# | 🔲 Planned | [issue #25](https://github.com/Roy-Wanyoike/bridge/issues/25) |
-| WASM     | 🔲 Planned | [issue #22](https://github.com/Roy-Wanyoike/bridge/issues/22) (with Go ↔ Rust FFI) |
+| Java     | ✅ Shipped | JDK-only (zero deps, incl. a generated JSON runtime); Maven project file |
+| C#       | ✅ Shipped | System.Text.Json only; .csproj; structural value equality |
+| WASM     | ✅ Shipped | wasm-bindgen types with `fromJson`/`toJson`/`validate` from JS |
+
+Every generated language is compile-verified in CI against the runnable
+examples, and every generated package ships a round-trip test. The FFI
+layer additionally carries **service methods** across the boundary —
+see [docs/FFI.md](docs/FFI.md).
 
 ## Status
 
-**Bridge 0.1.0 — the Phase 1 foundation is complete and tested: 355+ tests green across five packages.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
+**Bridge 0.2.0 — the roadmap through Phase 3 is shipped and tested: 569 tests green across nine packages, every generated language compile-verified, and the Go↔Rust FFI proven end to end on real builds.** See the [roadmap](docs/ROADMAP.md) and [open issues](https://github.com/Roy-Wanyoike/bridge/issues) for what's next.
 
 | Area | Status |
 |------|--------|
@@ -98,13 +113,16 @@ Every target below is generated from the same IR — types, enums, tagged unions
 | CLI (init/validate/fmt/lint/generate/diff/check/publish/pull/versions/inspect/search/doctor) | ✅ Shipped |
 | Local registry (immutable, content-addressed) | ✅ Shipped |
 | Examples + docs + verification scripts | ✅ Shipped |
-| Serialization round-trip matrix (Go↔Rust↔TS↔Python) | 🔬 In flight ([#15](https://github.com/Roy-Wanyoike/bridge/issues/15)) |
-| Event + RPC transports | 🔬 In flight ([#16](https://github.com/Roy-Wanyoike/bridge/issues/16), [#17](https://github.com/Roy-Wanyoike/bridge/issues/17)) |
+| Cross-language serialization round-trip matrix (Go↔Rust↔TS↔Python) | ✅ Shipped |
+| Event contracts + typed RPC clients/servers (every language) | ✅ Shipped |
 | Consumer-aware impact analysis + CI governance (`bridge impact`, `bridge check --against`) | ✅ Shipped |
-| Registry service (server, auth, multi-tenancy) | 🔲 Planned ([#18](https://github.com/Roy-Wanyoike/bridge/issues/18)) |
-| Dashboard | 🔲 Planned ([#20](https://github.com/Roy-Wanyoike/bridge/issues/20)) |
-| LSP / IDE integration | 🔲 Planned ([#21](https://github.com/Roy-Wanyoike/bridge/issues/21)) |
-| FFI (Go ↔ Rust) + WASM target | 🔲 Planned ([#22](https://github.com/Roy-Wanyoike/bridge/issues/22)) |
+| Property-based + fuzz harnesses, deterministic caching | ✅ Shipped |
+| LSP for the Bridge IDL (JSON-RPC over stdio) | ✅ Shipped ([#21](https://github.com/Roy-Wanyoike/bridge/issues/21)) |
+| Java + C# generators | ✅ Shipped ([#25](https://github.com/Roy-Wanyoike/bridge/issues/25)) |
+| Registry service (OIDC auth, multi-tenancy, signing, audit, rate limits, in-memory + PostgreSQL) | ✅ Shipped ([#18](https://github.com/Roy-Wanyoike/bridge/issues/18)) |
+| Dashboard (Next.js: contracts, diff reports, dependency graph, audit) | ✅ Shipped ([#20](https://github.com/Roy-Wanyoike/bridge/issues/20)) |
+| FFI (Go ↔ Rust over C ABI) + WASM target | ✅ Shipped ([#22](https://github.com/Roy-Wanyoike/bridge/issues/22)) |
+| Release engineering (binaries, containers, SBOM, signing, npm) | ✅ Shipped ([#24](https://github.com/Roy-Wanyoike/bridge/issues/24)) |
 
 ## Quick start
 
@@ -117,7 +135,7 @@ alias bridge="node $(pwd)/packages/bridge-cli/dist/bin/bridge.js"
 bridge init payments-service
 cd payments-service
 bridge validate                # compile the scaffolded contract
-bridge generate --language go  # also: rust | typescript | python
+bridge generate --language go  # also: rust | typescript | python | java | csharp
 bridge doctor
 ```
 
@@ -133,6 +151,7 @@ Read the [Quickstart](docs/QUICKSTART.md), the [IDL reference](docs/IDL_REFERENC
 | [docs/IDL_REFERENCE.md](docs/IDL_REFERENCE.md) | The full Bridge IDL: enums, unions, services, events, constraints |
 | [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) | The classification matrix, CI gates, GitHub Actions recipe |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The pipeline, the frozen IR contract, determinism guarantees |
+| [docs/FFI.md](docs/FFI.md) | Go↔Rust FFI over the C ABI + WASM: symbols, ownership, panic containment |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Three-phase public roadmap, linked to issues |
 | [docs/strategy/MARKET_ANALYSIS.md](docs/strategy/MARKET_ANALYSIS.md) | Landscape, market gaps, competitive matrix, risks |
 | [docs/strategy/POSITIONING.md](docs/strategy/POSITIONING.md) | Positioning, category, pitches, product principles |

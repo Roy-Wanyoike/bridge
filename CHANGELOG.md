@@ -5,6 +5,44 @@ All notable changes to Bridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — the platform era
+
+### Added
+
+- **Java + C# generators** (#25): deterministic, zero-dependency output
+  with full IR coverage (structs, enums, tagged unions, constraints,
+  events, HTTP clients/servers); compile-verified per example (ECJ and
+  dotnet), CI jobs wired; `bridge generate --language java|csharp`.
+- **Registry service** (`@bridge/registry-service`, #18): multi-tenant
+  HTTP API over a pluggable storage driver — org/project isolation,
+  OIDC (RS256/ES256 via JWKS) or static tokens, ed25519 artifact
+  signing with tamper detection, append-only filterable audit log,
+  token-bucket rate limiting, OpenAPI 3.1 document; in-memory driver +
+  PostgreSQL driver (dependency-free wire-protocol client, SCRAM-SHA-256,
+  migrations). Cross-tenant access is indistinguishable from unknown (404).
+- **Dashboard** (`dashboard/`, #20): Next.js console for the registry —
+  overview, contract pages, compatibility reports, SVG dependency graph,
+  audit log; typed client against the service API; demo mode with zero
+  backend.
+- **FFI** (`@bridge/ffi`, #22): one contract crosses language boundaries
+  as functions — Rust C-ABI cdylib (handler registry, panic containment,
+  single ownership rule, stable status codes) + Go cgo client sharing the
+  same generated C header + wasm32/wasm-bindgen target with typed TS
+  wrappers. Verified end to end: Go links the built Rust library and
+  round-trips through C.
+- **Release engineering** (#24): tag-to-release pipeline — bun-compiled
+  CLI binaries for 5 platform targets, SHA-256 checksums, keyless cosign
+  signing, SPDX/CycloneDX SBOMs, multi-arch container images, npm
+  publishing, Homebrew formula (`RELEASE.md`).
+- **LSP** (`@bridge/lsp`, #21) and **property/fuzz harnesses** (#23)
+  shipped earlier in the 0.1.x line; roadmap through Phase 3 is now
+  complete.
+
+### Changed
+
+- README and roadmap updated to the shipped state; six target languages
+  (Go, Rust, TypeScript, Python, Java, C#) plus WASM; nine packages.
+
 ## [0.1.0] — initial public pipeline
 
 ### Added
