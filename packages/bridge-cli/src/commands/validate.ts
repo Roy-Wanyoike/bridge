@@ -6,7 +6,7 @@ import { compileSource, formatDiagnostics, shortHash } from '@bridge/core';
 import { ParsedArgs } from '../args';
 import { inputFiles } from '../files';
 import { CliError } from '../errors';
-import { out, CHECK, printJson } from '../output';
+import { errOut, out, CHECK, printJson } from '../output';
 
 interface ValidateResultJson {
   file: string;
@@ -27,7 +27,16 @@ export function run(args: ParsedArgs): void {
     try {
       text = fs.readFileSync(file, 'utf8');
     } catch (e) {
-      throw new CliError(readFailure(file, e));
+      // One JSON entry per input file, even when it cannot be read — CI
+      // consumers parse the array instead of losing it to an early abort.
+      failures++;
+      results.push({
+        file,
+        ok: false,
+        diagnostics: [{ severity: 'error', message: readFailure(file, e) }],
+      });
+      if (!json) errOut(readFailure(file, e));
+      continue;
     }
     const result = compileSource(text, file);
     if (result.ok && result.ir) {

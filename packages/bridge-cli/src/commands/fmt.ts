@@ -6,7 +6,7 @@ import { formatSource, formatDiagnostics } from '@bridge/core';
 import { ParsedArgs } from '../args';
 import { inputFiles, readText } from '../files';
 import { CliError } from '../errors';
-import { out, CHECK } from '../output';
+import { out, errOut, CHECK } from '../output';
 import { unifiedDiff } from '../difftext';
 
 export function run(args: ParsedArgs): void {
@@ -35,7 +35,7 @@ export function run(args: ParsedArgs): void {
         fs.writeFileSync(file, formatted, 'utf8');
       } catch (e) {
         failures++;
-        out(`cannot write ${file}: ${e instanceof Error ? e.message : String(e)}`);
+        errOut(`cannot write ${file}: ${e instanceof Error ? e.message : String(e)}`);
         continue;
       }
       out(`${CHECK} formatted ${file}`);

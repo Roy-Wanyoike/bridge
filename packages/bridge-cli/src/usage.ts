@@ -13,7 +13,7 @@ Commands:
   fmt [-w] [files...]             Format Bridge IDL sources (canonical style)
   lint [files...]                 Report errors and convention findings
   generate --language <lang> [file]
-                                  Generate Go/Rust/TypeScript/Python code
+                                  Generate Go/Rust/TypeScript/Python/Java/C# code
   diff <old-file> <new-file>      Human-readable compatibility report
   check <old> <new> | <file> --against <ref>
                                   Machine-oriented compatibility gate (CI)
@@ -59,7 +59,10 @@ On failure prints the compiler diagnostics (file:line:col, message, hint).
 
 Options:
   --json                print a JSON array of
-                        { file, ok, package?, hash?, diagnostics } instead
+                        { file, ok, package?, hash?, diagnostics } instead;
+                        exactly one entry per input file is always emitted —
+                        a file that cannot be read reports ok: false with a
+                        { severity: 'error', message } diagnostic
 
 Exit 1 when any file fails to compile.`,
 
@@ -86,8 +89,8 @@ Options:
 Exit codes: 0 clean (warnings tolerated by default); 1 when any error
 (or, with --strict, any finding) is reported.`,
 
-  generate: `bridge generate --language <go|rust|typescript|python> [--out dir]
-                  [--package-name name] [--force] [file]
+  generate: `bridge generate --language <go|rust|typescript|python|java|csharp>
+                  [--out dir] [--package-name name] [--force] [file]
 
 Compile a contract and generate a full language project from it.
 
@@ -96,7 +99,8 @@ plus "/<language>" (e.g. generated/typescript). With --out the directory
 is used exactly as given.
 
 Options:
-  --language <lang>     required: go | rust | typescript | python
+  --language <lang>     required: go | rust | typescript | python | java |
+                        csharp
   --out <dir>           output directory (default generated/<language>)
   --package-name <name> override the derived module/package name
   --force               overwrite existing files
@@ -134,7 +138,8 @@ Options:
   --format <fmt>        table (default) | json | markdown (PR-comment ready)
   --compatible          gate on definite breaking changes only
   --strict              also fail on warnings
-  --json                shorthand for --format json
+  --json                shorthand for --format json; an explicit --format
+                        wins when both are given
 
 Exit 1 when the gate fails in the selected mode.`,
 
