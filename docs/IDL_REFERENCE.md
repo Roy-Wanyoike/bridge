@@ -51,6 +51,13 @@ type Money {
 }
 ```
 
+**Recursive types**: a struct may not directly or indirectly contain itself
+through a plain named field — `type Node { next: Node }` is rejected
+(`BR2017`) because it would generate infinitely sized values (Go: "invalid
+recursive type"; Rust: E0072). Self-references must go through `optional`,
+`list`, `set` or `map` (protobuf-style indirection), e.g.
+`next: Node?` or `children: list<Node>`.
+
 Field grammar:
 
 ```
@@ -76,14 +83,19 @@ field := doc* NAME ('?')? ':' type ('?')? constraint* ('=' default)?
 | `@length(n)` | `string` | 1 or 2 numbers | exact length, or `[min, max]` |
 | `@email` | `string` | — | RFC-style email shape |
 | `@url` | `string` | — | URL shape |
-| `@pattern(re)` | `string` | regex string | user regex (⚠ not supported by the generated Rust validator — documented v1 limitation) |
+| `@pattern(re)` | `string` | regex string | user regex — must be plain **RE2** syntax (`BR2018` otherwise): no lookahead/lookbehind, no backreferences (any `\1`–`\9`; octal escapes must start with `\0`), no atomic groups or possessive/nested quantifiers. Go's `regexp` (RE2) would panic in `regexp.MustCompile` at init otherwise. Generated Rust validators still do not evaluate `@pattern` (v1 limitation) |
 | `@uuid` | `string` | — | UUID shape |
 
 ¹ numeric types: `int32`, `int64`, `uint32`, `uint64`, `float32`, `float64`,
 `decimal`.
 
 Applying a constraint to an unsupported type is a compile error
-(`BR2013`). Every constraint accepts an optional custom message:
+(`BR2013`) — this includes struct, enum, union and composite targets such
+as `list<string>`, which are diagnosed instead of silently ignored.
+Constraint **arguments** are validated per kind (`BR2016`): `@min`/`@max`
+take exactly one unquoted number, `@length` one or two numbers,
+`@pattern` one quoted string, and `@email`/`@url`/`@uuid` none. Every
+constraint accepts a single trailing quoted string as a custom message:
 `@length(3, "ISO currency codes are 3 letters")` — the message travels in
 the IR (`IRConstraint.message`) and into generated validators.
 
@@ -196,6 +208,13 @@ The 13 primitive types and their mappings:
 
 - The **wire format of a set is always a JSON array**; generated helpers
   (`set_to_array` / `array_to_set` and language equivalents) convert.
+- **Set elements** must be hashable, canonically orderable values — the
+  same rule as map keys: `string`, `bool`, `int32`, `int64`, `uint32`,
+  `uint64`, `uuid`, or an alias to one (`BR2019` otherwise).
+  `set<struct>` is **forbidden by decision**: cross-language set ordering
+  is non-canonical, Rust's `BTreeSet<T>` needs `Ord` (structs/enums/floats
+  do not implement it), and Go's set wrapper needs comparable keys. Use
+  `list<T>` when you need ordering or complex elements.
 - Rust uses `BTreeMap` for deterministic key ordering.
 - **Map keys** must be hashable primitives: `string`, `bool`, `int32`,
   `int64`, `uint32`, `uint64`, `uuid` (`BR2011` otherwise).
@@ -264,7 +283,7 @@ payment.bridge:8:13: error BR2001: Unknown type `mony`.
 | --- | --- |
 | Lexical | `BR1001` unexpected character · `BR1002` unterminated string · `BR1003` invalid escape |
 | Syntax | `BR1004` (parser errors: unexpected token, unclosed block, malformed constraint args, …) |
-| Semantic — declarations | `BR2001` unknown type · `BR2002` duplicate declaration · `BR2003` duplicate field/union member · `BR2004` duplicate enum variant · `BR2005` duplicate method · `BR2006` duplicate import · `BR2007` package statement problems · `BR2008` invalid dotted name · `BR2009` alias cycle · `BR2010` method signature must reference structs · `BR2011` invalid map key · `BR2012` optional collection element · `BR2013` constraint not applicable · `BR2014` unknown constraint · `BR2015` unknown imported package |
+| Semantic — declarations | `BR2001` unknown type · `BR2002` duplicate declaration · `BR2003` duplicate field/union member · `BR2004` duplicate enum variant · `BR2005` duplicate method · `BR2006` duplicate import · `BR2007` package statement problems · `BR2008` invalid dotted name · `BR2009` alias cycle · `BR2010` method signature must reference structs · `BR2011` invalid map key · `BR2012` optional collection element · `BR2013` constraint not applicable · `BR2014` unknown constraint · `BR2015` unknown imported package · `BR2016` constraint argument shape/arity · `BR2017` recursive struct · `BR2018` @pattern not RE2-compatible · `BR2019` unhashable set element |
 | Semantic — style (warnings) | `BR2101` · `BR2102` · `BR2103` (see Naming conventions) |
 | Internal | `BR2999` (unexpected compiler failure — please report) |
 

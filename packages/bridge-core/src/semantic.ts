@@ -29,12 +29,16 @@
  * - BR2014 unknown constraint kind (emitted by the parser; listed here to
  *   keep the family documented in one place)
  * - BR2015 unknown imported package (compilePackage with dependencies)
+ * - BR2016 constraint argument shape/arity (per constraint kind)
+ * - BR2017 recursive struct (self-reference outside optional/list/set/map)
+ * - BR2018 @pattern uses regex syntax unsupported by Go's regexp (RE2)
+ * - BR2019 set element type is not hashable/orderable
  * - BR2101 type name not PascalCase (warning)
  * - BR2102 enum variant not SCREAMING_SNAKE_CASE (warning)
  * - BR2103 field name not snake_case (warning)
  */
 
-import type { Diagnostic, IRPackage, PrimitiveKind } from './ir/types';
+import type { Diagnostic, IRPackage, IRTypeDefinition, PrimitiveKind } from './ir/types';
 import {
   CONSTRAINT_KINDS,
   MAP_KEY_PRIMITIVES,
@@ -45,10 +49,14 @@ import {
   typeToText,
   type AliasDeclNode,
   type BridgeFileNode,
+  type ConstraintArgNode,
+  type ConstraintNode,
   type EnumDeclNode,
   type FieldNode,
   type NamedTypeNode,
   type ServiceDeclNode,
+  type SetTypeNode,
+  type StructDeclNode,
   type TypeDeclNode,
   type TypeNode,
 } from './ast';
@@ -70,6 +78,10 @@ export const SEMANTIC_CODES = {
   constraintNotApplicable: 'BR2013',
   unknownConstraint: 'BR2014',
   unknownImport: 'BR2015',
+  constraintArgs: 'BR2016',
+  recursiveType: 'BR2017',
+  patternNotRE2: 'BR2018',
+  setElement: 'BR2019',
   typeNameStyle: 'BR2101',
   enumVariantStyle: 'BR2102',
   fieldNameStyle: 'BR2103',
@@ -77,6 +89,164 @@ export const SEMANTIC_CODES = {
 
 /** Internal error code used by the compiler pipeline for unexpected failures. */
 export const INTERNAL_ERROR = 'BR2999';
+
+// ---------------------------------------------------------------------------
+// Constraint argument rules (BR2016)
+// ---------------------------------------------------------------------------
+
+/**
+ * Positional argument shape per constraint kind. A single trailing quoted
+ * string beyond the positional arguments is always a custom violation
+ * message (mirrors `lowerConstraint` in compiler/compile.ts).
+ */
+const CONSTRAINT_ARG_RULES: Readonly<Record<string, { min: number; max: number; shape: 'number' | 'string' }>> = {
+  min: { min: 1, max: 1, shape: 'number' },
+  max: { min: 1, max: 1, shape: 'number' },
+  length: { min: 1, max: 2, shape: 'number' },
+  pattern: { min: 1, max: 1, shape: 'string' },
+  email: { min: 0, max: 0, shape: 'string' },
+  url: { min: 0, max: 0, shape: 'string' },
+  uuid: { min: 0, max: 0, shape: 'string' },
+};
+
+/** Numeric constraint arguments: integer or decimal literals, sign allowed. */
+const NUMERIC_ARG_RE = /^-?[0-9]+(\.[0-9]+)?$/;
+
+/** Drop the trailing custom-message argument using the IR lowering rule. */
+function positionalConstraintArgs(constraint: ConstraintNode): ConstraintArgNode[] {
+  const rule = CONSTRAINT_ARG_RULES[constraint.kindName];
+  if (rule === undefined) return constraint.args;
+  const args = constraint.args;
+  if (args.length > rule.min && args.length > 0) {
+    const last = args[args.length - 1];
+    if (last !== undefined && last.isString) return args.slice(0, -1);
+  }
+  return args;
+}
+
+/** Render an argument the way it was written (strings re-quoted). */
+function argAsWritten(arg: ConstraintArgNode): string {
+  return arg.isString ? JSON.stringify(arg.text) : `\`${arg.text}\``;
+}
+
+function describeExpectedArgs(rule: { min: number; max: number; shape: 'number' | 'string' }): string {
+  const shape = rule.shape === 'number' ? 'numeric' : 'string';
+  const noun = (n: number): string => `${n} ${shape} argument${n === 1 ? '' : 's'}`;
+  if (rule.min === 0 && rule.max === 0) return 'no arguments';
+  if (rule.min === rule.max) return `exactly ${noun(rule.min)}`;
+  return `${rule.min} or ${rule.max} ${shape} arguments`;
+}
+
+// ---------------------------------------------------------------------------
+// RE2 dialect check for @pattern (BR2018)
+// ---------------------------------------------------------------------------
+
+/** A regex construct found in a pattern that Go's regexp (RE2) rejects. */
+export interface Re2Finding {
+  /** Human-readable description of the construct, e.g. `lookahead \`(?=\``. */
+  construct: string;
+  /** Offset of the construct within the pattern string. */
+  offset: number;
+}
+
+/** Capture names Go's regexp accepts (word characters). */
+const RE2_CAPTURE_NAME_RE = /^[A-Za-z0-9_]+$/;
+
+/**
+ * Scan a pattern for constructs Go's regexp (RE2) does not support:
+ * lookahead, lookbehind, atomic groups, possessive/nested repetition
+ * quantifiers and backreferences. Returns the first finding, or undefined
+ * when the pattern is plain RE2. Character-class aware (`[*+]` inside
+ * `[...]` is a literal pair, not a possessive quantifier). Every `\1`..`\9`
+ * escape is rejected (regexp/syntax parseEscape: "Single non-zero digit is a
+ * backreference; not supported" — octal escapes must start with `\0`),
+ * inside and outside classes alike. A trailing `?` after a quantifier is a
+ * lazy quantifier (`x*?`), which RE2 supports and is not flagged.
+ */
+export function re2UnsupportedConstruct(pattern: string): Re2Finding | undefined {
+  const n = pattern.length;
+  let i = 0;
+  let inClass = false;
+  while (i < n) {
+    const c = pattern.charAt(i);
+
+    if (c === '\\') {
+      const next = pattern.charAt(i + 1);
+      // Go's regexp/syntax rejects every \1..\9 escape: a single non-zero
+      // digit is a backreference (unsupported), so `\12` errors too — octal
+      // escapes must start with `\0`. \8 and \9 are invalid escapes outright.
+      if (next >= '1' && next <= '9') {
+        return { construct: `backreference \`\\${next}\``, offset: i };
+      }
+      i += 2; // consume the escape pair (escaped chars are literal)
+      continue;
+    }
+
+    if (!inClass && c === '[') {
+      inClass = true;
+      i++;
+      if (pattern.charAt(i) === '^') i++; // negation — a following `]` is literal
+      if (pattern.charAt(i) === ']') i++; // `[]` right after `[`/`[^` is a literal `]`
+      continue;
+    }
+    if (inClass && c === ']') {
+      inClass = false;
+      i++;
+      continue;
+    }
+
+    if (!inClass && c === '(' && pattern.charAt(i + 1) === '?') {
+      const d = pattern.charAt(i + 2);
+      if (d === '=') return { construct: 'lookahead `(?=`', offset: i };
+      if (d === '!') return { construct: 'negative lookahead `(?!`', offset: i };
+      if (d === '>') return { construct: 'atomic group `(?>`', offset: i };
+      if (d === '<') {
+        const e = pattern.charAt(i + 3);
+        if (e === '=') return { construct: 'lookbehind `(?<=`', offset: i };
+        if (e === '!') return { construct: 'negative lookbehind `(?<!`', offset: i };
+        // Named group `(?<name>...` — validate the name is terminated.
+        let j = i + 3;
+        while (j < n && pattern.charAt(j) !== '>') j++;
+        if (j >= n || j === i + 3) {
+          return { construct: 'named capture group with an empty or unterminated name', offset: i };
+        }
+        i = j + 1;
+        continue;
+      }
+      if (d === 'P') {
+        const e = pattern.charAt(i + 3);
+        if (e === '=') return { construct: 'capture-group call `(?P=name`', offset: i };
+        if (e === '<') {
+          let j = i + 4;
+          while (j < n && pattern.charAt(j) !== '>') j++;
+          if (j >= n) {
+            return { construct: 'named capture group with an unterminated name', offset: i };
+          }
+          if (j === i + 4 || !RE2_CAPTURE_NAME_RE.test(pattern.slice(i + 4, j))) {
+            return { construct: 'named capture group with an invalid name (use (?P<name>...) with [A-Za-z0-9_] names)', offset: i };
+          }
+          i = j + 1;
+          continue;
+        }
+      }
+      // Flag groups `(?i)`, `(?s)`, `(?-i)`, non-capturing `(?:...)` are RE2.
+      i++;
+      continue;
+    }
+
+    if (!inClass && (c === '*' || c === '+' || c === '?')) {
+      const next = pattern.charAt(i + 1);
+      // Possessive/nested repetition (`x*+`, `x**`, `x?+`) — RE2 rejects it.
+      // A following `?` is a lazy quantifier (`x*?`), which RE2 supports.
+      if (next === '*' || next === '+') {
+        return { construct: `nested repetition operator \`${c}${next}\``, offset: i };
+      }
+    }
+
+    i++;
+  }
+  return undefined;
+}
 
 /** A dotted lowercase identifier: `payments`, `payments.v1`, `a.b_c.d1`. */
 const DOTTED_NAME_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$/;
@@ -106,7 +276,8 @@ export interface AnalyzeOptions {
  *
  * Diagnostics are emitted in a deterministic order: package checks first,
  * then imports in source order, then declarations in source order (with
- * per-declaration checks in field/method order), then alias-cycle findings.
+ * per-declaration checks in field/method order), then alias-cycle findings,
+ * then recursive-struct findings.
  */
 export function analyzeFile(
   file: BridgeFileNode,
@@ -118,11 +289,32 @@ export function analyzeFile(
 
 // ---------------------------------------------------------------------------
 
-/** Result of resolving a type to a primitive for constraint checks. */
-type PrimitiveResolution =
-  | { found: true; primitive: PrimitiveKind }
-  /** Named reference that could not be resolved (already diagnosed). */
-  | { found: false };
+/**
+ * Minimal structural shape shared by AST `TypeNode` and IR `TypeRef`, so one
+ * resolver can walk both (dependency alias targets are IR TypeRefs).
+ */
+type ResolvableTypeRef =
+  | { kind: 'primitive'; primitive: PrimitiveKind }
+  | { kind: 'named'; name: string; package?: string }
+  | { kind: 'list'; element: ResolvableTypeRef }
+  | { kind: 'set'; element: ResolvableTypeRef }
+  | { kind: 'map'; key: ResolvableTypeRef; value: ResolvableTypeRef }
+  | { kind: 'optional'; inner: ResolvableTypeRef }
+  | { kind: 'error' };
+
+/** Result of resolving a constraint/set-element target type. */
+type ConstraintTargetResolution =
+  | { resolved: true; primitive: PrimitiveKind }
+  /**
+   * Struct/enum/union or composite — a constraint cannot apply and a set
+   * element is not hashable. Always produces a diagnostic (no silent skip).
+   */
+  | { resolved: false; reason: 'not-primitive' }
+  /**
+   * Unknown reference (BR2001 already reported) or an opaque cross-package
+   * reference in compileSource mode — checking deeper would double-report.
+   */
+  | { resolved: false; reason: 'unresolved-ref' };
 
 class Analyzer {
   private readonly diags: Diagnostic[] = [];
@@ -147,6 +339,7 @@ class Analyzer {
     this.collectLocalTypes();
     this.checkDeclarations();
     this.checkAliasCycles();
+    this.checkRecursiveTypes();
     return this.diags;
   }
 
@@ -401,6 +594,7 @@ class Analyzer {
           this.checkTypeExpr(t.element.inner);
           return;
         }
+        if (t.kind === 'set') this.checkSetElement(t);
         this.checkTypeExpr(t.element);
         return;
       }
@@ -467,16 +661,15 @@ class Analyzer {
       return;
     }
 
-    const dep = this.deps?.get(t.package);
-    if (dep === undefined) return; // no dependencies in compileSource — nothing deeper to check
-    const depNames = dep.types.map((td) => td.name);
-    if (!depNames.includes(t.name)) {
+    const depEntry = this.depTypes(t.package);
+    if (depEntry === undefined) return; // no dependencies in compileSource — nothing deeper to check
+    if (!depEntry.byName.has(t.name)) {
       this.error(
         SEMANTIC_CODES.unknownType,
         `Unknown type \`${t.package}.${t.name}\` — package \`${t.package}\` does not declare it.`,
         t.line,
         t.column,
-        suggestionHint(t.name, depNames),
+        suggestionHint(t.name, depEntry.names),
       );
     }
   }
@@ -488,6 +681,30 @@ class Analyzer {
       this.importedNamesCache = new Set(this.file.imports.map((i) => i.name));
     }
     return this.importedNamesCache;
+  }
+
+  /** Per-package dependency type index (built once, shared by all refs). */
+  private depTypesCache: Map<string, { names: string[]; byName: Map<string, IRTypeDefinition> }> | undefined;
+
+  /**
+   * Type index for a dependency package: the ordered name list (for
+   * did-you-mean suggestions) and a name→definition map (for resolution).
+   * Built once per package instead of `dep.types.map(...)`/`.find(...)` per
+   * reference — references are O(1) after the first touch.
+   */
+  private depTypes(pkg: string): { names: string[]; byName: Map<string, IRTypeDefinition> } | undefined {
+    if (this.depTypesCache === undefined) this.depTypesCache = new Map();
+    let entry = this.depTypesCache.get(pkg);
+    if (entry === undefined) {
+      const dep = this.deps?.get(pkg);
+      if (dep === undefined) return undefined;
+      entry = {
+        names: dep.types.map((td) => td.name),
+        byName: new Map(dep.types.map((td) => [td.name, td])),
+      };
+      this.depTypesCache.set(pkg, entry);
+    }
+    return entry;
   }
 
   // ------------------------------------------------------------- services
@@ -556,9 +773,7 @@ class Analyzer {
       return local === undefined ? undefined : { decl: local.decl };
     }
     if (!this.importedPackages().has(t.package)) return undefined;
-    const dep = this.deps?.get(t.package);
-    if (dep === undefined) return undefined;
-    const depType = dep.types.find((td) => td.name === t.name);
+    const depType = this.depTypes(t.package)?.byName.get(t.name);
     if (depType === undefined) return undefined;
     return { decl: depType.kind };
   }
@@ -570,56 +785,166 @@ class Analyzer {
       if (!CONSTRAINT_KINDS.has(constraint.kindName)) continue; // parser reported BR2014
       const underlying = field.type.kind === 'optional' ? field.type.inner : field.type;
       const numeric = constraint.kindName === 'min' || constraint.kindName === 'max';
-      const resolved = this.resolveToPrimitive(underlying);
-      if (resolved === undefined) continue; // unknown type — already diagnosed
-      if (numeric && !NUMERIC_PRIMITIVES.has(resolved)) {
-        this.error(
-          SEMANTIC_CODES.constraintNotApplicable,
-          `@${constraint.kindName} applies to numeric types only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
-          constraint.line,
-          constraint.column,
-          '@min/@max support int32, int64, uint32, uint64, float32, float64 and decimal fields.',
-        );
-      } else if (!numeric && resolved !== 'string') {
-        this.error(
-          SEMANTIC_CODES.constraintNotApplicable,
-          `@${constraint.kindName} applies to string fields only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
-          constraint.line,
-          constraint.column,
-          '@length/@email/@url/@pattern/@uuid support `string` fields only.',
-        );
+      const target = this.resolveConstraintTarget(underlying);
+      if (target.resolved) {
+        if (numeric && !NUMERIC_PRIMITIVES.has(target.primitive)) {
+          this.error(
+            SEMANTIC_CODES.constraintNotApplicable,
+            `@${constraint.kindName} applies to numeric types only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+            constraint.line,
+            constraint.column,
+            '@min/@max support int32, int64, uint32, uint64, float32, float64 and decimal fields.',
+          );
+          continue;
+        }
+        if (!numeric && target.primitive !== 'string') {
+          this.error(
+            SEMANTIC_CODES.constraintNotApplicable,
+            `@${constraint.kindName} applies to string fields only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+            constraint.line,
+            constraint.column,
+            '@length/@email/@url/@pattern/@uuid support `string` fields only.',
+          );
+          continue;
+        }
+      } else if (target.reason === 'not-primitive') {
+        // The target resolves to a struct/enum/union or a composite — never
+        // silently ignored: the constraint cannot apply (BR2013).
+        if (numeric) {
+          this.error(
+            SEMANTIC_CODES.constraintNotApplicable,
+            `@${constraint.kindName} applies to numeric types only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+            constraint.line,
+            constraint.column,
+            '@min/@max support int32, int64, uint32, uint64, float32, float64 and decimal fields.',
+          );
+        } else {
+          this.error(
+            SEMANTIC_CODES.constraintNotApplicable,
+            `@${constraint.kindName} applies to string fields only, but field \`${field.name}\` of ${container} has type \`${typeToText(underlying)}\`.`,
+            constraint.line,
+            constraint.column,
+            '@length/@email/@url/@pattern/@uuid support `string` fields only.',
+          );
+        }
+        continue;
+      } else {
+        // Unresolved reference — BR2001 was already reported for it (or the
+        // reference is opaque in compileSource mode); nothing deeper to add.
+        continue;
       }
+      this.checkConstraintArgs(constraint);
+      if (constraint.kindName === 'pattern') this.checkPatternRE2(constraint);
     }
   }
 
+  /** Validate argument count and shape for one constraint (BR2016). */
+  private checkConstraintArgs(constraint: ConstraintNode): void {
+    const rule = CONSTRAINT_ARG_RULES[constraint.kindName];
+    if (rule === undefined) return;
+    const args = positionalConstraintArgs(constraint);
+    if (args.length < rule.min || args.length > rule.max) {
+      this.error(
+        SEMANTIC_CODES.constraintArgs,
+        `@${constraint.kindName} expects ${describeExpectedArgs(rule)}, but got ${args.length}.`,
+        constraint.line,
+        constraint.column,
+        'A single trailing quoted string is a custom violation message, e.g. `@length(3, "ISO currency codes are 3 letters")`.',
+      );
+      return;
+    }
+    const numericShape = rule.shape === 'number';
+    for (const arg of args) {
+      const shapeOk = numericShape ? !arg.isString && NUMERIC_ARG_RE.test(arg.text) : arg.isString;
+      if (shapeOk) continue;
+      this.error(
+        SEMANTIC_CODES.constraintArgs,
+        numericShape
+          ? `@${constraint.kindName} expects a numeric argument (an unquoted number), but got ${argAsWritten(arg)}.`
+          : `@${constraint.kindName} expects a quoted string argument, but got ${argAsWritten(arg)}.`,
+        constraint.line,
+        constraint.column,
+      );
+    }
+  }
+
+  /** Reject @pattern arguments that Go's regexp (RE2) cannot compile (BR2018). */
+  private checkPatternRE2(constraint: ConstraintNode): void {
+    const args = positionalConstraintArgs(constraint);
+    const arg = args[0];
+    if (arg === undefined || !arg.isString) return; // shape error already reported by BR2016
+    const finding = re2UnsupportedConstruct(arg.text);
+    if (finding === undefined) return;
+    this.error(
+      SEMANTIC_CODES.patternNotRE2,
+      `@pattern ${JSON.stringify(arg.text)} uses ${finding.construct}, which Go's regexp (RE2) does not support — generated Go code would panic in regexp.MustCompile at package init.`,
+      constraint.line,
+      constraint.column,
+      'RE2 has no lookahead/lookbehind, no backreferences and no atomic/possessive quantifiers. Rewrite the pattern using plain RE2 syntax: https://github.com/google/re2/wiki/Syntax',
+    );
+  }
+
+  /** Enforce the set element rule (BR2019): hashable, orderable values only. */
+  private checkSetElement(t: SetTypeNode): void {
+    const target = this.resolveConstraintTarget(t.element);
+    if (target.resolved) {
+      if (MAP_KEY_PRIMITIVES.has(target.primitive)) return;
+    } else if (target.reason === 'unresolved-ref') {
+      // Unknown (BR2001 already reported) or opaque cross-package reference —
+      // nothing deeper to add here.
+      return;
+    }
+    // `!resolved && reason === 'not-primitive'` falls through: struct, enum,
+    // union and composite elements ARE diagnosed (no silent skip).
+    this.error(
+      SEMANTIC_CODES.setElement,
+      `Set element type \`${typeToText(t.element)}\` is not allowed — set elements must be hashable, canonically orderable values.`,
+      t.element.line,
+      t.element.column,
+      'Allowed element types: string, bool, int32, int64, uint32, uint64, uuid, or an alias to one. Struct, enum, union, composite and unhashable-primitive elements make cross-language set ordering non-canonical (Rust BTreeSet needs Ord; Go sets are map[T]struct{} and need comparable keys). Use `list<T>` when you need ordering or complex elements.',
+    );
+  }
+
   /**
-   * Resolve a type expression to its underlying primitive, following local
-   * aliases (cycle-safe). Returns undefined when the type is not primitive-
-   * resolvable (struct/enum/union, composite, or an unknown reference that
-   * was already diagnosed).
+   * Resolve a type expression to its underlying primitive for constraint and
+   * set-element checks, following local aliases and (when dependencies are
+   * available) cross-package aliases. Cycle-safe.
    */
-  private resolveToPrimitive(t: TypeNode): PrimitiveKind | undefined {
+  private resolveConstraintTarget(
+    t: TypeNode | ResolvableTypeRef,
+  ): ConstraintTargetResolution {
     const visited = new Set<string>();
-    let current: TypeNode = t;
+    let current: ResolvableTypeRef = t;
     for (;;) {
       switch (current.kind) {
         case 'primitive':
-          return current.primitive;
+          return { resolved: true, primitive: current.primitive };
         case 'optional':
           current = current.inner;
           continue;
+        case 'list':
+        case 'set':
+        case 'map':
+          return { resolved: false, reason: 'not-primitive' };
+        case 'error':
+          return { resolved: false, reason: 'unresolved-ref' }; // parse error already reported
         case 'named': {
-          if (current.package !== undefined && current.package !== this.ownPackage) return undefined;
-          if (visited.has(current.name)) return undefined; // alias cycle — diagnosed separately
-          visited.add(current.name);
+          const key = `${current.package ?? ''}.${current.name}`;
+          if (visited.has(key)) return { resolved: false, reason: 'not-primitive' }; // alias cycle — BR2009 reports
+          visited.add(key);
+          if (current.package !== undefined && current.package !== this.ownPackage) {
+            const depType = this.depTypes(current.package)?.byName.get(current.name);
+            if (depType === undefined) return { resolved: false, reason: 'unresolved-ref' };
+            if (depType.kind !== 'alias') return { resolved: false, reason: 'not-primitive' };
+            current = depType.target;
+            continue;
+          }
           const decl = this.localTypes.get(current.name);
-          if (decl === undefined) return undefined;
-          if (decl.decl !== 'alias') return undefined;
+          if (decl === undefined) return { resolved: false, reason: 'unresolved-ref' };
+          if (decl.decl !== 'alias') return { resolved: false, reason: 'not-primitive' };
           current = decl.target;
           continue;
         }
-        default:
-          return undefined;
       }
     }
   }
@@ -702,6 +1027,88 @@ class Analyzer {
       }
     };
     walk(decl.target);
+  }
+
+  // -------------------------------------------------------- recursive types
+
+  /**
+   * Detect structs that directly or indirectly contain themselves through a
+   * plain named field (BR2017). Self-references through `optional`, `list`,
+   * `set` or `map` are allowed (protobuf-style indirection); aliases are
+   * transparent edges. Cross-package references cannot participate in a
+   * local cycle (the other package cannot reference this file), so they are
+   * skipped.
+   */
+  private checkRecursiveTypes(): void {
+    const state = new Map<string, 0 | 1 | 2>(); // 0 = unvisited, 1 = on stack, 2 = done
+    for (const [name, decl] of this.localTypes) {
+      if (decl.decl !== 'struct') continue;
+      if ((state.get(name) ?? 0) !== 0) continue;
+      this.visitStructForRecursion(name, decl, [], state);
+    }
+  }
+
+  private visitStructForRecursion(
+    name: string,
+    decl: StructDeclNode,
+    stack: string[],
+    state: Map<string, 0 | 1 | 2>,
+  ): void {
+    state.set(name, 1);
+    stack.push(name);
+    for (const field of decl.fields) {
+      if (field.type.kind === 'error') continue; // parse error already reported
+      this.walkFieldForRecursion(field.type, stack, state, new Set<string>());
+    }
+    stack.pop();
+    state.set(name, 2);
+  }
+
+  /**
+   * Walk one field's type expression. Only *direct* named references create
+   * recursion edges — once the walk passes through `optional`, `list`,
+   * `set` or `map`, the contained types are heap/pointer represented in
+   * every backend and cannot close an inline cycle, so the walk stops there.
+   */
+  private walkFieldForRecursion(
+    t: TypeNode,
+    stack: string[],
+    state: Map<string, 0 | 1 | 2>,
+    aliasGuard: Set<string>,
+  ): void {
+    switch (t.kind) {
+      case 'named': {
+        if (t.package !== undefined && t.package !== this.ownPackage) return; // cross-package — no local cycle
+        if (PRIMITIVE_SET.has(t.name)) return;
+        const decl = this.localTypes.get(t.name);
+        if (decl === undefined) return; // unknown — BR2001 already reported
+        if (decl.decl === 'alias') {
+          if (aliasGuard.has(t.name)) return; // alias cycle — BR2009 reports
+          aliasGuard.add(t.name);
+          this.walkFieldForRecursion(decl.target, stack, state, aliasGuard);
+          return;
+        }
+        if (decl.decl !== 'struct') return; // enum/union payloads — not an inline edge
+        const target = t.name;
+        if (state.get(target) === 1) {
+          const path = [...stack, target].join(' -> ');
+          this.error(
+            SEMANTIC_CODES.recursiveType,
+            `Recursive struct \`${target}\` — the type reaches itself via \`${path}\` without going through optional, list, set or map.`,
+            t.line,
+            t.column,
+            `Wrap the self-reference: e.g. \`next: ${target}?\` or \`children: list<${target}>\`. Direct structural recursion generates infinitely sized values (Go: "invalid recursive type"; Rust: E0072).`,
+          );
+          return;
+        }
+        if ((state.get(target) ?? 0) === 0) {
+          this.visitStructForRecursion(target, decl, stack, state);
+        }
+        return;
+      }
+      default:
+        return; // optional/list/set/map break the inline cycle; primitives/errors are leaves
+    }
   }
 }
 

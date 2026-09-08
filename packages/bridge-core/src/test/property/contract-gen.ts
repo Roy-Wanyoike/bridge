@@ -434,7 +434,9 @@ function genTypeSpec(
     return { k: 'list', element: genInnerElement(rng, generated) };
   }
   if (r < 0.9) {
-    return { k: 'set', element: { k: 'prim', prim: rng.pick(PRIMS) } };
+    // Set elements must be hashable, orderable values (BR2019) — the same
+    // domain as map keys.
+    return { k: 'set', element: { k: 'prim', prim: rng.pick([...MAP_KEY_PRIMITIVES]) as PrimitiveKind } };
   }
   const key = rng.pick([...MAP_KEY_PRIMITIVES]) as PrimitiveKind;
   return { k: 'map', key, value: genInnerElement(rng, generated) };

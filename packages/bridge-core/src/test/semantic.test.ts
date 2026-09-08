@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { compilePackage, compileSource } from '../index';
-import { analyzeFile, didYouMean, levenshtein, SEMANTIC_CODES } from '../semantic';
+import { analyzeFile, didYouMean, levenshtein, re2UnsupportedConstruct, SEMANTIC_CODES } from '../semantic';
 import { parse } from '../parser';
 import { tokenize } from '../lexer';
 import type { Diagnostic, IRPackage } from '../ir/types';
@@ -403,6 +403,267 @@ type T {
 }
 `);
   assert.deepEqual(codes(diags), [SEMANTIC_CODES.unknownType]);
+});
+
+// ------------------------------------------- constraint arguments (BR2016)
+
+test('@min/@max reject non-numeric and wrong-arity arguments (BR2016)', () => {
+  const diags = analyze(`
+package p
+type T {
+    bad1: int64 @min(foo)
+    bad2: int64 @min("abc")
+    bad3: int64 @min("abc", "oops")
+    bad4: int64 @min()
+    bad5: int64 @min(1, 2)
+    ok1: int64 @min(5)
+    ok2: int64 @min(-1.5, "too small")
+    ok3: int64 @max(0)
+}
+`);
+  const bad = diags.filter((d) => d.code === SEMANTIC_CODES.constraintArgs);
+  assert.equal(bad.length, 5);
+  assert.deepEqual(
+    bad.map((d) => d.line),
+    [4, 5, 6, 7, 8],
+  );
+  assert.match(bad[0]?.message ?? '', /expects a numeric argument/);
+  assert.match(bad[1]?.message ?? '', /expects a numeric argument.*"abc"/);
+  assert.match(bad[2]?.message ?? '', /expects a numeric argument.*"abc"/);
+  assert.match(bad[3]?.message ?? '', /expects exactly 1 numeric argument, but got 0/);
+  assert.match(bad[4]?.message ?? '', /expects exactly 1 numeric argument, but got 2/);
+});
+
+test('@length/@pattern/@email argument rules per kind (BR2016)', () => {
+  const diags = analyze(`
+package p
+type T {
+    ok1: string @length(3)
+    ok2: string @length(1, 64)
+    ok3: string @length(0, "empty is ok")
+    ok4: string @pattern("^[a-z]+$", "lowercase only")
+    ok5: string @email("not an email")
+    bad1: string @length("3")
+    bad2: string @length()
+    bad3: string @length(1, 2, 3)
+    bad4: string @pattern(5)
+    bad5: string @email(5)
+}
+`);
+  const bad = diags.filter((d) => d.code === SEMANTIC_CODES.constraintArgs);
+  assert.deepEqual(
+    bad.map((d) => d.line),
+    [9, 10, 11, 12, 13],
+  );
+  assert.match(bad[0]?.message ?? '', /expects a numeric argument.*"3"/);
+  assert.match(bad[1]?.message ?? '', /expects 1 or 2 numeric arguments, but got 0/);
+  assert.match(bad[2]?.message ?? '', /expects 1 or 2 numeric arguments, but got 3/);
+  assert.match(bad[3]?.message ?? '', /@pattern expects a quoted string argument, but got `5`/);
+  assert.match(bad[4]?.message ?? '', /@email expects no arguments, but got 1/);
+});
+
+// ------------------------------------------ constraint targets (no silent skip)
+
+test('constraints on struct/enum/composite fields are BR2013, not silently ignored', () => {
+  const diags = analyze(`
+package p
+enum Kind {
+    A
+}
+type Inner {
+    x: int32
+}
+type T {
+    bad1: Kind @min(1)
+    bad2: Inner @min(0)
+    bad3: list<string> @length(0)
+    bad4: map<string, int32> @email
+    ok1: string @length(2, 8)
+}
+`);
+  const bad = diags.filter((d) => d.code === SEMANTIC_CODES.constraintNotApplicable);
+  assert.equal(bad.length, 4);
+  assert.deepEqual(
+    bad.map((d) => d.line),
+    [10, 11, 12, 13],
+  );
+  assert.match(bad[1]?.message ?? '', /has type `Inner`/);
+  assert.match(bad[2]?.message ?? '', /has type `list<string>`/);
+});
+
+// ------------------------------------------------------------ recursive structs
+
+test('direct recursive struct is BR2017 at the closing reference', () => {
+  const diags = analyze(`
+package p
+type Node {
+    next: Node
+}
+`);
+  const rec = diags.filter((d) => d.code === SEMANTIC_CODES.recursiveType);
+  assert.equal(rec.length, 1);
+  assert.match(rec[0]?.message ?? '', /Recursive struct `Node`/);
+  assert.match(rec[0]?.message ?? '', /Node -> Node/);
+  assert.equal(rec[0]?.line, 4);
+  assert.equal(rec[0]?.column, 11);
+  assert.ok((rec[0]?.hint ?? '').includes('list<Node>'));
+});
+
+test('mutual recursion through two structs is reported once, at the closing field', () => {
+  const diags = analyze(`
+package p
+type A {
+    b: B
+}
+type B {
+    a: A
+}
+`);
+  const rec = diags.filter((d) => d.code === SEMANTIC_CODES.recursiveType);
+  assert.equal(rec.length, 1);
+  assert.match(rec[0]?.message ?? '', /A -> B -> A/);
+  assert.equal(rec[0]?.line, 7);
+});
+
+test('self-reference through an alias still closes a cycle', () => {
+  const diags = analyze(`
+package p
+type Node {
+    next: Next
+}
+alias Next = Node
+`);
+  const rec = diags.filter((d) => d.code === SEMANTIC_CODES.recursiveType);
+  assert.equal(rec.length, 1);
+  assert.match(rec[0]?.message ?? '', /Node -> Node/);
+});
+
+test('self-references through optional, list and map are allowed (protobuf-style)', () => {
+  const diags = analyze(`
+package p
+type Node {
+    next: Node?
+    children: list<Node>
+    index: map<string, Node>
+    parent: Node
+}
+`);
+  // `parent` is the one direct reference and must be flagged; everything
+  // wrapped in a collection/optional is fine.
+  const rec = diags.filter((d) => d.code === SEMANTIC_CODES.recursiveType);
+  assert.equal(rec.length, 1);
+  assert.equal(rec[0]?.line, 7);
+});
+
+test('mutual recursion broken by an optional field is allowed', () => {
+  const diags = analyze(`
+package p
+type A {
+    b: B?
+}
+type B {
+    a: A?
+}
+`);
+  assert.deepEqual(diags, []);
+});
+
+// ------------------------------------------------------------- set elements
+
+test('set elements must be hashable, orderable values (BR2019)', () => {
+  const diags = analyze(`
+package p
+enum Kind {
+    A
+}
+alias Tag = string
+type Money {
+    units: int64
+}
+type T {
+    ok1: set<string>
+    ok2: set<int32>
+    ok3: set<uuid>
+    ok4: set<Tag>
+    ok5: list<Money>
+    bad1: set<Money>
+    bad2: set<Kind>
+    bad3: set<float64>
+    bad4: set<list<string>>
+    bad5: set<json>
+    bad6: set<bytes>
+    bad7: set<timestamp>
+}
+`);
+  const bad = diags.filter((d) => d.code === SEMANTIC_CODES.setElement);
+  assert.equal(bad.length, 7);
+  assert.deepEqual(
+    bad.map((d) => d.line),
+    [16, 17, 18, 19, 20, 21, 22],
+  );
+  assert.match(bad[0]?.message ?? '', /Set element type `Money` is not allowed/);
+  assert.ok((bad[0]?.hint ?? '').includes('list<T>'));
+});
+
+// ----------------------------------------------------------- RE2 dialect check
+
+test("@pattern rejects regex syntax unsupported by Go's regexp (BR2018)", () => {
+  const diags = analyze(`
+package p
+type T {
+    bad1: string @pattern("^a(?=b)")
+    bad2: string @pattern("a(?!b)")
+    bad3: string @pattern("(?<=a)b")
+    bad4: string @pattern("(?<!a)b")
+    bad5: string @pattern("^([a-z])\\\\1$")
+    bad6: string @pattern("a*+")
+    bad7: string @pattern("(?>a)b")
+    ok1: string @pattern("^(?P<year>[0-9]{4})$")
+    ok2: string @pattern("^(?<year>[0-9]{4})$")
+    ok3: string @pattern("[*+]")
+    ok4: string @pattern("^[a-z][a-z0-9_]*$")
+}
+`);
+  const bad = diags.filter((d) => d.code === SEMANTIC_CODES.patternNotRE2);
+  assert.equal(bad.length, 7);
+  assert.deepEqual(
+    bad.map((d) => d.line),
+    [4, 5, 6, 7, 8, 9, 10],
+  );
+  assert.match(bad[0]?.message ?? '', /lookahead `\(\?=`/);
+  assert.match(bad[1]?.message ?? '', /negative lookahead/);
+  assert.match(bad[2]?.message ?? '', /lookbehind `\(\?<=`/);
+  assert.match(bad[4]?.message ?? '', /backreference `\\1`/);
+  assert.match(bad[5]?.message ?? '', /nested repetition operator `\*\+`/);
+  assert.match(bad[6]?.message ?? '', /atomic group/);
+  assert.match(bad[0]?.message ?? '', /regexp\.MustCompile/);
+});
+
+test('re2UnsupportedConstruct scans patterns precisely', () => {
+  assert.equal(re2UnsupportedConstruct('^[a-z]+$'), undefined);
+  assert.equal(re2UnsupportedConstruct('^(?P<year>[0-9]{4})$'), undefined);
+  assert.equal(re2UnsupportedConstruct('^(?<year>[0-9]{4})$'), undefined);
+  assert.equal(re2UnsupportedConstruct('^\\d{3}-\\d{4}$'), undefined);
+  assert.equal(re2UnsupportedConstruct('\\012-\\0177 octal escapes are RE2'), undefined);
+  assert.equal(re2UnsupportedConstruct('[*+]?[\\\\]'), undefined);
+  assert.equal(re2UnsupportedConstruct('^a(?=b)')?.construct, 'lookahead `(?=`');
+  assert.equal(re2UnsupportedConstruct('a(?!b)')?.construct, 'negative lookahead `(?!`');
+  assert.equal(re2UnsupportedConstruct('(?<=a)b')?.construct, 'lookbehind `(?<=`');
+  assert.equal(re2UnsupportedConstruct('(?<!a)b')?.construct, 'negative lookbehind `(?<!`');
+  assert.equal(re2UnsupportedConstruct('^([a-z])\\1$')?.construct, 'backreference `\\1`');
+  assert.equal(re2UnsupportedConstruct('^([a-z])\\9$')?.construct, 'backreference `\\9`');
+  assert.equal(re2UnsupportedConstruct('\\12')?.construct, 'backreference `\\1`'); // Go: octal needs \0 prefix
+  assert.equal(re2UnsupportedConstruct('a*+')?.construct, 'nested repetition operator `*+`');
+  assert.equal(re2UnsupportedConstruct('(?>a)')?.construct, 'atomic group `(?>`');
+  // Lazy quantifiers (`x*?`, `x+?`, `x??`) are RE2 constructs — never flagged.
+  assert.equal(re2UnsupportedConstruct('a+?'), undefined);
+  assert.equal(re2UnsupportedConstruct('a*?'), undefined);
+  assert.equal(re2UnsupportedConstruct('a??'), undefined);
+  assert.equal(re2UnsupportedConstruct('(?P<a')?.construct.includes('unterminated'), true);
+  assert.equal(re2UnsupportedConstruct('(?P<>x)')?.construct.includes('invalid name'), true);
+  // Escaped meta characters are literal and never flagged.
+  assert.equal(re2UnsupportedConstruct('\\*+\\?+'), undefined);
+  assert.equal(re2UnsupportedConstruct('\\\\1'), undefined); // literal `\` then `1`
 });
 
 // ---------------------------------------------------------------- warnings
