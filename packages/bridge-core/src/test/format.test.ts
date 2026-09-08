@@ -156,3 +156,56 @@ test('formatSource never throws on garbage and reports failure instead', () => {
     if (!result.ok) assert.equal(result.output, undefined);
   }
 });
+
+// ------------------------------------------------------------- CRLF input
+
+test('CRLF files format to canonical LF output', () => {
+  const crlfSource = [
+    'package shop.v1',
+    '/// Money.',
+    'type Money {',
+    '    /// Whole units.',
+    '    amount: int64',
+    '    currency: string?',
+    '}',
+    '',
+  ].join('\r\n');
+  const result = formatSource(crlfSource, 'crlf.bridge');
+  assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
+  assert.equal(result.output, `package shop.v1
+
+/// Money.
+type Money {
+    /// Whole units.
+    amount: int64
+    currency: string?
+}
+`);
+  assert.ok(!result.output?.includes('\r'), 'output must not contain any CR');
+  // Formatting is idempotent across the CRLF → LF canonicalization.
+  const again = formatSource(result.output ?? '', 'crlf.bridge');
+  assert.equal(again.ok, true);
+  assert.equal(again.output, result.output);
+});
+
+// ------------------------------------------------------- depth protection
+
+test('deeply nested types fail with BR1005, never an internal formatter error', () => {
+  // Depth 200 formats fine (the issue's baseline case).
+  const shallow = formatSource(
+    `package p\ntype T {\n    x: ${'list<'.repeat(200)}string${'>'.repeat(200)}\n}\n`,
+    'deep.bridge',
+  );
+  assert.equal(shallow.ok, true, JSON.stringify(shallow.diagnostics));
+
+  // 8000 open `list<` used to overflow the stack while parsing (BR2999);
+  // the parser's depth limit now rejects it with a proper syntax diagnostic.
+  const deep = formatSource(`package p\ntype T {\n    x: ${'list<'.repeat(8000)}\n}\n`, 'deep.bridge');
+  assert.equal(deep.ok, false);
+  assert.equal(deep.output, undefined);
+  assert.ok(deep.diagnostics.some((d) => d.code === 'BR1005'), JSON.stringify(deep.diagnostics));
+  assert.ok(
+    deep.diagnostics.every((d) => d.code !== 'BR2999'),
+    'formatter must report BR1005, not an internal error',
+  );
+});

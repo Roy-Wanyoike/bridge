@@ -6,6 +6,7 @@
 export {
   DEFAULT_CORPUS,
   DEFAULT_FUZZ_SEED,
+  classifyTargetRun,
   classifyThrow,
   fuzzIdl,
   mixSeed,
@@ -20,6 +21,7 @@ export type {
   FuzzSummary,
   FuzzTarget,
   MutationOp,
+  TargetRunOutcome,
 } from './fuzz';
 export { USAGE, parseCliArgs, runCli, summaryLine } from './cli';
 export type { CliOptions } from './cli';

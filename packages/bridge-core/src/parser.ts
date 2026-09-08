@@ -5,7 +5,9 @@
  * parsing recovers (skipping to the next line, brace or declaration
  * boundary) so a single pass reports as many errors as possible. The
  * resulting AST is best-effort: failed constructs carry error placeholders
- * that later stages know to ignore.
+ * that later stages know to ignore. Recursion is bounded — type expressions
+ * deeper than {@link MAX_TYPE_DEPTH} report "type nesting too deep" (BR1005)
+ * instead of exhausting the call stack.
  *
  * Grammar (v1):
  * ```
@@ -55,10 +57,31 @@ import {
 
 /** Syntax-error diagnostic code (lexer/parser family, BR1xxx). */
 const SYNTAX_ERROR = 'BR1004';
+/**
+ * Type-nesting depth-limit diagnostic code (syntax family, BR1xxx). Emitted
+ * instead of an internal BR2999 when a type expression nests past
+ * {@link MAX_TYPE_DEPTH} and the parser would otherwise overflow the stack.
+ */
+const TYPE_DEPTH_ERROR = 'BR1005';
+/**
+ * Redundant optional-marker warning code (BR21xx style-warning family, like
+ * the BR2101-BR2103 naming warnings). Advisory only: warnings never block
+ * compilation or formatting.
+ */
+const REDUNDANT_OPTIONAL = 'BR2104';
 /** Package-statement placement diagnostic code. */
 const PACKAGE_ERROR = 'BR2007';
 /** Unknown-constraint diagnostic code (emitted during parsing). */
 const UNKNOWN_CONSTRAINT = 'BR2014';
+
+/**
+ * Maximum nesting depth of a type expression (`list<…>` / `set<…>` /
+ * `map<…, …>` / optional wrappers). Past this the parser reports
+ * "type nesting too deep" and recovers instead of recursing further —
+ * unbounded recursion overflows the call stack and surfaces as an internal
+ * `BR2999` error. Exported so tools and tests can match the threshold.
+ */
+export const MAX_TYPE_DEPTH = 256;
 
 const DECL_KEYWORDS: ReadonlySet<string> = new Set([
   'type', 'enum', 'union', 'alias', 'service', 'event',
@@ -86,6 +109,13 @@ class Parser {
   private readonly diagnostics: Diagnostic[] = [];
   /** Doc comment lines waiting to be attached to the next declaration/field. */
   private pendingDocs: string[] = [];
+  /**
+   * Set while recovering from a type-nesting depth-limit violation (BR1005):
+   * the diagnostic is reported once and enclosing composite frames close
+   * silently instead of cascading "Expected `>`" errors. Reset when the
+   * top-level `parseType` call completes.
+   */
+  private typeDepthLimitHit = false;
 
   constructor(
     private readonly tokens: Token[],
@@ -126,6 +156,25 @@ class Parser {
   ): void {
     const d: Diagnostic = {
       severity: 'error',
+      code,
+      message,
+      file: this.filePath,
+      line: tok.line,
+      column: tok.column,
+    };
+    if (hint !== undefined) d.hint = hint;
+    this.diagnostics.push(d);
+  }
+
+  /** Report an advisory warning (never blocks compilation or formatting). */
+  private warn(
+    code: string,
+    message: string,
+    tok: Token,
+    hint?: string,
+  ): void {
+    const d: Diagnostic = {
+      severity: 'warning',
       code,
       message,
       file: this.filePath,
@@ -487,8 +536,11 @@ class Parser {
     const nameTok = this.next(); // identifier (caller verified)
 
     let optional = false;
+    /** Optional markers (`?`) claimed by this field, for BR2104. */
+    let optionalMarkers = 0;
     if (this.atPunct('?')) {
       optional = true;
+      optionalMarkers += 1;
       this.next();
     }
     this.expectPunct(
@@ -503,9 +555,12 @@ class Parser {
     // equivalent at the field level.
     if (this.atPunct('?')) {
       optional = true;
+      optionalMarkers += 1;
       this.next();
-    } else if (parsedType.kind === 'optional') {
+    }
+    if (parsedType.kind === 'optional') {
       optional = true;
+      optionalMarkers += 1;
     }
 
     const constraints: ConstraintNode[] = [];
@@ -533,7 +588,19 @@ class Parser {
     // Lenient trailing `?` after constraints/default.
     if (this.atPunct('?')) {
       optional = true;
+      optionalMarkers += 1;
       this.next();
+    }
+
+    // More than one marker (`a?: string?`, `a: string??`, …) is redundant —
+    // the extra markers are silently swallowed otherwise.
+    if (optionalMarkers > 1) {
+      this.warn(
+        REDUNDANT_OPTIONAL,
+        `Field \`${nameTok.text}\` declares the optional marker \`?\` more than once.`,
+        nameTok,
+        'Keep a single `?` — canonical style is `name: Type?` (or `name?: Type`).',
+      );
     }
 
     const node: FieldNode = {
@@ -960,11 +1027,37 @@ class Parser {
    * references, or `list<T>` / `set<T>` / `map<K, V>` composites, each
    * optionally followed by `?` (producing an optional wrapper).
    *
+   * Recursion is bounded by {@link MAX_TYPE_DEPTH}: past the threshold the
+   * parser reports "type nesting too deep" (BR1005) once and recovers by
+   * skipping the remainder of the type expression, instead of recursing
+   * until the call stack overflows (which previously surfaced as an
+   * internal BR2999 error).
+   *
    * On failure reports an error and returns an `error` node **without
    * consuming** the offending token — the caller's loop makes progress.
    */
-  private parseType(): TypeNode {
+  private parseType(depth = 0): TypeNode {
+    if (depth === 0) {
+      // Top-level entry point: reset the depth-limit recovery flag when the
+      // whole expression has been parsed so later types parse normally.
+      try {
+        return this.parseTypeAt(depth);
+      } finally {
+        this.typeDepthLimitHit = false;
+      }
+    }
+    return this.parseTypeAt(depth);
+  }
+
+  private parseTypeAt(depth: number): TypeNode {
     const tok = this.peek();
+
+    if (depth > MAX_TYPE_DEPTH) {
+      this.reportTypeDepthLimit(tok);
+      this.skipTypeTail();
+      return { kind: 'error', line: tok.line, column: tok.column };
+    }
+
     let result: TypeNode;
 
     if (tok.kind === 'ident') {
@@ -979,18 +1072,18 @@ class Parser {
         this.next(); // composite name
         this.next(); // `<`
         if (name === 'map') {
-          const key = this.parseType();
+          const key = this.parseType(depth + 1);
           this.expectPunct(
             ',',
             'Expected `,` between the key and value types of a map.',
             'Map types are written `map<K, V>`.',
           );
-          const value = this.parseType();
-          this.expectPunct('>', 'Expected `>` to close the `map<` type.');
+          const value = this.parseType(depth + 1);
+          this.closeComposite('map');
           result = { kind: 'map', key, value, line: tok.line, column: tok.column };
         } else {
-          const element = this.parseType();
-          this.expectPunct('>', `Expected \`>\` to close the \`${name}<\` type.`);
+          const element = this.parseType(depth + 1);
+          this.closeComposite(name);
           result =
             name === 'list'
               ? { kind: 'list', element, line: tok.line, column: tok.column }
@@ -1031,5 +1124,73 @@ class Parser {
       result = { kind: 'optional', inner: result, line: tok.line, column: tok.column };
     }
     return result;
+  }
+
+  /** Report the BR1005 depth-limit diagnostic at most once per expression. */
+  private reportTypeDepthLimit(tok: Token): void {
+    if (this.typeDepthLimitHit) return;
+    this.typeDepthLimitHit = true;
+    this.err(
+      TYPE_DEPTH_ERROR,
+      `Type nesting too deep — type expressions may nest at most ${MAX_TYPE_DEPTH} levels.`,
+      tok,
+      'Introduce a named alias for the inner types, e.g. `alias Inner = list<string>`.',
+    );
+  }
+
+  /**
+   * Close a `list<` / `set<` / `map<` composite. While unwinding after a
+   * depth-limit violation the closing `>` is consumed silently when present
+   * (the violation itself was already reported), so the recovery does not
+   * cascade into hundreds of "Expected `>`" errors.
+   */
+  private closeComposite(name: string): void {
+    if (this.typeDepthLimitHit) {
+      if (this.atPunct('>')) this.next();
+      return;
+    }
+    this.expectPunct('>', `Expected \`>\` to close the \`${name}<\` type.`);
+  }
+
+  /**
+   * Skip the remainder of an over-deep type expression after a BR1005
+   * violation. Consumes type-ish tokens while brackets are balanced and
+   * stops at the first token that cannot continue a type (leaving closing
+   * `>`s for the enclosing frames, which pair them via {@link closeComposite}).
+   */
+  private skipTypeTail(): void {
+    let balance = 0;
+    for (;;) {
+      const tok = this.peek();
+      if (tok.kind === 'eof') return;
+      if (tok.kind === 'punct') {
+        switch (tok.text) {
+          case '<':
+            balance += 1;
+            this.next();
+            continue;
+          case '>':
+            if (balance === 0) return; // closes an enclosing composite
+            balance -= 1;
+            this.next();
+            continue;
+          case '.':
+            this.next();
+            continue;
+          case ',':
+          case '?':
+            if (balance === 0) return;
+            this.next();
+            continue;
+          default:
+            return; // `}` `)` `:` `@` `=` `->` … end the type expression
+        }
+      }
+      if (tok.kind === 'ident' || tok.kind === 'number' || tok.kind === 'string') {
+        this.next();
+        continue;
+      }
+      return; // keywords, doc comments, …
+    }
   }
 }

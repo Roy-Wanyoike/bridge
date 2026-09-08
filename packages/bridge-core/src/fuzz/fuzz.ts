@@ -8,10 +8,15 @@
  * never-throw contract:
  *
  * - `compileSource` / `formatSource` must NEVER throw on any input. The
- *   pipeline reports malformed input as diagnostics (or `BR2999` internal
- *   errors) instead. Any exception escaping either function is a bug and is
- *   recorded as a crash — throwing a non-Error value (string, number, bare
- *   object) is recorded as the worst crash class.
+ *   pipeline reports malformed input as diagnostics instead. Any exception
+ *   escaping either function is a bug and is recorded as a crash — throwing
+ *   a non-Error value (string, number, bare object) is recorded as the
+ *   worst crash class.
+ * - A run whose diagnostics include the internal `BR2999` code is also a
+ *   crash: internal errors mean the pipeline hit an unexpected state (e.g.
+ *   stack exhaustion) rather than a diagnosable input problem. Without this
+ *   rule the fuzzer is structurally blind to BR2999 — any non-empty
+ *   diagnostics array used to count as the "good path".
  *
  * Hangs cannot be observed from inside a synchronous call: a case that
  * never returns blocks the event loop. The runner therefore supports a
@@ -26,6 +31,8 @@
 
 import { compileSource } from '../compiler/compile';
 import { formatSource } from '../format';
+import { INTERNAL_ERROR } from '../semantic';
+import type { Diagnostic } from '../ir/types';
 
 // Self-contained PRNG (mulberry32 + splitmix-style mixer) — kept identical
 // to packages/*/src/test/property/harness.ts so seeds mean the same thing.
@@ -319,17 +326,33 @@ function randomGarbage(rng: RandomSource, length: number): string {
 export type FuzzTarget = 'compile' | 'format';
 
 /**
- * Run one fuzz target. By contract `compileSource`/`formatSource` never
- * throw — if this function throws at all, the pipeline violated its
- * contract. Exported for tests.
+ * Run one fuzz target and return its diagnostics. By contract
+ * `compileSource`/`formatSource` never throw — if this function throws at
+ * all, the pipeline violated its contract. Exported for tests.
  */
-export function runTarget(target: FuzzTarget, source: string): number {
+export function runTarget(target: FuzzTarget, source: string): Diagnostic[] {
   switch (target) {
     case 'compile':
-      return compileSource(source, 'fuzz.bridge').diagnostics.length;
+      return compileSource(source, 'fuzz.bridge').diagnostics;
     case 'format':
-      return formatSource(source, 'fuzz.bridge').diagnostics.length;
+      return formatSource(source, 'fuzz.bridge').diagnostics;
   }
+}
+
+/** Outcome buckets for one target run (exported for tests). */
+export type TargetRunOutcome = 'clean' | 'diagnostics' | 'internal-error';
+
+/**
+ * Classify the diagnostics of one target run (exported for tests).
+ *
+ * - `clean` — zero diagnostics;
+ * - `diagnostics` — the good path: only real (non-internal) diagnostics;
+ * - `internal-error` — a `BR2999` diagnostic is present; counted as a crash
+ *   by the runner (see {@link fuzzIdl}).
+ */
+export function classifyTargetRun(diagnostics: readonly Diagnostic[]): TargetRunOutcome {
+  if (diagnostics.some((d) => d.code === INTERNAL_ERROR)) return 'internal-error';
+  return diagnostics.length > 0 ? 'diagnostics' : 'clean';
 }
 
 export interface CrashClassification {
@@ -370,7 +393,11 @@ export interface FuzzCrash {
   caseSeed: number;
   ops: MutationOp[];
   target: FuzzTarget;
-  errorKind: 'non-throwable' | 'throwable';
+  /**
+   * `throwable` / `non-throwable` — an exception escaped the pipeline;
+   * `internal-error` — the pipeline returned a BR2999 diagnostic instead.
+   */
+  errorKind: 'non-throwable' | 'throwable' | 'internal-error';
   message: string;
   mutatedSource: string;
 }
@@ -382,7 +409,7 @@ export interface FuzzSummary {
   executed: number;
   /** Cases that produced zero diagnostics. */
   clean: number;
-  /** Cases that produced at least one diagnostic (the good path). */
+  /** Cases whose diagnostics were all real input problems (no BR2999). */
   diagnosticsFound: number;
   crashes: FuzzCrash[];
   stoppedEarly: boolean;
@@ -433,8 +460,26 @@ export function fuzzIdl(options: FuzzOptions = {}): FuzzSummary {
     for (const target of ['compile', 'format'] as const) {
       try {
         const diagnostics = runTarget(target, text);
-        if (diagnostics > 0) summary.diagnosticsFound += 1;
-        else summary.clean += 1;
+        const outcome = classifyTargetRun(diagnostics);
+        if (outcome === 'internal-error') {
+          // A BR2999 diagnostic means the pipeline hit an unexpected internal
+          // state (e.g. stack exhaustion) — record it as a crash, not as the
+          // diagnostics "good path".
+          const internal = diagnostics.find((d) => d.code === INTERNAL_ERROR);
+          summary.crashes.push({
+            case: caseIndex,
+            caseSeed: mixSeed(seed, caseIndex),
+            ops,
+            target,
+            errorKind: 'internal-error',
+            message: `internal error diagnostic ${INTERNAL_ERROR}: ${internal?.message ?? ''}`,
+            mutatedSource: text,
+          });
+        } else if (outcome === 'diagnostics') {
+          summary.diagnosticsFound += 1;
+        } else {
+          summary.clean += 1;
+        }
       } catch (error) {
         const classified = classifyThrow(error);
         summary.crashes.push({
