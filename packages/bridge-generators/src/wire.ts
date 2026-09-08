@@ -52,6 +52,7 @@ export const RPC_ERROR_STATUS: Readonly<Record<string, number>> = {
   method_not_allowed: 405,
   already_exists: 409,
   failed_precondition: 412,
+  payload_too_large: 413,
   resource_exhausted: 429,
   unimplemented: 501,
   internal: 500,

@@ -134,8 +134,10 @@ function javaDoc(
 ): string | undefined {
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return undefined;
+  // `*/` inside a doc line would terminate the Javadoc block early (issue #45).
+  const safe = lines.map((line) => line.replace(/\*\//g, '*\\/'));
   const out = [`${indent}/**`];
-  for (const line of lines) out.push(`${indent} * ${line}`.trimEnd());
+  for (const line of safe) out.push(`${indent} * ${line}`.trimEnd());
   out.push(`${indent} */`);
   return out.join('\n');
 }
@@ -199,6 +201,7 @@ function serializeLeafExpr(ref: TypeRef, value: string, input: GeneratorInput): 
   switch (ref.kind) {
     case 'primitive':
       if (ref.primitive === 'bytes') return `Base64.getEncoder().encodeToString(${value})`;
+      if (ref.primitive === 'uint64') return `Long.toUnsignedString(${value})`;
       return value;
     case 'named': {
       const aliasTarget = input.render.aliasTargets?.get(ref.name);
@@ -639,7 +642,13 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('            try {');
   lines.push('                return Long.parseLong(num);');
   lines.push('            } catch (NumberFormatException exc) {');
-  lines.push('                return Double.parseDouble(num);');
+  lines.push('                // Out-of-long-range integers (e.g. uint64 > 2^63-1) keep');
+  lines.push('                // full precision as BigInteger, never clamping via double.');
+  lines.push('                try {');
+  lines.push('                    return new java.math.BigInteger(num);');
+  lines.push('                } catch (NumberFormatException ignored) {');
+  lines.push('                    return Double.parseDouble(num);');
+  lines.push('                }');
   lines.push('            }');
   lines.push('        }');
   lines.push('    }');
@@ -760,6 +769,10 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('    /** Extracts an integer value; integral doubles are accepted. */');
   lines.push('    public static Long expectLong(Object raw, String ctx) {');
   lines.push('        if (raw instanceof Long l) { return l; }');
+  lines.push('        if (raw instanceof java.math.BigInteger bi) {');
+  lines.push('            if (bi.bitLength() <= 63) { return bi.longValue(); }');
+  lines.push('            throw new IllegalArgumentException(ctx + ": integer out of 64-bit range");');
+  lines.push('        }');
   lines.push('        if (raw instanceof Number n) {');
   lines.push('            double d = n.doubleValue();');
   lines.push('            if (d == Math.rint(d) && !Double.isInfinite(d)) { return (long) d; }');
@@ -784,6 +797,10 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('');
   lines.push('    /** Extracts an unsigned integer value (rejects negatives). */');
   lines.push('    public static Long expectUnsigned(Object raw, String ctx) {');
+  lines.push('        if (raw instanceof java.math.BigInteger bi) {');
+  lines.push('            if (bi.signum() >= 0 && bi.bitLength() <= 64) { return bi.longValue(); }');
+  lines.push('            throw new IllegalArgumentException(ctx + ": expected unsigned 64-bit integer");');
+  lines.push('        }');
   lines.push('        Long l = expectLong(raw, ctx);');
   lines.push('        if (l < 0) {');
   lines.push('            throw new IllegalArgumentException(ctx + ": expected unsigned integer");');
@@ -1407,15 +1424,15 @@ function javaConstraintCheck(
         `${pad}}`,
       ];
     case 'email':
-      return [`${pad}if (!EMAIL_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!EMAIL_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'url':
-      return [`${pad}if (!URL_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!URL_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'uuid':
-      return [`${pad}if (!UUID_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!UUID_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'pattern': {
       if (arg === undefined) return undefined;
       const constant = `P_${pascal(className)}_${pascal(field.name)}`;
-      return [`${pad}if (!${constant}.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!${constant}.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     }
     default:
       return undefined;
@@ -1753,7 +1770,12 @@ function serviceServerFile(
   lines.push('            return;');
   lines.push('        }');
   lines.push('        String method = path.substring(prefix.length());');
-  lines.push('        byte[] body = exchange.getRequestBody().readAllBytes();');
+  lines.push('        // DoS guard: cap the decoded body size before buffering it (issue #45).');
+  lines.push('        byte[] body = readBodyCapped(exchange);');
+  lines.push('        if (body == null) {');
+  lines.push('            respondError(exchange, "payload_too_large");');
+  lines.push('            return;');
+  lines.push('        }');
   lines.push('        Object parsed;');
   lines.push('        try {');
   lines.push('            parsed = BridgeJson.parse(new String(body, StandardCharsets.UTF_8));');
@@ -1812,6 +1834,19 @@ function serviceServerFile(
   lines.push('        payload.put("code", code);');
   lines.push('        payload.put("message", "bridge error: " + code);');
   lines.push('        respondJson(exchange, statusFor(code), BridgeJson.encode(payload));');
+  lines.push('    }');
+  lines.push('');
+  lines.push('    /** DoS guard: maximum request body size decoded by generated servers. */');
+  lines.push('    static final int MAX_BODY_BYTES = 1 << 20;');
+  lines.push('');
+  lines.push('    /** Reads the request body, or returns null when it exceeds {@link #MAX_BODY_BYTES}. */');
+  lines.push('    private static byte[] readBodyCapped(HttpExchange exchange) throws IOException {');
+  lines.push('        java.io.InputStream in = exchange.getRequestBody();');
+  lines.push('        byte[] buffer = in.readNBytes(MAX_BODY_BYTES + 1);');
+  lines.push('        if (buffer.length > MAX_BODY_BYTES) {');
+  lines.push('            return null;');
+  lines.push('        }');
+  lines.push('        return buffer;');
   lines.push('    }');
   lines.push('');
   lines.push('    /** Canonical Bridge error-code to HTTP-status mapping. */');

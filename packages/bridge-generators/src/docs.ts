@@ -45,12 +45,17 @@ export function rustDoc(docs: string | undefined, deprecated?: string | true): s
   return lines.map((line) => `/// ${line}`).join('\n');
 }
 
+/** Escapes text destined for a `*`+`/`-terminated block comment (JSDoc/Javadoc). */
+function escapeBlockComment(text: string): string {
+  return text.split('*/').join('*\\/');
+}
+
 /** TS JSDoc block. Empty docs -> empty string. */
 export function tsDoc(docs: string | undefined, deprecated?: string | true): string {
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return '';
-  if (lines.length === 1) return `/** ${lines[0]} */`;
-  const body = lines.map((line) => ` * ${line}`).join('\n');
+  if (lines.length === 1) return `/** ${escapeBlockComment(lines[0] ?? '')} */`;
+  const body = lines.map((line) => ` * ${escapeBlockComment(line)}`).join('\n');
   return `/**\n${body}\n */`;
 }
 
@@ -66,8 +71,10 @@ export function pythonDocstring(
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return undefined;
   const pad = ' '.repeat(indent);
-  if (lines.length === 1) return `${pad}"""${lines[0]}"""`;
-  const body = lines.map((line) => `${pad}${line}`).join('\n');
+  // A triple quote inside a doc line would terminate the docstring early.
+  const safe = lines.map((line) => line.split('"""').join('\\"\\"\\"'));
+  if (safe.length === 1) return `${pad}"""${safe[0]}"""`;
+  const body = safe.map((line) => `${pad}${line}`).join('\n');
   return `${pad}"""\n${body}\n${pad}"""`;
 }
 

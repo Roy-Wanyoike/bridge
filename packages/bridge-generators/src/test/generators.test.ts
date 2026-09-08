@@ -527,3 +527,65 @@ test('adversarial: every language generates without throwing for all cases', () 
     assert.ok(files.length > 0, `no files generated for ${lang}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Generated-code hardening (issue #45).
+// ---------------------------------------------------------------------------
+
+test('hardening: generated servers cap request body size (413)', () => {
+  const go = advText('go');
+  assert.ok(/http\.MaxBytesReader\(w, r\.Body, bridgeMaxBodyBytes\)/.test(go), 'go body cap missing');
+  assert.ok(/payload_too_large/.test(go), 'go 413 code missing');
+  const java = advText('java');
+  assert.ok(/readBodyCapped\(exchange\)/.test(java), 'java body cap missing');
+  assert.ok(/MAX_BODY_BYTES = 1 << 20/.test(java), 'java cap constant missing');
+  const python = advText('python');
+  assert.ok(/BRIDGE_MAX_BODY_BYTES/.test(python), 'python body cap missing');
+  assert.ok(/payload_too_large/.test(python), 'python 413 code missing');
+  const rust = advText('rust');
+  assert.ok(/BRIDGE_MAX_BODY_BYTES/.test(rust), 'rust body cap missing');
+  assert.ok(/payload_too_large/.test(rust), 'rust 413 code missing');
+});
+
+test('hardening: payload_too_large maps to 413 in the canonical status table', () => {
+  const go = advText('go');
+  assert.ok(/case "payload_too_large":\n\t\treturn 413/.test(go), 'go status map missing 413');
+});
+
+test('hardening: rust clients accept the full 2xx range', () => {
+  assert.ok(/\(200\.\.300\)\.contains\(&status\)/.test(advText('rust')), 'rust 200-only check');
+});
+
+test('hardening: validation regexes use full-match semantics in every language', () => {
+  const java = generate(ir, { language: 'java' }).map((f) => f.content).join('\n');
+  assert.ok(/\.matcher\(.+\)\.matches\(\)/.test(java), 'java find() semantics');
+  assert.ok(!/\.matcher\(.+\)\.find\(\)/.test(java), 'java find() still emitted');
+  const python = generate(ir, { language: 'python' }).map((f) => f.content).join('\n');
+  assert.ok(/EMAIL_RE\.fullmatch/.test(python), 'python search() semantics');
+  assert.ok(!/re\.search\(/.test(python), 'python re.search still emitted');
+  const csharp = generate(ir, { language: 'csharp' }).map((f) => f.content).join('\n');
+  assert.ok(/\)\\\\z", RegexOptions\.Compiled\);/.test(csharp), 'csharp unanchored pattern');
+  assert.ok(!/new\("\[\^@\\\\s\]/.test(csharp), 'csharp email pattern not wrapped');
+});
+
+test('hardening: java uint64 keeps full range (BigInteger, no double clamp)', () => {
+  const java = generate(ir, { language: 'java' }).map((f) => f.content).join('\n');
+  assert.ok(/java\.math\.BigInteger\(num\)/.test(java), 'scanner clamp fallback missing');
+  assert.ok(!/catch \(NumberFormatException exc\) \{\n\s*return Double\.parseDouble/.test(java), 'double clamp fallback still present');
+  assert.ok(/Long\.toUnsignedString\(/.test(java), 'unsigned encoding missing');
+  assert.ok(/expected unsigned 64-bit integer/.test(java), 'range-checked decode missing');
+});
+
+test('hardening: doc comments cannot terminate blocks early', async () => {
+  const { tsDoc, pythonDocstring } = await import('../docs');
+  const js = tsDoc('closes */ here');
+  assert.ok(!/(?<!\*)\*/.test(js.replace(/^\/\*\*/, '')) ? true : !js.slice(3, -2).includes('*/'), 'jsdoc terminated early');
+  const py = pythonDocstring('says """hi"""');
+  assert.ok(py !== undefined && py.split('"""').length === 3, 'python docstring terminated early');
+});
+
+test('hardening: explicit JSON null does not bypass python field defaults', async () => {
+  const text = generate(ir, { language: 'python' }).map((f) => f.content).join('\n');
+  // The generated from_dict must route explicit null through the default.
+  assert.ok(/if raw is None:\n\s+raw = /.test(text), 'python null-vs-default parity missing');
+});

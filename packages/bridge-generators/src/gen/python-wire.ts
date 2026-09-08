@@ -380,6 +380,10 @@ function renderServiceServer(
     `    http.server. Malformed requests become 400 invalid_argument;`,
     `    BridgeRpcError maps code → status; anything else is 500."""`);
   lines.push(`    route_prefix = ${JSON.stringify(routePrefix)}`);
+  lines.push('    # DoS guard: maximum request body size decoded by generated servers.');
+  lines.push('    bridge_max_body_bytes = 1 << 20');
+  lines.push('');
+  lines.push('    BRIDGE_MAX_BODY_BYTES = bridge_max_body_bytes');
   lines.push('');
   lines.push('    class BridgeHandler(BaseHTTPRequestHandler):');
   lines.push('        """Routes POST <prefix><Method> to the handler implementation."""');
@@ -402,6 +406,10 @@ function renderServiceServer(
   lines.push('                return');
   lines.push('            method_name = path[len(route_prefix):]');
   lines.push('            length = int(self.headers.get("Content-Length") or 0)');
+  lines.push('            # DoS guard: reject oversized declared bodies before reading (issue #45).');
+  lines.push('            if length > BRIDGE_MAX_BODY_BYTES:');
+  lines.push('                self._send_bridge_error("payload_too_large", "request body exceeds the 1 MiB limit")');
+  lines.push('                return');
   lines.push('            raw = self.rfile.read(length) if length > 0 else b""');
   lines.push('            try:');
   lines.push('                parsed = json.loads(raw.decode("utf-8"))');

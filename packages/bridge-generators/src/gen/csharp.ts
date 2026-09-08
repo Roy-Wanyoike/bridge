@@ -809,15 +809,15 @@ function csharpValidationFile(input: GeneratorInput): GeneratedFile | undefined 
   lines.push('public static class BridgeValidation');
   lines.push('{');
   if (needsRegex) {
-    lines.push('    private static readonly Regex EmailPattern = new("[^@\\\\s]+@[^@\\\\s]+\\\\.[^@\\\\s]+", RegexOptions.Compiled);');
-    lines.push('    private static readonly Regex UrlPattern = new("https?://\\\\S+", RegexOptions.Compiled);');
+    lines.push('    private static readonly Regex EmailPattern = new("^(?:[^@\\\\s]+@[^@\\\\s]+\\\\.[^@\\\\s]+)\\\\z", RegexOptions.Compiled);');
+    lines.push('    private static readonly Regex UrlPattern = new("^(?:https?://\\\\S+)\\\\z", RegexOptions.Compiled);');
     lines.push('    private static readonly Regex UuidPattern = new("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", RegexOptions.Compiled);');
     for (const structType of allStructs) {
       for (const field of structType.fields) {
         for (const constraint of field.constraints) {
           if (constraint.kind === 'pattern' && constraint.args[0] !== undefined) {
             const constant = `P${pascal(structType.name)}${pascal(field.name)}`;
-            lines.push(`    private static readonly Regex ${constant} = new(${JSON.stringify(constraint.args[0])}, RegexOptions.Compiled);`);
+            lines.push(`    private static readonly Regex ${constant} = new("^(?:" + ${JSON.stringify(constraint.args[0])} + ")\\\\z", RegexOptions.Compiled);`);
           }
         }
       }

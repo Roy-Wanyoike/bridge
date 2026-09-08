@@ -187,26 +187,26 @@ function renderConstraintCheck(
     }
     case 'email': {
       return [
-        `    if not EMAIL_RE.search(${accessor}):`,
+        `    if not EMAIL_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'url': {
       return [
-        `    if not URL_RE.search(${accessor}):`,
+        `    if not URL_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'uuid': {
       return [
-        `    if not UUID_RE.search(${accessor}):`,
+        `    if not UUID_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'pattern': {
       if (arg === undefined) return undefined;
       return [
-        `    if not re.search(${JSON.stringify(arg)}, ${accessor}):`,
+        `    if not re.fullmatch(${JSON.stringify(arg)}, ${accessor}):`,
         `        ${fail}`,
       ];
     }
@@ -456,7 +456,11 @@ function renderStruct(
     if (field.optional || field.default !== undefined) {
       const defExpr = dataclassDefault(field, input);
       const fallback = field.optional ? 'None' : (defExpr ?? 'None');
-      lines.push(`        raw = data.get(${key}, ${fallback})`);
+      // Explicit JSON null behaves like a missing key (parity with the Java
+      // and C# decoders): it must not smuggle None past a field default.
+      lines.push(`        raw = data.get(${key})`);
+      lines.push(`        if raw is None:`);
+      lines.push(`            raw = ${fallback}`);
       lines.push(`        ${pyField(field)} = ${deserializeExpr(field.type, 'raw', input, true)}`);
     } else {
       lines.push(`        if data.get(${key}) is None:`);
