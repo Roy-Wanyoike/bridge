@@ -13,8 +13,13 @@
  *  - maps: major 5, definite length, string keys only, keys sorted by UTF-8
  *    bytes (NB: plain bytewise order, not RFC 8949 §4.2 canonical
  *    length-first order — one order across all three formats)
- *  - tags: only tag 1 (epoch date). Content is the epoch as a binary64
- *    float: 0xc1 0xfb <8-byte IEEE-754>. Other tags are a decode error.
+ *  - tags: only tag 1 (epoch date). Canonical content: an integer epoch
+ *    (minimal-length major 0/1) when the nanosecond offset is zero — exact
+ *    for the full int64-second range (RFC 8949 §3.4.2 preferred form) —
+ *    otherwise 0xc1 0xfb <8-byte IEEE-754 binary64 epoch>. Decode is
+ *    symmetric: float epochs split with floor semantics so pre-1970
+ *    fractional timestamps round-trip (see timestampFromEpoch). Other tags
+ *    are a decode error.
  *  - simple values: false 0xf4, true 0xf5, null 0xf6
  *  - floats: always 0xfb (binary64) on encode; 0xf9/0xfa are decoded
  *    (widened) for interoperability. Non-finite floats are rejected.
@@ -146,6 +151,16 @@ class CborWriter {
 
   writeTimestamp(t: BridgeTimestamp): void {
     this.head(6, 1); // tag 1 (epoch date)
+    if (t.nanos === 0) {
+      // Integer epoch — RFC 8949 §3.4.2 preferred serialization. Exact for
+      // the full int64-second range (never passes through a float).
+      if (t.seconds >= 0) return this.head(0, t.seconds);
+      return this.head(1, -1n - t.seconds);
+    }
+    // Fractional seconds ride the binary64 epoch. Precision contract
+    // (docs/SERIALIZATION.md): the value is rounded to the nearest
+    // representable double — sub-µs nanos may be adjusted on decode. Decode
+    // is symmetric (floor-split), so pre-1970 values round-trip.
     const epoch = Number(t.seconds) + t.nanos / 1e9;
     const buf = this.reserve(9);
     buf[0] = 0xfb;
@@ -288,7 +303,10 @@ class CborReader {
       throw new Error(`cbor: unsupported tag ${tag} (only tag 1 epoch dates)`);
     }
     const content = this.readValue();
-    if (typeof content === 'number' && Number.isFinite(content)) {
+    if (typeof content === 'number') {
+      if (!Number.isFinite(content)) {
+        throw new Error('cbor: tag 1 content must be a finite epoch (NaN/±Inf rejected)');
+      }
       return timestampFromEpoch(content);
     }
     if (typeof content === 'bigint') {
@@ -321,13 +339,22 @@ class CborReader {
   }
 }
 
+/**
+ * Split a binary64 epoch into (seconds, nanos) with FLOOR semantics — the
+ * exact inverse of the fractional encoder above. Floor (not truncation) is
+ * what makes pre-1970 fractional timestamps round-trip: epoch -0.5 →
+ * seconds -1, nanos +500000000, mirroring the (seconds, nanos) pair the
+ * encoder started from. This matches the decoders of every reference
+ * runtime (Go's time.Unix normalization, Rust/Python floor-split hooks).
+ */
 function timestampFromEpoch(epoch: number): BridgeTimestamp {
-  const seconds = BigInt(Math.trunc(epoch));
-  let nanos = Math.round((epoch - Math.trunc(epoch)) * 1e9);
+  const floor = Math.floor(epoch);
+  let seconds = BigInt(floor);
+  let nanos = Math.round((epoch - floor) * 1e9);
   if (nanos === 1_000_000_000) {
     // rounding carried over (epoch like x.9999999999)
     nanos = 0;
-    return new BridgeTimestamp(seconds + 1n, nanos);
+    seconds += 1n;
   }
   return new BridgeTimestamp(seconds, nanos);
 }

@@ -36,8 +36,10 @@ function writeCanonical(value: BridgeValue): string {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') {
-    // ECMAScript Number::toString — shortest round-trip. NaN/±Infinity are
-    // not Bridge values; canonical JSON degrades them to null (documented).
+    // ECMAScript Number::toString — shortest round-trip. Negative zero keeps
+    // its sign ("-0") so the canonical text stays value-faithful. NaN/±Infinity
+    // are not Bridge values; canonical JSON degrades them to null (documented).
+    if (Object.is(value, -0)) return '-0';
     return JSON.stringify(value);
   }
   if (typeof value === 'string') return JSON.stringify(value);

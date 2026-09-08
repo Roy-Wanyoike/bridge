@@ -33,6 +33,40 @@ export const MIN_I64 = -(2n ** 63n);
 export const MAX_I64 = 2n ** 63n - 1n;
 export const MAX_U64 = 2n ** 64n - 1n;
 
+const SECS_PER_DAY = 86_400n;
+
+/** Hinnant's days_from_civil — proleptic Gregorian, exact for any year. */
+function daysFromCivil(y: number, m: number, d: number): number {
+  const yy = m <= 2 ? y - 1 : y;
+  const era = Math.floor(yy / 400);
+  const yoe = yy - era * 400; // [0, 399]
+  const mp = (m + 9) % 12; // March = 0
+  const doy = Math.floor((153 * mp + 2) / 5) + d - 1; // [0, 365]
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy; // [0, 146096]
+  return era * 146_097 + doe - 719_468;
+}
+
+/** Inverse of {@link daysFromCivil}. Day counts for int64-second timestamps stay below 2^53, so fixed-width numbers are exact. */
+function civilFromDays(z: number): { y: number; m: number; d: number } {
+  const zAdj = z + 719_468;
+  const era = Math.floor(zAdj / 146_097);
+  const doe = zAdj - era * 146_097; // [0, 146096]
+  const yoe = Math.floor(
+    (doe - Math.floor(doe / 1460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365,
+  ); // [0, 399]
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100)); // [0, 365]
+  const mp = Math.floor((5 * doy + 2) / 153); // [0, 11]
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1; // [1, 31]
+  const m = mp < 10 ? mp + 3 : mp - 9; // [1, 12]
+  return { y: m <= 2 ? y + 1 : y, m, d };
+}
+
+function daysInMonth(y: number, m: number): number {
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  return [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1] as number;
+}
+
 /** 64-bit Unix timestamp: whole seconds + non-negative nanosecond offset. */
 export class BridgeTimestamp {
   readonly seconds: bigint;
@@ -50,30 +84,87 @@ export class BridgeTimestamp {
     this.nanos = nanos;
   }
 
-  /** Build from an RFC 3339 string (e.g. `2024-06-04T17:00:00Z`). */
+  /**
+   * Build from an RFC 3339 string (e.g. `2024-06-04T17:00:00Z`).
+   *
+   * Parsed arithmetically (proleptic Gregorian, no `Date.parse`): the full
+   * int64-second range is accepted, years render with more (or fewer, signed)
+   * than four digits outside `0000`–`9999`, offsets `±HH:MM` are honored, and
+   * fractional seconds carry up to nanosecond (9-digit) precision exactly.
+   */
   static fromISO(iso: string): BridgeTimestamp {
-    const ms = Date.parse(iso);
-    if (Number.isNaN(ms)) {
+    const match =
+      /^(-?\d{4,})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/.exec(
+        iso,
+      );
+    if (!match) {
       throw new RangeError(`invalid RFC 3339 timestamp: ${iso}`);
     }
-    const wholeSeconds = Math.floor(ms / 1000);
-    const nanos = Math.round((ms - wholeSeconds * 1000) * 1_000_000);
-    return new BridgeTimestamp(BigInt(wholeSeconds), nanos);
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = Number(match[6]);
+    if (
+      month < 1 || month > 12 ||
+      day < 1 || day > daysInMonth(year, month) ||
+      hour > 23 || minute > 59 || second > 59
+    ) {
+      throw new RangeError(`invalid RFC 3339 timestamp: ${iso}`);
+    }
+    const frac = match[7];
+    if (frac !== undefined && frac.length > 9) {
+      throw new RangeError(`timestamp fraction exceeds nanosecond precision: ${iso}`);
+    }
+    const nanos = frac === undefined || frac === '' ? 0 : Number(frac) * 10 ** (9 - frac.length);
+    let seconds =
+      BigInt(daysFromCivil(year, month, day)) * SECS_PER_DAY +
+      BigInt(hour) * 3600n +
+      BigInt(minute) * 60n +
+      BigInt(second);
+    if (match[8] !== undefined) {
+      const offset =
+        BigInt(Number(match[9])) * 3600n + BigInt(Number(match[10])) * 60n;
+      seconds -= match[8] === '+' ? offset : -offset;
+    }
+    return new BridgeTimestamp(seconds, nanos);
   }
 
-  /** RFC 3339 in UTC. Fractional seconds are emitted only when non-zero. */
+  /**
+   * RFC 3339 in UTC, rendered arithmetically from (seconds, nanos) — exact
+   * over the whole int64-second domain (years beyond ±9999 render with
+   * expanded/signed digit groups). Fractional seconds are emitted only when
+   * non-zero, at full nanosecond precision. For negative seconds the offset
+   * normalizes onto the pre-epoch day (e.g. `-1s + 0.5s` →
+   * `1969-12-31T23:59:59.5Z`).
+   */
   toISO(): string {
-    const ms = Number(this.seconds) * 1000 + Math.floor(this.nanos / 1_000_000);
-    const base = new Date(ms).toISOString(); // e.g. 2024-06-04T17:00:00.000Z
-    const head = base.slice(0, 19); // 2024-06-04T17:00:00
-    const micros = Math.floor(this.nanos / 1000); // sub-ms precision loss-free up to micros
-    const frac = micros.toString().padStart(6, '0').replace(/0+$/, '');
-    return frac.length > 0 ? `${head}.${frac}Z` : `${head}Z`;
+    const days = floorDiv(this.seconds, SECS_PER_DAY);
+    const secsOfDay = Number(this.seconds - days * SECS_PER_DAY); // [0, 86399]
+    const { y, m, d } = civilFromDays(Number(days));
+    const year = y < 0 ? `-${String(-y).padStart(4, '0')}` : String(y).padStart(4, '0');
+    const head =
+      `${year}-${pad2(m)}-${pad2(d)}T${pad2(Math.floor(secsOfDay / 3600))}:` +
+      `${pad2(Math.floor(secsOfDay / 60) % 60)}:${pad2(secsOfDay % 60)}`;
+    if (this.nanos === 0) return `${head}Z`;
+    const frac = String(this.nanos).padStart(9, '0').replace(/0+$/, '');
+    return `${head}.${frac}Z`;
   }
 
   equals(other: BridgeTimestamp): boolean {
     return this.seconds === other.seconds && this.nanos === other.nanos;
   }
+}
+
+function floorDiv(a: bigint, b: bigint): bigint {
+  const q = a / b;
+  const r = a % b;
+  return r < 0n ? q - 1n : q;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
 }
 
 /**

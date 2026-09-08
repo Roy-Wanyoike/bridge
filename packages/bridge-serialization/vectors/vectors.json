@@ -201,6 +201,46 @@
       "cbor": "fb7e37e43c8800759c"
     },
     {
+      "id": "float_neg_zero",
+      "model": {
+        "t": "f64",
+        "v": "-0.0"
+      },
+      "json": "-0",
+      "msgpack": "cb8000000000000000",
+      "cbor": "fb8000000000000000"
+    },
+    {
+      "id": "float_smallest_subnormal",
+      "model": {
+        "t": "f64",
+        "v": 5e-324
+      },
+      "json": "5e-324",
+      "msgpack": "cb0000000000000001",
+      "cbor": "fb0000000000000001"
+    },
+    {
+      "id": "float_subnormal",
+      "model": {
+        "t": "f64",
+        "v": 2.5e-310
+      },
+      "json": "2.5e-310",
+      "msgpack": "cb00002e055c9a3f6c",
+      "cbor": "fb00002e055c9a3f6c"
+    },
+    {
+      "id": "float_max",
+      "model": {
+        "t": "f64",
+        "v": 1.7976931348623157e+308
+      },
+      "json": "1.7976931348623157e+308",
+      "msgpack": "cb7fefffffffffffff",
+      "cbor": "fb7fefffffffffffff"
+    },
+    {
       "id": "string_empty",
       "model": {
         "t": "str",
@@ -288,7 +328,7 @@
       },
       "json": "\"2024-06-04T15:40:00Z\"",
       "msgpack": "c70cff0000000000000000665f3550",
-      "cbor": "c1fb41d997cd54000000"
+      "cbor": "c11a665f3550"
     },
     {
       "id": "timestamp_nanos",
@@ -308,7 +348,67 @@
       },
       "json": "\"1970-01-01T00:00:00Z\"",
       "msgpack": "c70cff000000000000000000000000",
-      "cbor": "c1fb0000000000000000"
+      "cbor": "c100"
+    },
+    {
+      "id": "timestamp_pre1970_subsecond",
+      "model": {
+        "t": "timestamp",
+        "iso": "1969-12-31T23:59:59.5Z"
+      },
+      "json": "\"1969-12-31T23:59:59.5Z\"",
+      "msgpack": "c70cff1dcd6500ffffffffffffffff",
+      "cbor": "c1fbbfe0000000000000"
+    },
+    {
+      "id": "timestamp_pre1970_nano",
+      "model": {
+        "t": "timestamp",
+        "iso": "1969-12-31T23:59:59.000000001Z"
+      },
+      "json": "\"1969-12-31T23:59:59.000000001Z\"",
+      "msgpack": "c70cff00000001ffffffffffffffff",
+      "cbor": "c1fbbfefffffff768fa1"
+    },
+    {
+      "id": "timestamp_subms_epoch",
+      "model": {
+        "t": "timestamp",
+        "iso": "1970-01-01T00:00:00.000123456Z"
+      },
+      "json": "\"1970-01-01T00:00:00.000123456Z\"",
+      "msgpack": "c70cff0001e2400000000000000000",
+      "cbor": "c1fb3f202e7ef70994dd"
+    },
+    {
+      "id": "timestamp_subus_epoch",
+      "model": {
+        "t": "timestamp",
+        "iso": "1970-01-01T00:00:00.000000001Z"
+      },
+      "json": "\"1970-01-01T00:00:00.000000001Z\"",
+      "msgpack": "c70cff000000010000000000000000",
+      "cbor": "c1fb3e112e0be826d695"
+    },
+    {
+      "id": "timestamp_int64max_seconds",
+      "model": {
+        "t": "timestamp",
+        "iso": "292277026596-12-04T15:30:07Z"
+      },
+      "json": "\"292277026596-12-04T15:30:07Z\"",
+      "msgpack": "c70cff000000007fffffffffffffff",
+      "cbor": "c11b7fffffffffffffff"
+    },
+    {
+      "id": "timestamp_int64min_seconds",
+      "model": {
+        "t": "timestamp",
+        "iso": "-292277022657-01-27T08:29:52Z"
+      },
+      "json": "\"-292277022657-01-27T08:29:52Z\"",
+      "msgpack": "c70cff000000008000000000000000",
+      "cbor": "c13b7fffffffffffffff"
     },
     {
       "id": "array_empty",
@@ -524,7 +624,44 @@
       },
       "json": "{\"amount\":\"19.99\",\"big\":9007199254740993,\"created\":\"2024-06-04T17:00:00Z\",\"flag\":true,\"id\":\"pay_01\",\"meta\":{\"attempts\":2,\"retry\":false},\"ratio\":-0.5,\"receipt\":\"AAEC/w==\",\"tags\":[\"card\",\"recurring\"],\"voided_at\":null}",
       "msgpack": "8aa6616d6f756e74a531392e3939a3626967cf0020000000000001a763726561746564c70cff0000000000000000665f4810a4666c6167c3a26964a67061795f3031a46d65746182a8617474656d70747302a57265747279c2a5726174696fcbbfe0000000000000a772656365697074c404000102ffa47461677392a463617264a9726563757272696e67a9766f696465645f6174c0",
-      "cbor": "aa66616d6f756e746531392e3939636269671b00200000000000016763726561746564c1fb41d997d20400000064666c6167f5626964667061795f3031646d657461a268617474656d70747302657265747279f465726174696ffbbfe0000000000000677265636569707444000102ff647461677382646361726469726563757272696e6769766f696465645f6174f6"
+      "cbor": "aa66616d6f756e746531392e3939636269671b00200000000000016763726561746564c11a665f481064666c6167f5626964667061795f3031646d657461a268617474656d70747302657265747279f465726174696ffbbfe0000000000000677265636569707444000102ff647461677382646361726469726563757272696e6769766f696465645f6174f6"
+    }
+  ],
+  "rejects": [
+    {
+      "id": "reject_cbor_nan",
+      "format": "cbor",
+      "hex": "fb7ff8000000000000"
+    },
+    {
+      "id": "reject_cbor_inf",
+      "format": "cbor",
+      "hex": "fb7ff0000000000000"
+    },
+    {
+      "id": "reject_cbor_neg_inf",
+      "format": "cbor",
+      "hex": "fbfff0000000000000"
+    },
+    {
+      "id": "reject_cbor_tag1_bignum",
+      "format": "cbor",
+      "hex": "c1c201"
+    },
+    {
+      "id": "reject_msgpack_nan",
+      "format": "msgpack",
+      "hex": "cb7ff8000000000000"
+    },
+    {
+      "id": "reject_msgpack_inf",
+      "format": "msgpack",
+      "hex": "cb7ff0000000000000"
+    },
+    {
+      "id": "reject_msgpack_neg_inf",
+      "format": "msgpack",
+      "hex": "cbfff0000000000000"
     }
   ]
 }
