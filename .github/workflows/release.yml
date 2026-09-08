@@ -1,15 +1,22 @@
 name: Release
 
 # Triggered by pushing a semver tag (v<major>.<minor>.<patch>):
-#   1. builds self-contained CLI binaries for 5 platform targets
-#   2. generates SHA-256 checksums
-#   3. signs binaries (keyless cosign) and produces SPDX + CycloneDX SBOMs
-#   4. publishes a GitHub release with changelog from conventional commits
-#   5. builds and pushes multi-arch container images (ghcr.io) + signs them
-#   6. publishes the npm workspaces
+#   1. guard       — asserts version lockstep (tag == root package.json == every
+#                    workspace package == Homebrew formula); fails on drift
+#   2. binaries    — builds self-contained CLI binaries for 5 platform targets,
+#                    smoke-tests the native ones honestly (no `|| true`)
+#   3. checksums   — SHA-256 checksums, SPDX SBOM, keyless blob signing + SBOM
+#                    attestation of the checksums file
+#   4. gh-release  — GitHub release with a conventional-commit changelog
+#   5. container   — per-platform builds pushed by digest, merged into a TRUE
+#                    multi-arch manifest list (X.Y.Z, vX.Y.Z, latest), verified
+#                    with `docker buildx imagetools inspect`, signed by digest
+#   6. npm         — publishes the npm workspaces (dry-run + loud warning when
+#                    NPM_TOKEN is absent; hard failure on real publish errors)
 #
 # Prerequisites (one-time, repo settings): allow OIDC for cosign keyless
-# signing; set NPM_TOKEN secret for the publish job.
+# signing; set NPM_TOKEN secret for the publish job (without it the npm job
+# runs a dry-run and publishes nothing).
 
 on:
   push:
@@ -29,8 +36,50 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  guard:
+    name: Version guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert tag/version lockstep
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '${TAG}' is not of the form vX.Y.Z"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          fail=0
+
+          root_version="$(node -p "require('./package.json').version")"
+          if [ "$root_version" != "$VERSION" ]; then
+            echo "::error::Root package.json version is ${root_version}, but the tag is ${VERSION}. Unify versions (RELEASE.md checklist) before tagging."
+            fail=1
+          fi
+
+          for f in packages/*/package.json; do
+            v="$(node -p "require('./$f').version")"
+            if [ "$v" != "$VERSION" ]; then
+              echo "::error::$f version is ${v}, but the tag is ${VERSION}. Unify versions (RELEASE.md checklist) before tagging."
+              fail=1
+            fi
+          done
+
+          formula_version="$(sed -n 's/^[[:space:]]*version[[:space:]]*"\([^"]*\)".*/\1/p' homebrew/bridge.rb)"
+          if [ "$formula_version" != "$VERSION" ]; then
+            echo "::error::homebrew/bridge.rb version is ${formula_version:-<unset>}, but the tag is ${VERSION}. Bump the formula as part of the release checklist (RELEASE.md)."
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Version drift detected — release aborted, see the ::error:: lines above."
+          fi
+          exit "$fail"
+
   binaries:
     name: Binaries (${{ matrix.os-label }})
+    needs: guard
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: true
@@ -67,9 +116,19 @@ jobs:
             packages/bridge-cli/src/bin/bridge.ts \
             --outfile "dist/release/bridge-v${VERSION}-${{ matrix.os-label }}${{ matrix.ext }}"
 
+      # Honest smoke test: invoke the built binary directly via glob (the
+      # artifact name is deterministic: bridge-v<version>-<os-label><ext>).
+      # The old condition compared os-label against the literal string
+      # 'darwin-*' (no glob expansion in GHA expressions — a no-op) and
+      # masked every failure with `|| true`.
+      # Exclusions: darwin via runner.os (per release design); linux-arm64
+      # because no arm64 runner exists to execute the cross-compiled binary;
+      # windows-amd64 explicitly, because it is CROSS-COMPILED on an ubuntu
+      # runner (see matrix runs-on), so `runner.os != 'Windows'` alone would
+      # not exclude it — running a PE on Linux must not fail the release.
       - name: Smoke test the binary
-        if: matrix.os-label != 'windows-amd64' && matrix.os-label != 'linux-arm64' && matrix.os-label != 'darwin-*'
-        run: dist/release/bridge-$(basename dist/release/bridge-* | head -1 | sed 's/^bridge-//;s/\..*//')* version || true
+        if: runner.os != 'Windows' && runner.os != 'macOS' && matrix.os-label != 'linux-arm64' && matrix.os-label != 'windows-amd64'
+        run: dist/release/bridge-v*-${{ matrix.os-label }}${{ matrix.ext }} version
 
       - uses: actions/upload-artifact@v4
         with:
@@ -95,25 +154,48 @@ jobs:
           sha256sum bridge-* > checksums-sha256.txt
           cat checksums-sha256.txt
 
-      - name: SBOM (SPDX + CycloneDX) for the release artifacts
+      - name: SPDX SBOM for the release artifacts
         uses: anchore/sbom-action@v0
         with:
           path: dist/release
           format: spdx-json
+          output-file: dist/release/bridge-sbom.spdx.json
           artifact-name: bridge-sbom.spdx.json
+          # Uploaded below via the `release-meta` artifact (the file is needed
+          # locally as the attestation predicate).
+          upload-artifact: false
+          upload-release-assets: false
 
-      - uses: anchore/sbom-action@v0
+      - name: CycloneDX SBOM for the release artifacts
+        uses: anchore/sbom-action@v0
         with:
           path: dist/release
           format: cyclonedx-json
           artifact-name: bridge-sbom.cyclonedx.json
 
-      - name: Sign binaries + checksums (keyless)
+      - name: Install cosign
         uses: sigstore/cosign-installer@v3
-      - run: |
+
+      - name: Sign binaries + checksums (keyless)
+        run: |
           for file in dist/release/bridge-* dist/release/checksums-sha256.txt; do
             cosign sign-blob --yes --output-signature "${file}.sig" "$file"
           done
+
+      # The SBOM covers the whole artifact directory (not per-binary), so we
+      # attest the checksums file — the release's root of trust — with the
+      # SPDX document as predicate. `--type spdxjson` (predicateType
+      # https://spdx.dev/Document) is the cosign-validated shape for an SPDX
+      # document; `--type slsaprovenance` would fail cosign's predicate
+      # validation (verified locally against cosign v2: it requires a
+      # `builder` field an SBOM does not carry).
+      - name: Attest the checksums file with the SPDX SBOM (keyless)
+        run: |
+          cosign attest-blob --yes \
+            --predicate dist/release/bridge-sbom.spdx.json \
+            --type spdxjson \
+            --output-attestation dist/release/checksums-sha256.txt.att \
+            dist/release/checksums-sha256.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -121,6 +203,8 @@ jobs:
           path: |
             dist/release/checksums-sha256.txt
             dist/release/*.sig
+            dist/release/bridge-sbom.spdx.json
+            dist/release/checksums-sha256.txt.att
 
   github-release:
     name: GitHub release
@@ -136,26 +220,30 @@ jobs:
           path: dist/release
           merge-multiple: true
 
+      # No continue-on-error: a cliff.toml/template failure must fail the
+      # release, not silently degrade the body. The `|| fallback` on the body
+      # only covers an EMPTY changelog (e.g. the first release, no previous
+      # tag to diff against).
       - name: Changelog from conventional commits
         id: changelog
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --latest --strip header
-        continue-on-error: true
 
       - uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.changelog.outputs.content || 'See commit history for changes.' }}
           files: |
-            dist/release/bridge-*
+            dist/release/bridge-v*
             dist/release/checksums-sha256.txt
             dist/release/*.sig
+            dist/release/checksums-sha256.txt.att
             dist/release/bridge-sbom.*.json
 
-  container:
-    name: Container image (${{ matrix.platform }})
-    needs: checksums-sbom-sign
+  container-build:
+    name: Container build (${{ matrix.platform }})
+    needs: guard
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
@@ -163,6 +251,15 @@ jobs:
         platform: [linux/amd64, linux/arm64]
     steps:
       - uses: actions/checkout@v4
+
+      # ghcr.io requires lowercase image names; `${{ github.repository }}`
+      # keeps the repo's display case (metadata-action used to lowercase it
+      # implicitly — with explicit `outputs:` we must do it ourselves).
+      - name: Prepare
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
 
       - uses: docker/setup-qemu-action@v3
 
@@ -177,29 +274,93 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+          images: ${{ env.IMAGE }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Sign the image (keyless)
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  container-merge:
+    name: Container manifest (multi-arch)
+    needs: container-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare
+        run: echo "IMAGE=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Single writer, sequential: assemble the manifest list from the
+      # per-platform digests exported by container-build. Tags emitted:
+      #   <X.Y.Z>, v<X.Y.Z>, latest
+      - name: Create the multi-arch manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:${GITHUB_REF_NAME#v}" \
+            -t "$IMAGE:v${GITHUB_REF_NAME#v}" \
+            -t "$IMAGE:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Verify both platforms are present in the manifest list
+        run: |
+          IMAGE_TAG="$IMAGE:v${GITHUB_REF_NAME#v}"
+          docker buildx imagetools inspect "$IMAGE_TAG" | tee "${RUNNER_TEMP}/inspect.txt"
+          for plat in linux/amd64 linux/arm64; do
+            grep -Eq "Platform:[[:space:]]+${plat}" "${RUNNER_TEMP}/inspect.txt" || {
+              echo "::error::${plat} missing from ${IMAGE_TAG} manifest list"
+              exit 1
+            }
+          done
+          echo "Multi-arch manifest verified: ${IMAGE_TAG} (linux/amd64 + linux/arm64)"
+
+      # Sign the immutable digest, never a mutable tag: the manifest list we
+      # just created is assembled from the exported per-platform digests, and
+      # its index digest is resolved immediately after creation (single merge
+      # job — no sibling-writer race). `cosign verify …:<tag>` then resolves
+      # to this digest and finds the signature.
+      - name: Install cosign
         uses: sigstore/cosign-installer@v3
-      - run: |
-          DIGEST=$(docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GITHUB_REF_NAME#v} \
-            --format '{{json .Manifest.Digest}}' | tr -d '"')
-          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
-        continue-on-error: true
+
+      - name: Sign the manifest digest (keyless)
+        run: |
+          IMAGE_TAG="$IMAGE:v${GITHUB_REF_NAME#v}"
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "Signing ${IMAGE}@${DIGEST}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
   npm:
     name: Publish npm workspaces
@@ -214,11 +375,33 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci --no-audit --no-fund
       - run: npm run build
+
+      # Root build script completeness is fixed via PR #54; this assertion is
+      # the guard that refuses to ship empty tarballs regardless.
+      - name: Verify every published package has a dist/
+        run: |
+          fail=0
+          for pkg in bridge-core bridge-generators bridge-compat bridge-registry bridge-serialization bridge-cli; do
+            if [ ! -d "packages/$pkg/dist" ]; then
+              echo "::error::packages/$pkg/dist is missing after 'npm run build' — refusing to publish an empty tarball."
+              fail=1
+            fi
+          done
+          exit "$fail"
+
       - name: Publish @bridge/* (public)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          DRY_RUN=""
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning title=NPM_TOKEN is empty::Running 'npm publish --dry-run' ONLY — nothing will be published to npm. Set the NPM_TOKEN secret to publish for real."
+            DRY_RUN="--dry-run"
+          else
+            # Preflight: fail loudly on a missing/expired/unauthorized token.
+            npm whoami
+          fi
           for pkg in bridge-core bridge-generators bridge-compat bridge-registry bridge-serialization bridge-cli; do
-            (cd "packages/$pkg" && npm publish --access public) || echo "publish skipped for $pkg (already exists?)"
+            echo "== npm publish: packages/$pkg ${DRY_RUN}"
+            (cd "packages/$pkg" && npm publish --access public $DRY_RUN)
           done
-        continue-on-error: true
