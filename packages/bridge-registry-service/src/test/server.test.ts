@@ -303,6 +303,41 @@ test('audit endpoint requires admin and records publishes', async () => {
   });
 });
 
+test('audit reads are force-scoped to the principal org (issue #47)', async () => {
+  await withServer({}, async ({ url }) => {
+    // Two tenants publish; both events land in the shared audit backend.
+    const acmePublish = await request(url, 'PUT', '/v1/orgs/acme/projects/payments/contracts/payments.v1', {
+      token: WRITE,
+      body: { ir: makeIR() },
+    });
+    assert.equal(acmePublish.status, 201);
+    const otherPublish = await request(url, 'PUT', '/v1/orgs/other/projects/payments/contracts/payments.v1', {
+      token: 'other-write',
+      body: { ir: makeIR() },
+    });
+    assert.equal(otherPublish.status, 201);
+
+    // Explicit foreign org filter → 404 (no existence leak), never rows.
+    const foreign = await request(url, 'GET', '/v1/audit?org=other', { token: ADMIN });
+    assert.equal(foreign.status, 404);
+    assert.equal(foreign.json.error.code, 'not-found');
+
+    // No org filter → ONLY the caller's own org is returned (before the fix
+    // the driver returned every tenant's entries here).
+    const own = await request(url, 'GET', '/v1/audit?limit=10000', { token: ADMIN });
+    assert.equal(own.status, 200);
+    assert.ok(own.json.entries.length > 0);
+    for (const entry of own.json.entries) {
+      assert.equal(entry.org, 'acme', `audit row leaked a foreign org: ${JSON.stringify(entry.org)}`);
+    }
+
+    // An explicit own-org filter still works.
+    const explicitOwn = await request(url, 'GET', '/v1/audit?org=acme&limit=10000', { token: ADMIN });
+    assert.equal(explicitOwn.status, 200);
+    assert.ok(explicitOwn.json.entries.some((e: { action: string; status: number }) => e.action === 'publish'));
+  });
+});
+
 test('OIDC tokens authenticate over HTTP', async () => {
   const { mint, key } = generateSigningKey('RS256');
   await withServer(

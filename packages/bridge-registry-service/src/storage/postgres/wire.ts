@@ -326,6 +326,83 @@ export interface PgResult {
   command: string | null;
 }
 
+// ------------------------------------------------------------------- mutex
+
+/**
+ * FIFO promise-queue mutex.
+ *
+ * `run(fn)` executes `fn` exclusively; overlapping callers are queued and
+ * started in submission order, never interleaved. The PostgreSQL wire
+ * protocol is strictly request/response per connection — two interleaved
+ * exchanges on one socket let one caller consume the other's rows (possible
+ * cross-tenant delivery) and leave the other hanging forever — so every
+ * {@link PgClient} serializes its query traffic through one of these.
+ *
+ * When the transport dies mid-flight, {@link close} rejects every QUEUED
+ * (not yet started) waiter immediately and fails all future `run` calls:
+ * nothing may open a new exchange on a dead connection, and nothing waits
+ * forever behind it. The single actively-running section is failed by the
+ * socket handlers themselves (its own message waiter is rejected).
+ */
+export class Mutex {
+  private queue: Array<{ start: () => void; fail: (err: Error) => void }> = [];
+  private busy = false;
+  private closedError: Error | null = null;
+
+  /** Run `fn` in a critical section. FIFO order; never interleaved. */
+  public run<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      if (this.closedError !== null) {
+        reject(this.closedError);
+        return;
+      }
+      const entry: { start: () => void; fail: (err: Error) => void } = {
+        start: () => {
+          Promise.resolve()
+            .then(fn)
+            .then(resolve, reject)
+            .finally(() => this.release());
+        },
+        fail: (err) => reject(err),
+      };
+      this.queue.push(entry);
+      if (!this.busy) this.release(); // pump immediately when idle
+    });
+  }
+
+  /**
+   * Reject every queued (not yet started) waiter with `err` and fail all
+   * future `run` calls. Idempotent.
+   */
+  public close(err: Error): void {
+    if (this.closedError !== null) return;
+    this.closedError = err;
+    const queued = this.queue;
+    this.queue = [];
+    for (const entry of queued) entry.fail(err);
+  }
+
+  /** Number of queued (waiting, not running) entries. */
+  public get pending(): number {
+    return this.queue.length;
+  }
+
+  /** True once {@link close} has been called. */
+  public get isClosed(): boolean {
+    return this.closedError !== null;
+  }
+
+  private release(): void {
+    const next = this.queue.shift();
+    if (next === undefined) {
+      this.busy = false;
+      return;
+    }
+    this.busy = true;
+    next.start();
+  }
+}
+
 // ------------------------------------------------------------------- client
 
 const QUERY_TYPES: readonly string[] = ['1', '2', '3', 'C', 'D', 'E', 'I', 'K', 'N', 'n', 'R', 'S', 'T', 'v', 'Z'];
@@ -335,6 +412,13 @@ export class PgClient {
   private buffer: Buffer = Buffer.alloc(0);
   private waiter: { resolve: (msg: PgMessage) => void; reject: (err: Error) => void } | null = null;
   private closed = false;
+  /**
+   * Serializes query()/simpleQuery() per connection (issue #47): the wire
+   * protocol allows exactly one exchange in flight — concurrent callers
+   * would otherwise overwrite the single `waiter` slot, hang forever, or
+   * consume each other's rows.
+   */
+  private readonly mutex = new Mutex();
 
   private constructor(socket: Socket | TLSSocket) {
     this.socket = socket;
@@ -343,11 +427,16 @@ export class PgClient {
       this.pump();
     });
     socket.on('error', (err: Error) => {
+      // Fail the active exchange AND everything queued behind the mutex —
+      // no eternal hangs, no responses delivered after reconnect attempts.
       this.failWaiter(err);
+      this.mutex.close(new Error(`postgres: connection error: ${err.message}`));
     });
     socket.on('close', () => {
       this.closed = true;
-      this.failWaiter(new Error('postgres: connection closed'));
+      const err = new Error('postgres: connection closed');
+      this.failWaiter(err);
+      this.mutex.close(err);
     });
   }
 
@@ -469,9 +558,17 @@ export class PgClient {
   /**
    * Run one parameterized query (extended protocol). Values must be
    * string | number | boolean | null (converted to PostgreSQL text).
+   *
+   * Serialized per connection through the connection mutex: only one
+   * exchange is ever in flight, in FIFO call order.
    */
   public async query(sql: string, params: unknown[] = []): Promise<PgResult> {
     if (this.closed) throw new Error('postgres: connection is closed');
+    return this.mutex.run(() => this.queryOnce(sql, params));
+  }
+
+  /** Query body — only ever runs while holding the connection mutex. */
+  private async queryOnce(sql: string, params: unknown[]): Promise<PgResult> {
     const encoded: (string | null)[] = params.map((value) => {
       if (value === null || value === undefined) return null;
       if (typeof value === 'string') return value;
@@ -558,9 +655,16 @@ export class PgClient {
    * Run one simple-protocol query (multi-statement SQL allowed; no
    * parameters). Returns the LAST statement's result — sufficient for
    * migrations and transaction control (BEGIN/COMMIT/ROLLBACK).
+   *
+   * Serialized per connection through the connection mutex.
    */
   public async simpleQuery(sql: string): Promise<PgResult> {
     if (this.closed) throw new Error('postgres: connection is closed');
+    return this.mutex.run(() => this.simpleQueryOnce(sql));
+  }
+
+  /** Simple-query body — only ever runs while holding the connection mutex. */
+  private async simpleQueryOnce(sql: string): Promise<PgResult> {
     this.socket.write(encodeSimpleQuery(sql));
 
     const columns: string[] = [];
