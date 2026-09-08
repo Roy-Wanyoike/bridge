@@ -50,8 +50,10 @@ export { TokenBucketLimiter } from './ratelimit';
 export type { RateLimitDecision, RateLimitTier } from './ratelimit';
 export {
   KEY_ID_HEADER,
+  MAX_CANONICAL_DEPTH,
   SIGNATURE_HEADER,
   assertContentHash,
+  effectiveSigningMode,
   parseSignatureHeaders,
   verifyPublishSignature,
 } from './signing';
@@ -65,7 +67,14 @@ export {
   validateIRPackage,
 } from './validation';
 export { InMemoryDriver } from './storage/memory';
-export { PostgresDriver } from './storage/postgres/driver';
+export {
+  MIGRATION_ADVISORY_LOCK_KEY,
+  MIGRATION_ADVISORY_LOCK_SQL,
+  MIGRATION_ADVISORY_UNLOCK_SQL,
+  PostgresDriver,
+} from './storage/postgres/driver';
+export type { PostgresDriverOptions } from './storage/postgres/driver';
+export { Mutex } from './storage/postgres/wire';
 export type {
   AccessLevel,
   AuditBackend,

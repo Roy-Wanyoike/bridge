@@ -48,24 +48,58 @@ export interface PostgresDriverOptions {
   /** Migrations directory. Defaults to the package `migrations/` folder. */
   migrationsDir?: string;
   connectionTimeoutMs?: number;
+  /**
+   * Audit retention in days (issue #48): `bridge_audit` rows older than the
+   * cutoff are deleted at boot and then swept every {@link RETENTION_SWEEP_INTERVAL_MS}.
+   * `undefined` disables pruning (the table grows unbounded — not recommended
+   * for long-lived deployments).
+   */
+  auditRetentionDays?: number;
 }
+
+/** How often the retention sweep re-runs while the process is up. */
+export const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Advisory-lock key around the migration runner (issue #48): 'brid' as a
+ * 32-bit int (0x62726964). Two instances booting against the same database
+ * serialize instead of racing their DDL.
+ */
+export const MIGRATION_ADVISORY_LOCK_KEY = 0x6272_6964;
+export const MIGRATION_ADVISORY_LOCK_SQL = `SELECT pg_advisory_lock(${MIGRATION_ADVISORY_LOCK_KEY})`;
+export const MIGRATION_ADVISORY_UNLOCK_SQL = `SELECT pg_advisory_unlock(${MIGRATION_ADVISORY_LOCK_KEY})`;
 
 export class PostgresDriver implements StorageDriver {
   public readonly kind = 'postgres' as const;
   private readonly connectOptions: PgConnectOptions;
   private readonly migrationsDir: string;
+  private readonly auditRetentionDays: number | undefined;
   private client: PgClient | null = null;
   private connecting: Promise<PgClient> | null = null;
+  private retentionTimer: NodeJS.Timeout | null = null;
 
   public constructor(opts: PostgresDriverOptions = {}) {
     if (opts.dsn !== undefined) {
-      this.connectOptions = { ...parseDsn(opts.dsn), connectionTimeoutMs: opts.connectionTimeoutMs };
+      const parsed = parseDsn(opts.dsn);
+      if (parsed.sslDefaulted) {
+        console.warn(
+          '[bridge-registry-service] PG_DSN has no sslmode; defaulting to sslmode=prefer ' +
+            '(TLS when the server supports it). Set sslmode=require for production.',
+        );
+      }
+      this.connectOptions = { ...parsed, connectionTimeoutMs: opts.connectionTimeoutMs };
     } else if (opts.options !== undefined) {
       this.connectOptions = { ...opts.options, connectionTimeoutMs: opts.connectionTimeoutMs };
     } else {
       throw new TypeError('PostgresDriver: dsn or options is required');
     }
     this.migrationsDir = opts.migrationsDir ?? resolve(__dirname, '..', '..', '..', 'migrations');
+    if (opts.auditRetentionDays !== undefined) {
+      if (!Number.isInteger(opts.auditRetentionDays) || opts.auditRetentionDays < 1) {
+        throw new TypeError('PostgresDriver: auditRetentionDays must be an integer >= 1');
+      }
+    }
+    this.auditRetentionDays = opts.auditRetentionDays;
   }
 
   /** Lazily open (or reuse) the single connection used by the driver. */
@@ -93,6 +127,41 @@ export class PostgresDriver implements StorageDriver {
   /** Apply any unapplied `migrations/*.sql` files, each in its own transaction. */
   public async init(): Promise<void> {
     const client = await this.conn();
+    // Advisory lock (issue #48): serialize concurrent boots against the same
+    // database so two instances cannot race the DDL. The lock is session-
+    // scoped and released in `finally` (a dead connection releases it too).
+    await client.query(MIGRATION_ADVISORY_LOCK_SQL);
+    try {
+      await this.runMigrations(client);
+    } finally {
+      try {
+        await client.query(MIGRATION_ADVISORY_UNLOCK_SQL);
+      } catch {
+        /* connection may already be gone — session locks die with it */
+      }
+    }
+    if (this.auditRetentionDays !== undefined) {
+      // Retention (issue #48): a first sweep right after boot, then a
+      // periodic one for long-lived processes. Never fails the boot.
+      try {
+        const deleted = await this.pruneAudit();
+        if (deleted > 0) console.log(`[bridge-registry-service] audit retention: pruned ${deleted} row(s) older than ${this.auditRetentionDays}d`);
+      } catch (err) {
+        console.error(`[bridge-registry-service] audit retention sweep failed: ${(err as Error).message}`);
+      }
+      if (this.retentionTimer === null) {
+        this.retentionTimer = setInterval(() => {
+          this.pruneAudit().catch((err: unknown) => {
+            console.error(`[bridge-registry-service] audit retention sweep failed: ${(err as Error).message}`);
+          });
+        }, RETENTION_SWEEP_INTERVAL_MS);
+        this.retentionTimer.unref();
+      }
+    }
+  }
+
+  /** Migration body; caller holds the advisory lock. */
+  private async runMigrations(client: PgClient): Promise<void> {
     await client.simpleQuery(
       'CREATE TABLE IF NOT EXISTS bridge_schema_migrations (' +
         'name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())',
@@ -122,11 +191,32 @@ export class PostgresDriver implements StorageDriver {
   }
 
   public async close(): Promise<void> {
+    if (this.retentionTimer !== null) {
+      clearInterval(this.retentionTimer);
+      this.retentionTimer = null;
+    }
     if (this.client !== null) {
       const client = this.client;
       this.client = null;
       await client.close();
     }
+  }
+
+  /**
+   * Delete audit rows older than `auditRetentionDays` (issue #48 retention).
+   * Returns the number of rows deleted. Throws when no retention window is
+   * configured.
+   */
+  public async pruneAudit(): Promise<number> {
+    if (this.auditRetentionDays === undefined) {
+      throw new TypeError('PostgresDriver: pruneAudit() requires auditRetentionDays to be configured');
+    }
+    const cutoff = new Date(Date.now() - this.auditRetentionDays * 86_400_000).toISOString();
+    const client = await this.conn();
+    // `time` is ISO-8601 UTC text — lexicographic comparison is chronological
+    // (see 0001_init.sql), same convention the audit query filters use.
+    const result = await client.query('DELETE FROM bridge_audit WHERE time < $1', [cutoff]);
+    return result.rowCount ?? 0;
   }
 
   // ----------------------------------------------------------------- publish
@@ -380,7 +470,13 @@ export class PostgresDriver implements StorageDriver {
     if (filter.actor !== undefined) add('actor = $?', filter.actor);
     if (filter.action !== undefined) add('action = $?', filter.action);
     if (filter.contract !== undefined) add('contract = $?', filter.contract);
-    if (filter.org !== undefined) add('org = $?', filter.org);
+    if (filter.org !== undefined) {
+      // Failed authentications (issue #48) are stored with org NULL (the
+      // tenant is unknowable before the credential resolves) and stay
+      // visible inside every org-scoped query as global security events.
+      // Mirrors the in-memory filter in audit.ts.
+      add("(org = $? OR (org IS NULL AND action = 'auth'))", filter.org);
+    }
     if (filter.project !== undefined) add('project = $?', filter.project);
     if (filter.from !== undefined) add('time >= $?', filter.from);
     if (filter.to !== undefined) add('time <= $?', filter.to);

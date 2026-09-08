@@ -28,12 +28,34 @@ const SIGNATURE_HEADER = 'x-bridge-signature';
 const KEY_ID_HEADER = 'x-bridge-key-id';
 const MAX_SIGNATURE_LENGTH = 512;
 const MAX_KEY_ID_LENGTH = 256;
+/**
+ * Max canonical-JSON nesting depth accepted while verifying a publish body
+ * (issue #48): `canonicalJson` recurses over the WHOLE body (including keys
+ * the publish flow otherwise ignores), so an unbounded ~10k-deep payload
+ * used to surface as `RangeError` → 500. A depth-capped document is a
+ * client error instead (400).
+ */
+export const MAX_CANONICAL_DEPTH = 512;
 
 export { SIGNATURE_HEADER, KEY_ID_HEADER };
 
 interface LoadedKeys {
   keys: Map<string, KeyObject>;
   mode: 'required' | 'optional';
+}
+
+/**
+ * Effective signing mode of a config: `'required'` only when at least one
+ * key is configured and `mode` is not explicitly `'optional'`. Used by the
+ * server for the loud boot warning when signing is silently optional
+ * (issue #48) — keep in lockstep with {@link loadKeys}.
+ */
+export function effectiveSigningMode(config: SigningConfig | undefined): 'required' | 'optional' {
+  const keys = config?.keys;
+  if (keys !== undefined && typeof keys === 'object' && Object.keys(keys).length > 0) {
+    return config!.mode ?? 'required';
+  }
+  return 'optional';
 }
 
 function loadKeys(config: SigningConfig | undefined): LoadedKeys {
@@ -134,7 +156,20 @@ export function verifyPublishSignature(
   if (key === undefined) {
     throw new ServiceError(401, 'invalid-signature', `unknown signing key id '${parsed.keyId}'`);
   }
-  const message = Buffer.from(canonicalJson(body), 'utf8');
+  let message: Buffer;
+  try {
+    message = Buffer.from(canonicalJson(body, MAX_CANONICAL_DEPTH), 'utf8');
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // issue #48: map unbounded-recursion DoS bodies to a client error.
+      throw new ServiceError(
+        400,
+        'invalid_argument',
+        `request body nesting exceeds the maximum supported canonical-JSON depth (${MAX_CANONICAL_DEPTH})`,
+      );
+    }
+    throw err;
+  }
   if (!cryptoVerify(null, message, key, parsed.signature)) {
     throw new ServiceError(
       401,

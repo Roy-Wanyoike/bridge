@@ -50,4 +50,33 @@ if (DSN === undefined) {
     const dependents = await driver.dependents('acme', 'payments', 'payments');
     if (dependents.length < 0) throw new Error('unreachable');
   });
+
+  test('postgres driver: audit retention prunes rows older than the window (issue #48)', async (t) => {
+    const driver = new PostgresDriver({ dsn, auditRetentionDays: 30 });
+    await driver.init();
+    t.after(() => driver.close());
+
+    const base = {
+      org: 'acme',
+      project: 'payments',
+      actor: 'ci',
+      action: 'publish',
+      contract: 'payments',
+      version: 'v1',
+      ok: true,
+      status: 201,
+      ip: '127.0.0.1',
+    };
+    await driver.appendAudit({
+      ...base,
+      time: new Date(Date.now() - 90 * 86_400_000).toISOString(),
+      actor: 'ancient',
+    });
+    await driver.appendAudit({ ...base, time: new Date().toISOString() });
+
+    const pruned = await driver.pruneAudit();
+    if (pruned < 1) throw new Error('retention sweep did not delete the ancient row');
+    const survivors = await driver.queryAudit({ actor: 'ancient' });
+    if (survivors.length !== 0) throw new Error('ancient row survived the retention sweep');
+  });
 }

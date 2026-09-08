@@ -56,7 +56,15 @@ export function applyAuditFilter(entries: readonly AuditEntry[], filter: AuditFi
     if (filter.actor !== undefined && entry.actor !== filter.actor) continue;
     if (filter.action !== undefined && entry.action !== filter.action) continue;
     if (filter.contract !== undefined && entry.contract !== filter.contract) continue;
-    if (filter.org !== undefined && entry.org !== filter.org) continue;
+    if (filter.org !== undefined && entry.org !== filter.org) {
+      // Failed authentications (issue #48) carry no tenant attribution yet —
+      // the org is genuinely unknowable before the credential resolves — so
+      // they are stored with `org: null` and action 'auth'. They are global
+      // security events and stay visible to every admin's org-scoped query;
+      // nothing about ANOTHER tenant is revealed (there is no tenant on the
+      // row to reveal).
+      if (!(entry.org === null && entry.action === 'auth')) continue;
+    }
     if (filter.project !== undefined && entry.project !== filter.project) continue;
     if (!inRange(entry.time, filter)) continue;
     out.push(entry);

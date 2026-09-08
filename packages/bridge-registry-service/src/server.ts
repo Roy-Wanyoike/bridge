@@ -24,18 +24,19 @@ import { hashPackage } from '@bridge/core';
 import { diffPackages } from '@bridge/compat';
 import { RegistryError, splitPackageVersion } from '@bridge/registry';
 import { DriverAuditBackend, clampLimit } from './audit';
-import { createAuthenticator, requireLevel } from './auth';
+import { createAuthenticator, extractBearerToken, requireLevel } from './auth';
 import type { RequestAuthenticator } from './auth';
 import { Levels } from './auth';
 import { ServiceError, statusForRegistryError } from './errors';
 import { TokenBucketLimiter } from './ratelimit';
-import { assertContentHash, verifyPublishSignature } from './signing';
-import { assertContractName, isPlainObject, validateIRPackage } from './validation';
+import { MAX_CANONICAL_DEPTH, assertContentHash, effectiveSigningMode, verifyPublishSignature } from './signing';
+import { assertContractName, assertIsoTimestamp, isPlainObject, validateIRPackage } from './validation';
 import { openApiDocument } from './openapi';
 import type {
   AuditBackend,
   AuditEntry,
   ContractMeta,
+  Principal,
   PublishMeta,
   RegistryServiceOptions,
   StorageDriver,
@@ -53,7 +54,7 @@ interface Deps {
 }
 
 interface RequestContext {
-  /** Attempted operation; `null` for /healthz and unknown routes. */
+  /** Attempted operation; `null` for /healthz, openapi.json and unknown routes. */
   action: 'publish' | 'read' | 'search' | 'audit' | 'auth' | null;
   org: string | null;
   project: string | null;
@@ -62,6 +63,11 @@ interface RequestContext {
   /** Resolved version when known. */
   version: string | null;
   subject: string | null;
+  /**
+   * Audit hygiene (issue #48): `true` when the request must NOT be
+   * persisted to the audit log (pre-auth noise, rate-limited floods).
+   */
+  skipAudit: boolean;
 }
 
 // ---------------------------------------------------------------- factories
@@ -83,12 +89,39 @@ export function createServer(options: RegistryServiceOptions): Server {
     throw new TypeError('createServer: options.driver must be a StorageDriver');
   }
   const auth = createAuthenticator(options.auth);
-  const limiter = new TokenBucketLimiter(options.rateLimit ?? { enabled: false });
+  // Rate limiting defaults to ON with the conservative DEFAULTS buckets
+  // (issue #48 — matches "Defaults to on" in the option docs): a naive
+  // deployment must not ship unthrottled against token guessing and publish
+  // floods. Pass `{ enabled: false }` explicitly to opt out (tests).
+  const limiter = new TokenBucketLimiter(options.rateLimit ?? {});
+  if (options.rateLimit === undefined) {
+    console.log(
+      '[bridge-registry-service] rate limiting enabled by default ' +
+        '(auth bucket: 120 capacity @ 30/s per IP, publish: 30 @ 5/s per principal)',
+    );
+  }
+  // Loud boot warning when publishes are silently unsigned-accepted
+  // (issue #48): signing is only enforced when keys are configured AND mode
+  // is not explicitly 'optional'.
+  if (effectiveSigningMode(options.signing) === 'optional') {
+    console.warn(
+      '[bridge-registry-service] WARNING: artifact signing is NOT required — ' +
+        'unsigned publishes are accepted. Configure signing.keys (mode defaults to "required") ' +
+        'or start with --production-profile.',
+    );
+  }
   const audit: AuditBackend = options.audit ?? new DriverAuditBackend(driver);
   const deps: Deps = { driver, auth, limiter, audit, signing: options.signing };
-  return nodeCreateServer((req, res) => {
+  const server = nodeCreateServer((req, res) => {
     void handle(req, res, deps);
   });
+  // Explicit timeout hygiene (issue #48): Node's defaults are generous
+  // (300s request, 60s headers). keepAliveTimeout pins Node's 5s default so
+  // a runtime default change cannot silently loosen it.
+  server.headersTimeout = 15_000;
+  server.requestTimeout = 120_000;
+  server.keepAliveTimeout = 5_000;
+  return server;
 }
 
 /**
@@ -118,6 +151,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Pr
     contract: null,
     version: null,
     subject: null,
+    skipAudit: false,
   };
   res.on('error', () => {
     /* socket-level noise (client aborts) is not an application error */
@@ -127,10 +161,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Pr
     status = await routeRequest(req, res, ctx, deps);
   } catch (err) {
     status = sendError(res, err);
+    if (status === 413) {
+      // 413 ordering (issue #48): the envelope is written FIRST (above),
+      // the connection is destroyed only after it has flushed.
+      discardOversizedRequest(req, res);
+    }
   }
-  // One audit entry per /v1 request (success or failure). Audit failures
-  // are logged and never fail the response.
-  if (ctx.action !== null) {
+  // One audit entry per /v1 request (success or failure), except for the
+  // hygiene classes flagged in `ctx.skipAudit` (issue #48): rate-limited
+  // floods and requests that never presented usable credentials must not
+  // evict legitimate history from the ring. Audit failures are logged and
+  // never fail the response.
+  if (ctx.action !== null && !ctx.skipAudit) {
     const entry: AuditEntry = {
       time: startedAt.toISOString(),
       org: ctx.org,
@@ -182,14 +224,6 @@ async function routeRequest(
     throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
   }
 
-  // GET /v1/openapi.json — public API document (rate-limited, no auth).
-  if (segments.length === 2 && segments[1] === 'openapi.json') {
-    requireMethod(method, 'GET', '/v1/openapi.json');
-    ctx.action = 'read';
-    sendJson(res, 200, openApiDocument());
-    return 200;
-  }
-
   ctx.action = 'read';
   ctx.subject = null;
 
@@ -197,12 +231,43 @@ async function routeRequest(
   const ip = clientIp(req) ?? 'unknown';
   const authDecision = deps.limiter.take('auth', ip);
   if (!authDecision.ok) {
+    // Audit hygiene (issue #48): rate-limited requests are NOT persisted —
+    // an unauthenticated flood must not evict legitimate audit history.
+    ctx.skipAudit = true;
     res.setHeader('Retry-After', String(authDecision.retryAfterSeconds));
     throw new ServiceError(429, 'rate-limited', 'too many requests: slow down and retry');
   }
 
+  // GET /v1/openapi.json — static public API document, no auth. Served
+  // BELOW the limiter (issue #48: it used to bypass it, contradicting the
+  // old comment; static-doc floods must be throttled like any other /v1
+  // traffic). Not audited at all: it is static and pre-auth.
+  if (segments.length === 2 && segments[1] === 'openapi.json') {
+    requireMethod(method, 'GET', '/v1/openapi.json');
+    ctx.action = null;
+    sendJson(res, 200, openApiDocument());
+    return 200;
+  }
+
   // Authentication covers every remaining /v1 route.
-  const principal = await deps.auth.authenticate(req.headers.authorization);
+  let principal;
+  try {
+    principal = await deps.auth.authenticate(req.headers.authorization);
+  } catch (err) {
+    // Audit hygiene policy (issue #48), applied coherently:
+    // - Requests that never presented a well-formed bearer token (missing
+    //   header, wrong scheme, empty token) are PRE-AUTH noise — skipped,
+    //   because unauthenticated floods would otherwise evict the ring.
+    // - A well-formed bearer token that failed verification is a real
+    //   security event (possible credential misuse / probing) and IS
+    //   persisted, with action 'auth': authentication failed before any
+    //   route was selected, so the attempted operation is unknowable.
+    // - Authorization failures (403) after successful authn keep the
+    //   attempted operation as their action and stay recorded.
+    ctx.action = 'auth';
+    if (!hasWellFormedBearer(req.headers.authorization)) ctx.skipAudit = true;
+    throw err;
+  }
   ctx.subject = principal.subject;
   ctx.action = 'read';
 
@@ -221,9 +286,9 @@ async function routeRequest(
 
   // GET /v1/audit — admin-only, filterable, newest first.
   if (rest.length === 1 && rest[0] === 'audit') {
+    ctx.action = 'audit'; // attempted op first, so 403s record 'audit'
     requireMethod(method, 'GET', '/v1/audit');
     requireLevel(principal, Levels.admin);
-    ctx.action = 'audit';
     ctx.org = principal.org;
     // Tenancy (issue #47): audit reads are FORCE-SCOPED to the principal's
     // own org, mirroring /v1/search. The Principal model has no cross-org
@@ -244,8 +309,11 @@ async function routeRequest(
       actor: url.searchParams.get('actor') ?? undefined,
       action: url.searchParams.get('action') ?? undefined,
       contract: url.searchParams.get('contract') ?? undefined,
-      from: url.searchParams.get('from') ?? undefined,
-      to: url.searchParams.get('to') ?? undefined,
+      // Time bounds are validated (issue #48): they compare lexicographically
+      // against stored ISO-8601 strings, so garbage bounds silently matched
+      // nothing (or everything) before.
+      from: withIsoParam(url, 'from'),
+      to: withIsoParam(url, 'to'),
       limit: clampLimit(limitParam(url)),
     });
     sendJson(res, 200, { entries });
@@ -440,7 +508,7 @@ async function publish(
   }
   const ir = validated.ir;
 
-  const actualHash = hashPackage(ir);
+  const actualHash = hashWithDepthCap(ir);
   assertContentHash(body, actualHash);
 
   const { base, version: embedded } = splitPackageVersion(contract);
@@ -457,7 +525,7 @@ async function publish(
 
   const publishTime =
     typeof body['publishTime'] === 'string' && body['publishTime'].length > 0
-      ? body['publishTime']
+      ? assertIsoTimestamp(body['publishTime'], 'body.publishTime')
       : undefined;
 
   const result = await deps.driver.publish({
@@ -480,6 +548,59 @@ async function publish(
 
 function clientIp(req: IncomingMessage): string | null {
   return req.socket.remoteAddress ?? null;
+}
+
+/** True when the Authorization header carries a well-formed bearer token. */
+function hasWellFormedBearer(authorization: string | undefined): boolean {
+  try {
+    extractBearerToken(authorization);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Validated optional ISO-8601 query parameter (empty/absent → undefined). */
+function withIsoParam(url: URL, name: string): string | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.length === 0) return undefined;
+  return assertIsoTimestamp(raw, `audit.${name}`);
+}
+
+/**
+ * Re-hash the validated IR with the canonical-JSON depth cap (issue #48):
+ * the validator bounds IR shape, but the cap guarantees even a future
+ * validation gap cannot turn recursion into a 500.
+ */
+function hashWithDepthCap(ir: Parameters<typeof hashPackage>[0]): string {
+  try {
+    return hashPackage(ir, MAX_CANONICAL_DEPTH);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      throw new ServiceError(
+        400,
+        'invalid_argument',
+        `contract nesting exceeds the maximum supported canonical-JSON depth (${MAX_CANONICAL_DEPTH})`,
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * 413 follow-up (issue #48): discard the rest of the upload so the client
+ * can finish sending and read the envelope, then destroy the socket once
+ * the response has flushed. `sendError` has already written the envelope —
+ * the destroy strictly follows it.
+ */
+function discardOversizedRequest(req: IncomingMessage, res: ServerResponse): void {
+  const destroy = (): void => {
+    req.socket.destroy();
+  };
+  req.on('data', () => {}); // resume + discard the remaining upload
+  req.resume();
+  if (res.writableFinished) destroy();
+  else res.once('finish', destroy);
 }
 
 function limitParam(url: URL): number | undefined {
@@ -528,17 +649,34 @@ async function readRawBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let settled = false;
     req.on('data', (chunk: Buffer) => {
+      if (settled) return; // draining after a 413 decision — discard
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
+        settled = true;
+        chunks.length = 0;
+        // Do NOT destroy the socket here (issue #48): the 413 envelope must
+        // be written first. Pause consumption; `handle` discards the rest
+        // and destroys the connection after the response has flushed.
+        req.pause();
         reject(new ServiceError(413, 'payload-too-large', `request body exceeds ${MAX_BODY_BYTES} bytes`));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', (err) => reject(err));
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
   });
 }
 

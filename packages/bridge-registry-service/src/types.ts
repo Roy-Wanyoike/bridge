@@ -92,8 +92,10 @@ export interface JwksDocument {
  *
  * Keys come from `jwks` (static injection — tests, air-gapped deployments)
  * or are fetched from `jwksUrl` (default `<issuer>/.well-known/jwks.json`)
- * and cached per `kid` for `cacheTtlMs`. An unknown `kid` triggers one
- * immediate re-fetch per verification attempt.
+ * and cached per `kid` for `cacheTtlMs`. An unknown `kid` triggers a
+ * single-flight re-fetch (rate-limited); misses are negatively cached for a
+ * short TTL so repeated garbage tokens never cause per-request fetches
+ * (issue #48).
  */
 export interface OidcConfig {
   /** Expected `iss` claim (exact string match). */

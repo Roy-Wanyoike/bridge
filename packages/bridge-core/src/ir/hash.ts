@@ -13,20 +13,29 @@ import type { IRPackage } from './types';
  * order (IR contract guarantees semantic order), no insignificant
  * whitespace. Undefined properties are omitted.
  *
+ * ADDITIVE PARAMETER (registry-service security wave, issue #48 — this file
+ * is otherwise owned by the compiler wave): `maxDepth` bounds recursion so
+ * a hostile, deeply nested document throws `RangeError` instead of
+ * exhausting the stack. The default `Infinity` preserves the previous
+ * behavior byte for byte; compiler/hash callers pass nothing.
+ *
  * NOTE (core-compiler agent): the recovered scaffold returned the
  * intermediate canonicalized *object* here (with an `as string` cast), which
  * made `hashPackage` throw on every call. The `JSON.stringify` step is the
  * missing final encoding — this fix restores the documented contract and
  * does not change the digest format: SHA-256 of the UTF-8 canonical JSON.
  */
-export function canonicalJson(value: unknown): string {
-  return JSON.stringify(canonicalize(value));
+export function canonicalJson(value: unknown, maxDepth: number = Number.POSITIVE_INFINITY): string {
+  return JSON.stringify(canonicalize(value, 0, maxDepth));
 }
 
-function canonicalize(value: unknown): unknown {
+function canonicalize(value: unknown, depth: number, maxDepth: number): unknown {
+  if (depth > maxDepth) {
+    throw new RangeError(`canonicalJson: document nesting exceeds maxDepth ${maxDepth}`);
+  }
   if (value === null) return null;
   if (Array.isArray(value)) {
-    return value.map((item) => canonicalize(item));
+    return value.map((item) => canonicalize(item, depth + 1, maxDepth));
   }
   if (value instanceof Date) {
     return value.toISOString();
@@ -36,7 +45,7 @@ function canonicalize(value: unknown): unknown {
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       const v = (value as Record<string, unknown>)[key];
       if (v === undefined) continue;
-      out[key] = canonicalize(v);
+      out[key] = canonicalize(v, depth + 1, maxDepth);
     }
     return out;
   }
@@ -46,9 +55,12 @@ function canonicalize(value: unknown): unknown {
 /**
  * SHA-256 of the canonical JSON encoding of the package, hex-encoded.
  * Identical IR must always produce an identical digest.
+ *
+ * `maxDepth` mirrors {@link canonicalJson} (default `Infinity` — unchanged
+ * behavior; the registry service passes a cap for untrusted payloads).
  */
-export function hashPackage(ir: IRPackage): string {
-  return createHash('sha256').update(canonicalJson(ir), 'utf8').digest('hex');
+export function hashPackage(ir: IRPackage, maxDepth: number = Number.POSITIVE_INFINITY): string {
+  return createHash('sha256').update(canonicalJson(ir, maxDepth), 'utf8').digest('hex');
 }
 
 /** Short 12-char digest for display (`bridge inspect`, reports). */

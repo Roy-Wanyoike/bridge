@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPackage } from '@bridge/core';
 import { InMemoryDriver } from '../storage/memory';
+import { PostgresDriver } from '../storage/postgres/driver';
 import { TokenBucketLimiter } from '../ratelimit';
 import { makeFullIR, makeIR } from './helpers';
 import type { PublishInput } from '../types';
@@ -132,6 +133,15 @@ test('driver: audit entries append and query with filters', async () => {
   const byActor = await driver.queryAudit({ actor: 'nobody' });
   assert.equal(byActor.length, 0);
   await driver.close();
+});
+
+test('postgres driver: auditRetentionDays is validated eagerly, no connection (issue #48)', () => {
+  assert.throws(() => new PostgresDriver({ dsn: 'postgres://u:p@h/db', auditRetentionDays: 0 }), /auditRetentionDays/);
+  assert.throws(
+    () => new PostgresDriver({ dsn: 'postgres://u:p@h/db', auditRetentionDays: 1.5 }),
+    /auditRetentionDays/,
+  );
+  assert.doesNotThrow(() => new PostgresDriver({ dsn: 'postgres://u:p@h/db', auditRetentionDays: 30 }));
 });
 
 // ------------------------------------------------------------ rate limiter
