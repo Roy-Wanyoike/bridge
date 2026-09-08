@@ -1,40 +1,76 @@
 # Release engineering
 
 This document is the operator's manual for cutting a Bridge release. The
-process is fully automated by [`.github/workflows/release.yml`](.github/workflows/release.yml);
-a release is **one tag push**.
+process is automated by [`.github/workflows/release.yml`](.github/workflows/release.yml);
+a release is **one tag push** — but the pre-tag checklist below is mandatory,
+and the workflow's first job (`guard`) fails the release if it was skipped.
 
 ## Prerequisites (one-time)
 
 - GitHub Actions must be runnable on the account (⚠ see the billing note
   below — the workflows are complete but cannot execute until the account's
   Actions billing lock is lifted).
-- `NPM_TOKEN` secret set for npm publishing (the container/npm jobs fail
-  soft when artifacts already exist).
+- `NPM_TOKEN` secret set for npm publishing. Without it the publish job runs
+  `npm publish --dry-run` with a loud warning and **publishes nothing**; with
+  it, a bad or unauthorized token fails the job (`npm whoami` preflight) and
+  any publish error fails the release — nothing is masked.
 - OIDC enabled for keyless cosign signing (default on GitHub Actions).
 
-## Cutting a release
+## Release checklist (per release)
 
 1. Ensure `main` is green and the CHANGELOG reflects the release.
-2. Tag and push:
+2. **Version lockstep** (enforced by the `guard` job):
+   root `package.json` == every `packages/*/package.json` ==
+   `homebrew/bridge.rb` `version` == the tag (`vX.Y.Z`).
+3. Bump `homebrew/bridge.rb`: set `version "X.Y.Z"` and, once the release
+   binaries exist, replace the four `sha256 :no_check` placeholders with the
+   real per-target digests from that release's `checksums-sha256.txt`.
+   (No PAT is wired up for auto-committing the formula — this is a manual
+   checklist step, and the guard job asserts the version half of it.)
+4. Tag and push:
    ```bash
    git tag -a vX.Y.Z -m "Bridge vX.Y.Z"
    git push origin vX.Y.Z
    ```
-3. The workflow then:
+5. The workflow then:
+   - **guard**: asserts the version lockstep from step 2 (root, all workspace
+     packages, Homebrew formula vs the tag);
    - builds **self-contained CLI binaries** for linux/darwin × amd64/arm64
-     and windows/amd64 (`bun build --compile` over `@bridge/cli`), via
-     [scripts/package-release.mjs](scripts/package-release.mjs);
+     and windows/amd64 — the workflow inlines `bun build --compile` over
+     `@bridge/cli` (scripts/package-release.mjs mirrors the same artifact
+     layout for local runs; the workflow does not invoke it) — and honestly
+     smoke-tests the linux-amd64 binary (no `|| true`);
    - writes **SHA-256 checksums** (`checksums-sha256.txt`);
    - produces **SBOMs** (SPDX + CycloneDX) via syft;
-   - **signs** every binary and the checksum file (keyless cosign, `.sig` files);
+   - **signs** every binary and the checksum file (keyless cosign, `.sig`
+     files) and **attests** the checksums file with the SPDX SBOM as
+     predicate (`cosign attest-blob --type spdxjson`, DSSE bundle saved as
+     `checksums-sha256.txt.att`);
    - publishes a **GitHub release** with a conventional-commit changelog
-     (`cliff.toml`);
-   - builds and pushes **multi-arch container images**
-     (`ghcr.io/roy-wanyoike/bridge:<version>` and `:<major.minor>`), signs them;
+     (`cliff.toml`, rendered by git-cliff — a render failure fails the job;
+     the `|| fallback` in the body only covers an empty changelog, e.g. the
+     first release);
+   - builds **linux/amd64 + linux/arm64** container images, pushes each
+     **by digest**, then merges them into a **true multi-arch manifest list**
+     (standard buildx pattern) — verified in-workflow with
+     `docker buildx imagetools inspect` asserting both platforms;
+   - **signs the immutable manifest digest** (never a mutable tag);
    - **publishes the npm workspaces** (`@bridge/core`, `@bridge/generators`,
      `@bridge/compat`, `@bridge/registry`, `@bridge/serialization`,
-     `@bridge/cli`).
+     `@bridge/cli`) — after asserting every package's `dist/` exists.
+
+## Container tags emitted
+
+Exactly three tags are pushed to `ghcr.io/roy-wanyoike/bridge`:
+
+| Tag | Meaning |
+| --- | --- |
+| `X.Y.Z` | bare semver (no `v` prefix) |
+| `vX.Y.Z` | the versioned tag used in the verify commands below |
+| `latest` | floating, points at the newest release |
+
+All three point at the same multi-arch manifest list (linux/amd64 +
+linux/arm64).
 
 ## Verifying a release
 
@@ -48,12 +84,18 @@ cosign verify-blob \
 cosign verify ghcr.io/roy-wanyoike/bridge:vX.Y.Z
 ```
 
+`cosign verify` resolves the `vX.Y.Z` tag to the signed manifest digest, so
+the command above is valid for any of the three emitted tags (`X.Y.Z`,
+`vX.Y.Z`, `latest`).
+
 ## Homebrew
 
-[homebrew/bridge.rb](homebrew/bridge.rb) installs the release binaries. For
-a public tap: copy the formula into `homebrew-bridge/` of your tap and bump
-`version` + `sha256` per release (the per-target digests are in
-`checksums-sha256.txt` of that release).
+[homebrew/bridge.rb](homebrew/bridge.rb) installs the release binaries
+(`bin.install Dir["bridge-v#{version}-*"].first => "bridge"`, with a raise if
+the glob misses). For a public tap: copy the formula into `homebrew-bridge/`
+of your tap. **Bumping the formula `version` + pinning the `sha256` digests
+is part of the per-release checklist above** — the release workflow's guard
+job fails if the formula version does not match the pushed tag.
 
 ## Local dry-run (no CI needed)
 
@@ -62,9 +104,14 @@ bun scripts/package-release.mjs --current-only   # build + checksums
 bash scripts/verify-release.sh                   # build, smoke, verify checksums
 ```
 
+`scripts/verify-release.sh` fails (exit 1) if the binary is missing, the
+smoke commands fail, or `checksums-sha256.txt` is absent/mismatched.
+
 ## ⚠ Billing note
 
 GitHub Actions on this account is currently billing-locked: every workflow
 in `.github/workflows/` is complete and correct but cannot execute until
 the lock is lifted. All release mechanics above were additionally verified
-locally where possible (binary build + smoke + checksums via bun).
+locally where possible (binary build + smoke + checksums via bun; cliff.toml
+rendered with git-cliff v2.10.0; cosign attest-blob flag/predicate shape
+validated against cosign v2).

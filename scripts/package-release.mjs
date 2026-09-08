@@ -30,7 +30,7 @@ const ALL_TARGETS = [
   { target: 'bun-linux-x64', os: 'linux', arch: 'amd64', ext: '' },
   { target: 'bun-linux-arm64', os: 'linux', arch: 'arm64', ext: '' },
   { target: 'bun-darwin-x64', os: 'darwin', arch: 'amd64', ext: '' },
-  { target: 'bun-darwin-arm64', os: 'darwin', arch: 'arch64', ext: '' },
+  { target: 'bun-darwin-arm64', os: 'darwin', arch: 'arm64', ext: '' },
   { target: 'bun-windows-x64', os: 'windows', arch: 'amd64', ext: '.exe' },
 ];
 
