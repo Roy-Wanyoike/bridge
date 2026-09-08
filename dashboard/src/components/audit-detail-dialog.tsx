@@ -19,7 +19,7 @@ export function AuditDetailDialog({ entry }: { entry: AuditEntry }) {
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="relative">
-          <DialogClose onOpenChange={setOpen} />
+          <DialogClose />
           <DialogTitle>Audit entry {entry.id}</DialogTitle>
           <DialogDescription>
             {entry.action} · {formatDateTime(entry.at)}

@@ -38,9 +38,43 @@ interface TabsListProps extends React.HTMLAttributes<HTMLDivElement> {
 }
 
 function TabsList({ className, ...props }: TabsListProps) {
+  const listRef = React.useRef<HTMLDivElement>(null);
+  const { setValue } = useTabs();
+
+  /**
+   * WAI-ARIA APG tabs pattern: Left/Right (Home/End) move focus across the
+   * tablist with automatic activation; Tab skips past the list to the page.
+   */
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home' && e.key !== 'End') {
+      return;
+    }
+    const tabs = Array.from(
+      listRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]:not(:disabled)') ?? [],
+    );
+    if (tabs.length === 0) return;
+    const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    let nextIndex: number;
+    if (e.key === 'Home') nextIndex = 0;
+    else if (e.key === 'End') nextIndex = tabs.length - 1;
+    else if (e.key === 'ArrowRight') {
+      nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % tabs.length;
+    } else {
+      nextIndex = currentIndex < 0 ? tabs.length - 1 : (currentIndex - 1 + tabs.length) % tabs.length;
+    }
+    e.preventDefault();
+    const next = tabs[nextIndex];
+    if (!next) return;
+    next.focus();
+    const value = next.dataset.tabsValue;
+    if (value !== undefined) setValue(value);
+  };
+
   return (
     <div
+      ref={listRef}
       role="tablist"
+      onKeyDown={onKeyDown}
       className={cn(
         'inline-flex h-9 items-center gap-1 rounded-lg border border-border bg-secondary/50 p-1',
         className,
@@ -62,6 +96,7 @@ function TabsTrigger({ value, className, onClick, ...props }: TabsTriggerProps) 
       type="button"
       role="tab"
       id={`${baseId}-tab-${value}`}
+      data-tabs-value={value}
       aria-selected={selected}
       aria-controls={`${baseId}-panel-${value}`}
       tabIndex={selected ? 0 : -1}

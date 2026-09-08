@@ -50,6 +50,7 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
               <Link
                 key={tab.key}
                 href={tab.key ? `/graph?org=${tab.key}` : '/graph'}
+                aria-current={org === tab.key ? 'page' : undefined}
                 className={cn(
                   'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
                   org === tab.key
@@ -85,6 +86,9 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
               <p className="text-sm text-muted-foreground">No dependency edges in this scope.</p>
             ) : (
               <Table>
+                <caption className="sr-only">
+                  Contracts ranked by number of direct dependents in this scope
+                </caption>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     <TableHead>Contract</TableHead>
@@ -103,7 +107,7 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
                         >
                           {c.base}
                         </Link>
-                        <div className="text-[11px] text-muted-foreground/70">
+                        <div className="text-[11px] text-muted-foreground/80">
                           {c.org} / {c.project}
                         </div>
                       </TableCell>
@@ -127,6 +131,9 @@ export default async function GraphPage({ searchParams }: { searchParams: SP }) 
           </CardHeader>
           <CardContent className="max-h-96 overflow-y-auto">
             <Table>
+              <caption className="sr-only">
+                Every contract appearing in the dependency graph, with consumer count and verdict
+              </caption>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead>Contract</TableHead>
