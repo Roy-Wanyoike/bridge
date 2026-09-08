@@ -1,34 +1,77 @@
 /**
- * Bearer-token authentication and role authorization.
+ * Authentication: static bearer tokens and OIDC JWTs.
  *
- * Roles form a hierarchy: `read` < `write` < `admin`.
- * - any valid token may use read endpoints (list/get/versions/dependents/search)
- * - `write` (or `admin`) is required to publish
- * - `admin` is required to read the audit endpoint
+ * Two mechanisms, configurable together (static table consulted first, then
+ * JWT verification):
+ *
+ * - **Static tokens** — a `TokenTable` of raw bearer tokens. This is the
+ *   test/dev injection point: no cryptography, roles map 1:1 to scope
+ *   levels. Not a production mechanism.
+ * - **OIDC** — RS256/ES256 JWTs verified against a JWKS (fetched from the
+ *   issuer and cached per `kid`, or injected statically for tests).
+ *   Issuer, audience, expiry (`exp`, with leeway), `nbf`/`iat` sanity and
+ *   scope claims are all enforced; any failure is 401 (fail closed). A
+ *   valid token without an `org` claim is rejected with 403 on every /v1
+ *   route — org binding is how tenancy is decided.
+ *
+ * Scopes: `registry:read` (1) < `registry:publish` (2) < `registry:admin` (3).
  */
 
+import { createPublicKey, verify as cryptoVerify, type JsonWebKey, type KeyObject } from 'node:crypto';
 import { ServiceError } from './errors';
-import type { RegistryRole, RegistryTokenInfo, TokenTable } from './types';
+import { isValidOrgOrProject } from './validation';
+import {
+  SCOPES,
+  type AccessLevel,
+  type AuthConfig,
+  type Jwk,
+  type JwksDocument,
+  type OidcConfig,
+  type Principal,
+  type RegistryRole,
+  type RegistryTokenInfo,
+  type TokenTable,
+} from './types';
 
-/** Numeric rank of each role; compare with the numbers in {@link Roles}. */
-export const ROLE_RANK: Record<RegistryRole, number> = { read: 1, write: 2, admin: 3 };
+/** Numeric rank of static-token roles; compare against AccessLevel. */
+export const ROLE_RANK: Record<RegistryRole, AccessLevel> = { read: 1, write: 2, admin: 3 };
 
-/** Required role levels for endpoint families. */
-export const Roles = {
-  /** Any valid token. */
-  read: ROLE_RANK.read,
+/** Required access levels for endpoint families. */
+export const Levels = {
+  /** Any authenticated principal. */
+  read: 1 as AccessLevel,
   /** Publish contracts. */
-  write: ROLE_RANK.write,
-  /** Read the audit log. */
-  admin: ROLE_RANK.admin,
+  publish: 2 as AccessLevel,
+  /** Read/query the audit log. */
+  admin: 3 as AccessLevel,
 } as const;
 
 const ALL_ROLES: readonly string[] = ['read', 'write', 'admin'];
 
+/** Max accepted `Authorization` header length (bound parsing work). */
+const MAX_AUTH_HEADER = 16 * 1024;
+/** Default JWT time-claim leeway in seconds. */
+const DEFAULT_LEEWAY_SEC = 60;
+/** Default JWKS cache TTL in ms. */
+const DEFAULT_CACHE_TTL_MS = 600_000;
+/** Minimum RSA modulus size we accept: 2048 bits = 256 bytes. */
+const MIN_RSA_MODULUS_BYTES = 256;
+
+function unauthenticated(message: string): ServiceError {
+  return new ServiceError(401, 'unauthenticated', message);
+}
+
+/** Distinct failure used to trigger a one-shot JWKS refresh on unknown kids. */
+function unknownKey(): ServiceError {
+  return new ServiceError(401, 'unauthenticated', 'token signed by an unknown key (kid not in JWKS)');
+}
+
+// ---------------------------------------------------------- static tokens
+
 /**
  * Validate a token table eagerly (at `createServer` time): every entry must
- * carry a non-empty string `tenant` and a known `role`. Returns the table
- * unchanged. Malformed tables are programming errors → `TypeError`.
+ * carry a non-empty string `tenant` and a known `role`. Malformed tables are
+ * programming errors → `TypeError`.
  */
 export function assertTokenTable(tokens: TokenTable): TokenTable {
   for (const [token, info] of Object.entries(tokens)) {
@@ -51,40 +94,401 @@ export function assertTokenTable(tokens: TokenTable): TokenTable {
 }
 
 /**
- * Authenticate a request from its `Authorization` header value.
- *
- * Accepts `Bearer <token>` (scheme case-insensitive, per RFC 7235).
- * Throws 401 `unauthenticated` when the header is missing, malformed or
- * the token is unknown.
+ * Parse the `Authorization` header into its bearer token.
+ * Throws 401 when the header is missing, malformed or oversized.
  */
-export function authenticate(tokens: TokenTable, authorization: string | undefined): RegistryTokenInfo {
-  const fail = (): ServiceError =>
-    new ServiceError(401, 'unauthenticated', 'missing or invalid bearer token');
-
-  if (typeof authorization !== 'string') throw fail();
+export function extractBearerToken(authorization: string | undefined): string {
+  if (typeof authorization !== 'string' || authorization.length > MAX_AUTH_HEADER) {
+    throw unauthenticated('missing or invalid bearer token');
+  }
   const space = authorization.indexOf(' ');
-  if (space <= 0) throw fail();
+  if (space <= 0) throw unauthenticated('missing or invalid bearer token');
   const scheme = authorization.slice(0, space).toLowerCase();
-  if (scheme !== 'bearer') throw fail();
+  if (scheme !== 'bearer') throw unauthenticated('missing or invalid bearer token');
   const token = authorization.slice(space + 1).trim();
-  if (token.length === 0) throw fail();
+  if (token.length === 0) throw unauthenticated('missing or invalid bearer token');
+  return token;
+}
 
+/** Static-token lookup → {@link Principal}. Throws 401 when unknown. */
+export function authenticateStaticToken(tokens: TokenTable, authorization: string | undefined): Principal {
+  const token = extractBearerToken(authorization);
   const info = tokens[token];
-  if (info === undefined) throw fail();
-  return info;
+  if (info === undefined) throw unauthenticated('missing or invalid bearer token');
+  return {
+    kind: 'token',
+    subject: `token:${info.tenant}`,
+    org: info.tenant,
+    level: ROLE_RANK[info.role],
+    scopes: [`role:${info.role}`],
+  };
 }
 
 /**
- * Require a minimum role level; throws 403 `forbidden` when the token's
- * role ranks below it.
+ * Require a minimum access level; throws 403 `forbidden` when the
+ * principal's level ranks below it.
  */
-export function requireRole(auth: RegistryTokenInfo, needed: number): void {
-  if (ROLE_RANK[auth.role] < needed) {
+export function requireLevel(principal: Principal, needed: AccessLevel): void {
+  if (principal.level < needed) {
     throw new ServiceError(
       403,
       'forbidden',
-      `token role '${auth.role}' is not permitted for this operation ` +
-        `(requires role level ${needed})`,
+      `credentials '${principal.scopes.join(', ')}' are not permitted for this operation ` +
+        `(requires ${needed === Levels.read ? SCOPES.read : needed === Levels.publish ? SCOPES.publish : SCOPES.admin})`,
     );
   }
+}
+
+// ------------------------------------------------------------------- JWKs
+
+function b64urlToBuffer(value: string, at: string): Buffer {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new TypeError(`${at}: not a base64url string`);
+  }
+  return Buffer.from(value, 'base64url');
+}
+
+/** Validate one JWK for verification use and import it as a `KeyObject`. */
+export function jwkToPublicKey(jwk: Jwk, at: string): KeyObject {
+  if (jwk['use'] !== undefined && jwk['use'] !== 'sig') {
+    throw new TypeError(`${at}: JWK use must be 'sig'`);
+  }
+  const ops = jwk['key_ops'];
+  if (Array.isArray(ops) && !ops.includes('verify')) {
+    throw new TypeError(`${at}: JWK key_ops does not include 'verify'`);
+  }
+  const expectedAlg = jwk['kty'] === 'RSA' ? 'RS256' : jwk['kty'] === 'EC' ? 'ES256' : undefined;
+  if (jwk['alg'] !== undefined && jwk['alg'] !== expectedAlg) {
+    throw new TypeError(`${at}: JWK alg ${JSON.stringify(jwk['alg'])} is not supported`);
+  }
+  if (typeof jwk['kid'] !== 'string' || jwk['kid'].length === 0 || jwk['kid'].length > 256) {
+    throw new TypeError(`${at}: JWK kid must be a non-empty string (max 256 chars)`);
+  }
+  try {
+    if (jwk['kty'] === 'RSA') {
+      const n = b64urlToBuffer(jwk['n'] as string, `${at}.n`);
+      if (n.length < MIN_RSA_MODULUS_BYTES) {
+        throw new TypeError(`${at}: RSA modulus smaller than 2048 bits`);
+      }
+      b64urlToBuffer(jwk['e'] as string, `${at}.e`);
+      return createPublicKey({ key: jwk as unknown as JsonWebKey, format: 'jwk' });
+    }
+    if (jwk['kty'] === 'EC') {
+      if (jwk['crv'] !== 'P-256') throw new TypeError(`${at}: EC crv must be P-256 (ES256)`);
+      if (b64urlToBuffer(jwk['x'] as string, `${at}.x`).length !== 32) {
+        throw new TypeError(`${at}: EC x coordinate must be 32 bytes`);
+      }
+      if (b64urlToBuffer(jwk['y'] as string, `${at}.y`).length !== 32) {
+        throw new TypeError(`${at}: EC y coordinate must be 32 bytes`);
+      }
+      return createPublicKey({ key: jwk as unknown as JsonWebKey, format: 'jwk' });
+    }
+  } catch (err) {
+    if (err instanceof TypeError) throw err;
+    throw new TypeError(`${at}: invalid JWK: ${(err as Error).message}`);
+  }
+  throw new TypeError(`${at}: JWK kty must be 'RSA' (RS256) or 'EC' (ES256, P-256)`);
+}
+
+/** Validate a JWKS document shape and import every usable key. */
+export function parseJwks(doc: JwksDocument): Map<string, KeyObject> {
+  if (typeof doc !== 'object' || doc === null || !Array.isArray((doc as JwksDocument).keys)) {
+    throw new TypeError('JWKS document must be an object with a "keys" array');
+  }
+  const out = new Map<string, KeyObject>();
+  const keys = (doc as { keys?: unknown }).keys as unknown;
+  const list = Array.isArray(keys) ? keys : [];
+  for (let i = 0; i < list.length; i++) {
+    const jwk = list[i] as Jwk;
+    if (typeof jwk !== 'object' || jwk === null) continue;
+    try {
+      const key = jwkToPublicKey(jwk, `keys[${i}]`);
+      out.set(jwk['kid'] as string, key);
+    } catch {
+      // Unusable keys are skipped (e.g. different alg); JWKS is a set.
+    }
+  }
+  return out;
+}
+
+// --------------------------------------------------------------- JWT core
+
+interface JwtHeader {
+  alg: string;
+  kid?: string;
+}
+
+interface JwtClaims {
+  iss?: unknown;
+  sub?: unknown;
+  aud?: unknown;
+  exp?: unknown;
+  nbf?: unknown;
+  iat?: unknown;
+  jti?: unknown;
+  scope?: unknown;
+  scp?: unknown;
+  org?: unknown;
+}
+
+function decodeSegment(segment: string, at: string): Record<string, unknown> {
+  if (segment.length === 0 || segment.length > 64 * 1024 || !/^[A-Za-z0-9_-]+$/.test(segment)) {
+    throw unauthenticated(`malformed token: ${at}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+  } catch {
+    throw unauthenticated(`malformed token: ${at} is not valid JSON`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw unauthenticated(`malformed token: ${at} must be a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** Verify one signature (`RS256` or `ES256`); returns false on any mismatch. */
+export function verifyJwtSignature(
+  signingInput: string,
+  signature: Buffer,
+  header: JwtHeader,
+  key: KeyObject,
+): boolean {
+  if (header.alg === 'RS256') {
+    if (key.asymmetricKeyType !== 'rsa') return false;
+    return cryptoVerify('sha256', Buffer.from(signingInput, 'ascii'), key, signature);
+  }
+  if (header.alg === 'ES256') {
+    if (key.asymmetricKeyType !== 'ec') return false;
+    if (signature.length !== 64) return false; // JWS raw r||s
+    return cryptoVerify('sha256', Buffer.from(signingInput, 'ascii'), { key, dsaEncoding: 'ieee-p1363' }, signature);
+  }
+  return false;
+}
+
+/**
+ * Verify the signature and standard claims of a compact JWT and return the
+ * decoded payload. Throws 401 on every failure (fail closed).
+ */
+export function verifyJwt(token: string, cfg: OidcConfig, keys: Map<string, KeyObject>): JwtClaims {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw unauthenticated('malformed token: expected a compact JWT');
+  const [h, p, s] = parts as [string, string, string];
+  const header = decodeSegment(h, 'header');
+  const payload = decodeSegment(p, 'payload');
+
+  const alg = header['alg'];
+  if (alg !== 'RS256' && alg !== 'ES256') {
+    throw unauthenticated(`token alg ${JSON.stringify(alg)} is not allowed (RS256/ES256 only)`);
+  }
+  const kid = header['kid'];
+  if (typeof kid !== 'string' || kid.length === 0 || kid.length > 256) {
+    throw unauthenticated('malformed token: header.kid must be a non-empty string');
+  }
+  const key = keys.get(kid);
+  if (key === undefined) throw unknownKey();
+  let signature: Buffer;
+  try {
+    if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error('charset');
+    signature = Buffer.from(s, 'base64url');
+  } catch {
+    throw unauthenticated('malformed token: signature is not base64url');
+  }
+  const signingInput = `${h}.${p}`;
+  if (!verifyJwtSignature(signingInput, signature, { alg, kid }, key)) {
+    throw unauthenticated('token signature verification failed');
+  }
+
+  const now = (cfg.now ?? (() => Date.now()))() / 1000;
+  const leeway = cfg.leewaySec ?? DEFAULT_LEEWAY_SEC;
+
+  const exp = payload['exp'];
+  if (typeof exp !== 'number' || !Number.isFinite(exp)) {
+    throw unauthenticated('token rejected: exp claim is required');
+  }
+  if (now > exp + leeway) throw unauthenticated('token expired');
+
+  const nbf = payload['nbf'];
+  if (nbf !== undefined && (typeof nbf !== 'number' || !Number.isFinite(nbf) || now < nbf - leeway)) {
+    throw unauthenticated('token not yet valid (nbf)');
+  }
+  const iat = payload['iat'];
+  if (iat !== undefined && (typeof iat !== 'number' || !Number.isFinite(iat) || now < iat - leeway)) {
+    throw unauthenticated('token issued in the future (iat)');
+  }
+
+  if (payload['iss'] !== cfg.issuer) throw unauthenticated('token issuer (iss) mismatch');
+  const aud = payload['aud'];
+  const audOk =
+    typeof aud === 'string'
+      ? aud === cfg.audience
+      : Array.isArray(aud) && aud.some((a) => a === cfg.audience);
+  if (!audOk) throw unauthenticated('token audience (aud) mismatch');
+
+  const sub = payload['sub'];
+  if (typeof sub !== 'string' || sub.length === 0 || sub.length > 256) {
+    throw unauthenticated('token rejected: sub claim is required');
+  }
+  return payload as JwtClaims;
+}
+
+/** Map `scope`/`scp` claims to the highest held access level. */
+export function scopesToLevel(scopes: readonly string[]): AccessLevel {
+  let level: AccessLevel = 1;
+  if (scopes.includes(SCOPES.admin)) level = 3;
+  else if (scopes.includes(SCOPES.publish)) level = 2;
+  return level;
+}
+
+function parseScopeClaim(payload: JwtClaims): string[] {
+  const scp = payload['scp'];
+  if (Array.isArray(scp)) {
+    return scp.filter((s): s is string => typeof s === 'string');
+  }
+  const scope = typeof payload['scope'] === 'string' ? payload['scope'] : '';
+  return scope.split(/\s+/).filter((s) => s.length > 0);
+}
+
+// ---------------------------------------------------------- authenticator
+
+export interface RequestAuthenticator {
+  authenticate(authorization: string | undefined): Promise<Principal>;
+}
+
+/** OIDC authenticator: verifies JWTs against a cached JWKS. */
+export class OidcAuthenticator implements RequestAuthenticator {
+  private readonly cfg: OidcConfig;
+  private readonly fetchJwks: (url: string) => Promise<JwksDocument>;
+  private readonly ttlMs: number;
+  private cache: Map<string, KeyObject> = new Map();
+  private fetchedAt = -Infinity;
+
+  constructor(cfg: OidcConfig) {
+    if (typeof cfg.issuer !== 'string' || cfg.issuer.length === 0) {
+      throw new TypeError('OidcAuthenticator: issuer is required');
+    }
+    if (typeof cfg.audience !== 'string' || cfg.audience.length === 0) {
+      throw new TypeError('OidcAuthenticator: audience is required');
+    }
+    this.cfg = cfg;
+    this.fetchJwks = cfg.fetchJwks ?? defaultFetchJwks;
+    this.ttlMs = cfg.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    if (cfg.jwks !== undefined) {
+      this.cache = parseJwks(cfg.jwks);
+      this.fetchedAt = this.now();
+    }
+  }
+
+  private now(): number {
+    return (this.cfg.now ?? (() => Date.now()))();
+  }
+
+  private jwksUrl(): string {
+    return this.cfg.jwksUrl ?? `${this.cfg.issuer.replace(/\/$/, '')}/.well-known/jwks.json`;
+  }
+
+  private async loadKeys(force: boolean): Promise<Map<string, KeyObject>> {
+    const stale = this.now() - this.fetchedAt > this.ttlMs;
+    if (!force && this.cache.size > 0 && !stale) return this.cache;
+    if (this.cfg.jwks !== undefined) return this.cache; // static injection: never re-fetch
+    const doc = await this.fetchJwks(this.jwksUrl());
+    const keys = parseJwks(doc);
+    if (keys.size === 0) throw unauthenticated('token rejected: JWKS contains no usable keys');
+    this.cache = keys;
+    this.fetchedAt = this.now();
+    return this.cache;
+  }
+
+  /** Verify the bearer JWT and produce a {@link Principal}. */
+  public async authenticate(authorization: string | undefined): Promise<Principal> {
+    const token = extractBearerToken(authorization);
+    let keys = await this.loadKeys(false);
+    let claims: JwtClaims;
+    try {
+      claims = verifyJwt(token, this.cfg, keys);
+    } catch (err) {
+      if (err instanceof ServiceError && err.message === 'token signed by an unknown key (kid not in JWKS)') {
+        // One forced refresh per attempt (key rotation without waiting out the TTL).
+        keys = await this.loadKeys(true);
+        claims = verifyJwt(token, this.cfg, keys);
+      } else {
+        throw err;
+      }
+    }
+
+    const scopes = parseScopeClaim(claims);
+    const level = scopesToLevel(scopes);
+    const org = claims['org'];
+    if (org === undefined && this.cfg.requireOrgClaim === false) {
+      // Org-less tokens stay authenticated but are rejected by org-scoped routes.
+    } else if (typeof org !== 'string' || org.length === 0) {
+      throw new ServiceError(403, 'missing-org-claim', 'token is valid but carries no org claim');
+    } else if (!isValidOrgOrProject(org)) {
+      throw new ServiceError(403, 'forbidden', 'token org claim is malformed');
+    }
+
+    return {
+      kind: 'oidc',
+      subject: claims['sub'] as string,
+      org: typeof org === 'string' ? org : '',
+      level,
+      scopes: scopes.length > 0 ? scopes : ['(none)'],
+      tokenId: typeof claims['jti'] === 'string' ? claims['jti'] : undefined,
+    };
+  }
+}
+
+/** Default JWKS fetcher: `fetch` with a hard 10s timeout. */
+async function defaultFetchJwks(url: string): Promise<JwksDocument> {
+  let response: Response;
+  try {
+    response = await fetch(url, { signal: AbortSignal.timeout(10_000), redirect: 'error' });
+  } catch (err) {
+    throw unauthenticated(`could not fetch JWKS from ${url}: ${(err as Error).name}`);
+  }
+  if (!response.ok) throw unauthenticated(`JWKS endpoint responded ${response.status}`);
+  try {
+    return (await response.json()) as JwksDocument;
+  } catch {
+    throw unauthenticated('JWKS endpoint returned invalid JSON');
+  }
+}
+
+/**
+ * Build the request authenticator from {@link AuthConfig}.
+ *
+ * Fails closed: with neither static tokens nor OIDC configured it throws
+ * `TypeError` at construction time, so a service that would accept
+ * anonymous requests can never be created.
+ *
+ * When both are configured, static tokens are consulted first (exact match),
+ * and non-matching tokens fall through to JWT verification.
+ */
+export function createAuthenticator(auth: AuthConfig | undefined): RequestAuthenticator {
+  const hasTokens = auth !== undefined && auth.tokens !== undefined && Object.keys(auth.tokens).length > 0;
+  const hasOidc = auth !== undefined && auth.oidc !== undefined;
+  if (!hasTokens && !hasOidc) {
+    throw new TypeError(
+      'auth: at least one mechanism is required (tokens or oidc) — the service refuses to start unauthenticated',
+    );
+  }
+  if (hasTokens) assertTokenTable(auth!.tokens!);
+  const oidc = hasOidc ? new OidcAuthenticator(auth!.oidc!) : undefined;
+  const tokens = hasTokens ? auth!.tokens! : undefined;
+
+  if (tokens !== undefined && oidc === undefined) {
+    return { authenticate: (authorization) => Promise.resolve(authenticateStaticToken(tokens, authorization)) };
+  }
+  if (tokens === undefined && oidc !== undefined) {
+    return oidc;
+  }
+  return {
+    authenticate: async (authorization) => {
+      try {
+        return authenticateStaticToken(tokens!, authorization);
+      } catch {
+        return oidc!.authenticate(authorization);
+      }
+    },
+  };
 }

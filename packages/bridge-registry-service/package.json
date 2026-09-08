@@ -1,7 +1,7 @@
 {
   "name": "@bridge/registry-service",
-  "version": "0.1.0",
-  "description": "Bridge registry service: HTTP API over the contract registry with bearer auth, multi-tenancy and audit logs",
+  "version": "0.2.0",
+  "description": "Bridge registry service: multi-tenant HTTP registry API with OIDC auth, artifact signing, audit logs, rate limiting and pluggable storage (in-memory / PostgreSQL)",
   "license": "MIT",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,7 +9,8 @@
     "bridge-registry-service": "dist/bin/bridge-registry-service.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "migrations"
   ],
   "scripts": {
     "build": "tsc -b .",
@@ -17,6 +18,8 @@
     "start": "node dist/bin/bridge-registry-service.js"
   },
   "dependencies": {
+    "@bridge/compat": "*",
+    "@bridge/core": "*",
     "@bridge/registry": "*"
   },
   "devDependencies": {

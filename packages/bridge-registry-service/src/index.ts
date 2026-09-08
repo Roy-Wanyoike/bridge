@@ -1,34 +1,92 @@
 /**
- * `@bridge/registry-service` — HTTP API over the Bridge contract registry.
+ * `@bridge/registry-service` — multi-tenant HTTP registry for Bridge
+ * contracts.
  *
- * Dependency-free `node:http` server exposing `RegistryStore` operations as
- * JSON endpoints with bearer-token auth, tenant recording and an append-only
- * audit log. See the package README for the full API table and quickstart.
+ * Dependency-free `node:http` server over a {@link StorageDriver} with
+ * org/project tenancy, OIDC (or static-token) auth, ed25519 artifact
+ * signing, an append-only audit log, rate limiting and a hand-written
+ * OpenAPI document at `GET /v1/openapi.json`.
  *
  * @example
  * ```ts
- * import { RegistryStore } from '@bridge/registry';
- * import { createServer } from '@bridge/registry-service';
+ * import { InMemoryDriver } from './storage/memory';
+ * import { start } from './server';
  *
- * const server = createServer({
- *   store: new RegistryStore('.bridge-registry'),
- *   tokens: { 'secret-1': { tenant: 'acme', role: 'write' } },
- *   audit: 'audit.jsonl',
- * });
- * server.listen(4350);
+ * start({
+ *   driver: new InMemoryDriver(),
+ *   auth: { tokens: { 'secret-1': { tenant: 'acme', role: 'write' } } },
+ * }).listen(4350);
  * ```
  */
 
 export { createServer, start } from './server';
-export { FileAuditSink, MemoryAuditSink, clampLimit } from './audit';
-export { ServiceError, statusForRegistryError } from './errors';
+export { openApiDocument } from './openapi';
+export {
+  DriverAuditBackend,
+  FileAuditSink,
+  MemoryAuditSink,
+  applyAuditFilter,
+  clampLimit,
+} from './audit';
+export {
+  OidcAuthenticator,
+  assertTokenTable,
+  authenticateStaticToken,
+  createAuthenticator,
+  extractBearerToken,
+  jwkToPublicKey,
+  parseJwks,
+  requireLevel,
+  scopesToLevel,
+  verifyJwt,
+  verifyJwtSignature,
+  Levels,
+  ROLE_RANK,
+} from './auth';
+export type { RequestAuthenticator } from './auth';
+export { ServiceError, isAuthError, statusForRegistryError } from './errors';
 export type { ServiceErrorCode } from './errors';
-export { authenticate, requireRole, ROLE_RANK, Roles } from './auth';
+export { TokenBucketLimiter } from './ratelimit';
+export type { RateLimitDecision, RateLimitTier } from './ratelimit';
+export {
+  KEY_ID_HEADER,
+  SIGNATURE_HEADER,
+  assertContentHash,
+  parseSignatureHeaders,
+  verifyPublishSignature,
+} from './signing';
+export {
+  assertContractName,
+  assertIsoTimestamp,
+  assertOrgOrProject,
+  isPlainObject,
+  isValidContractName,
+  isValidOrgOrProject,
+  validateIRPackage,
+} from './validation';
+export { InMemoryDriver } from './storage/memory';
+export { PostgresDriver } from './storage/postgres/driver';
 export type {
+  AccessLevel,
+  AuditBackend,
   AuditEntry,
-  AuditSink,
+  AuditFilter,
+  AuthConfig,
+  ContractMeta,
+  Jwk,
+  JwksDocument,
+  OidcConfig,
+  Principal,
+  PublishInput,
+  PublishMeta,
+  PublishResult,
+  RateLimitConfig,
+  RateLimitOptions,
   RegistryRole,
   RegistryServiceOptions,
   RegistryTokenInfo,
+  SigningConfig,
+  StorageDriver,
+  StoredContract,
   TokenTable,
 } from './types';

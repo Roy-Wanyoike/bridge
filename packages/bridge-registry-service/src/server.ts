@@ -1,82 +1,91 @@
 /**
  * `@bridge/registry-service` — dependency-free HTTP layer over a
- * {@link RegistryStore}.
+ * {@link StorageDriver}.
  *
- * JSON over HTTP. Every response is JSON; every error response uses the
- * envelope `{"error": {"code": ..., "message": ...}}`. `RegistryError`
- * codes map to HTTP status (`not-found` 404, `hash-conflict`/`immutable`
- * 409, `invalid-name`/`invalid-version` 400, `corrupt`/`io` 500).
+ * JSON over HTTP with org/project tenancy, OIDC (or static-token)
+ * authentication, ed25519 artifact-signature verification on publish, an
+ * append-only audit log and token-bucket rate limiting. Every error
+ * response uses the envelope `{"error": {"code": ..., "message": ...}}`.
+ * `RegistryError` codes from the storage layer map to HTTP statuses
+ * (`not-found` 404, `hash-conflict`/`immutable` 409, `invalid-name`/
+ * `invalid-version` 400, `corrupt`/`io` 500).
+ *
+ * Cross-tenant access ALWAYS returns 404 (never 403) so the service does
+ * not leak the existence of other tenants' resources.
  *
  * No top-level side effects: `createServer` returns a plain `http.Server`
- * (bind it yourself, e.g. `listen(0)` in tests); `start` is the convenience
- * wrapper that binds and prints the bound port.
+ * (bind it yourself, e.g. `listen(0)` in tests); `start` is the
+ * convenience wrapper that binds and prints the bound port.
  */
 
 import { createServer as nodeCreateServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import { normalizeVersion, RegistryError, splitPackageVersion } from '@bridge/registry';
-import type { IRPackage, PublishMeta, RegistryStore } from '@bridge/registry';
-import { FileAuditSink, MemoryAuditSink } from './audit';
-import { assertTokenTable, authenticate, requireRole, Roles } from './auth';
+import { hashPackage } from '@bridge/core';
+import { diffPackages } from '@bridge/compat';
+import { RegistryError, splitPackageVersion } from '@bridge/registry';
+import { DriverAuditBackend, clampLimit } from './audit';
+import { createAuthenticator, requireLevel } from './auth';
+import type { RequestAuthenticator } from './auth';
+import { Levels } from './auth';
 import { ServiceError, statusForRegistryError } from './errors';
-import type { AuditEntry, AuditSink, RegistryServiceOptions, RegistryTokenInfo, TokenTable } from './types';
+import { TokenBucketLimiter } from './ratelimit';
+import { assertContentHash, verifyPublishSignature } from './signing';
+import { assertContractName, isPlainObject, validateIRPackage } from './validation';
+import { openApiDocument } from './openapi';
+import type {
+  AuditBackend,
+  AuditEntry,
+  ContractMeta,
+  PublishMeta,
+  RegistryServiceOptions,
+  StorageDriver,
+} from './types';
 
 /** Hard cap on request body size (8 MiB — generous for IR documents). */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** Default number of audit entries returned by GET /api/v1/audit. */
-const DEFAULT_AUDIT_TAIL = 100;
-/** Upper bound for the `limit` query parameter. */
-const MAX_AUDIT_TAIL = 10_000;
 
-/** Per-request bookkeeping used to decide what gets audited. */
+interface Deps {
+  driver: StorageDriver;
+  auth: RequestAuthenticator;
+  limiter: TokenBucketLimiter;
+  audit: AuditBackend;
+  signing?: RegistryServiceOptions['signing'];
+}
+
 interface RequestContext {
-  /** Attempted operation; `null` for /health and unknown routes. */
-  action: 'publish' | 'read' | 'audit' | null;
-  /** Route package name when the route has one. */
+  /** Attempted operation; `null` for /healthz and unknown routes. */
+  action: 'publish' | 'read' | 'search' | 'audit' | 'auth' | null;
+  org: string | null;
+  project: string | null;
+  /** Route contract base when the route had one. */
   contract: string | null;
   /** Resolved version when known. */
   version: string | null;
-  /** Authenticated credentials once auth succeeded. */
-  auth: RegistryTokenInfo | null;
+  subject: string | null;
 }
-
-interface Deps {
-  store: RegistryStore;
-  tokens: TokenTable;
-  audit: AuditSink;
-}
-
-type Segments = string[];
-
-/** Classified API route (after path decoding). */
-type Route =
-  | { kind: 'list' }
-  | { kind: 'contract'; name: string }
-  | { kind: 'versions'; name: string }
-  | { kind: 'dependents'; name: string }
-  | { kind: 'search' }
-  | { kind: 'audit' };
 
 // ---------------------------------------------------------------- factories
 
 /**
  * Create the HTTP server.
  *
- * Returns the unstarted `http.Server` so callers control binding (tests use
- * `server.listen(0)`). Validates options eagerly; malformed token tables or
- * audit options throw `TypeError` before any request is served.
+ * Returns the unstarted `http.Server` so callers control binding (tests
+ * use `server.listen(0)`). Options are validated eagerly — a service
+ * without auth configured fails at construction (fail closed), never
+ * silently at request time.
  */
 export function createServer(options: RegistryServiceOptions): Server {
   if (typeof options !== 'object' || options === null) {
     throw new TypeError('createServer: options object is required');
   }
-  const store: RegistryStore | undefined = options.store;
-  if (typeof store !== 'object' || store === null || typeof store.publish !== 'function') {
-    throw new TypeError('createServer: options.store must be a RegistryStore from @bridge/registry');
+  const driver: StorageDriver | undefined = options.driver;
+  if (typeof driver !== 'object' || driver === null || typeof driver.publish !== 'function') {
+    throw new TypeError('createServer: options.driver must be a StorageDriver');
   }
-  const tokens = assertTokenTable(options.tokens ?? {});
-  const audit = resolveAudit(options.audit);
-  const deps: Deps = { store, tokens, audit };
+  const auth = createAuthenticator(options.auth);
+  const limiter = new TokenBucketLimiter(options.rateLimit ?? { enabled: false });
+  const audit: AuditBackend = options.audit ?? new DriverAuditBackend(driver);
+  const deps: Deps = { driver, auth, limiter, audit, signing: options.signing };
   return nodeCreateServer((req, res) => {
     void handle(req, res, deps);
   });
@@ -98,35 +107,47 @@ export function start(options: RegistryServiceOptions, port = 0): Server {
   return server;
 }
 
-function resolveAudit(audit: string | AuditSink | undefined): AuditSink {
-  if (audit === undefined) return new MemoryAuditSink();
-  if (typeof audit === 'string') return new FileAuditSink(audit);
-  if (
-    typeof audit === 'object' &&
-    audit !== null &&
-    typeof audit.append === 'function' &&
-    typeof audit.tail === 'function'
-  ) {
-    return audit;
-  }
-  throw new TypeError('audit: expected a JSONL file path or an AuditSink with append()/tail()');
-}
-
 // ------------------------------------------------------------- entry points
 
 async function handle(req: IncomingMessage, res: ServerResponse, deps: Deps): Promise<void> {
-  const ctx: RequestContext = { action: null, contract: null, version: null, auth: null };
+  const startedAt = new Date();
+  const ctx: RequestContext = {
+    action: null,
+    org: null,
+    project: null,
+    contract: null,
+    version: null,
+    subject: null,
+  };
   res.on('error', () => {
     /* socket-level noise (client aborts) is not an application error */
   });
+  let status = 500;
   try {
-    await routeRequest(req, res, ctx, deps);
-    if (ctx.action === 'publish') appendAudit(deps.audit, ctx, true);
+    status = await routeRequest(req, res, ctx, deps);
   } catch (err) {
-    sendError(res, err);
-    const authFail =
-      err instanceof ServiceError && (err.code === 'unauthenticated' || err.code === 'forbidden');
-    if (authFail || ctx.action === 'publish') appendAudit(deps.audit, ctx, false);
+    status = sendError(res, err);
+  }
+  // One audit entry per /v1 request (success or failure). Audit failures
+  // are logged and never fail the response.
+  if (ctx.action !== null) {
+    const entry: AuditEntry = {
+      time: startedAt.toISOString(),
+      org: ctx.org,
+      project: ctx.project,
+      actor: ctx.subject,
+      action: ctx.action,
+      contract: ctx.contract,
+      version: ctx.version,
+      ok: status < 400,
+      status,
+      ip: clientIp(req),
+    };
+    try {
+      await deps.audit.append(entry);
+    } catch (err) {
+      console.error('audit append failed:', (err as Error).message);
+    }
   }
 }
 
@@ -135,11 +156,11 @@ async function routeRequest(
   res: ServerResponse,
   ctx: RequestContext,
   deps: Deps,
-): Promise<void> {
+): Promise<number> {
   const method = (req.method ?? 'GET').toUpperCase();
   const url = new URL(req.url ?? '/', 'http://bridge.local');
 
-  let segments: Segments;
+  let segments: string[];
   try {
     segments = url.pathname
       .split('/')
@@ -149,400 +170,408 @@ async function routeRequest(
     throw new ServiceError(400, 'invalid_argument', 'malformed percent-encoding in request path');
   }
 
-  // GET /health — unauthenticated liveness probe.
-  if (segments.length === 1 && segments[0] === 'health') {
-    if (method !== 'GET') {
-      throw new ServiceError(405, 'method-not-allowed', `method ${method} is not allowed for /health`);
-    }
+  // GET /healthz — unauthenticated liveness probe (not rate-limited).
+  if (segments.length === 1 && segments[0] === 'healthz') {
+    requireMethod(method, 'GET', '/healthz');
+    ctx.action = null;
     sendJson(res, 200, { ok: true });
-    return;
+    return 200;
   }
 
-  if (segments[0] !== 'api' || segments[1] !== 'v1') {
+  if (segments[0] !== 'v1') {
     throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
   }
 
-  const route = classifyRoute(segments.slice(2));
-  if (route === null) {
+  // GET /v1/openapi.json — public API document (rate-limited, no auth).
+  if (segments.length === 2 && segments[1] === 'openapi.json') {
+    requireMethod(method, 'GET', '/v1/openapi.json');
+    ctx.action = 'read';
+    sendJson(res, 200, openApiDocument());
+    return 200;
+  }
+
+  ctx.action = 'read';
+  ctx.subject = null;
+
+  // Rate limit: one auth-tier token per /v1 request, keyed by client IP.
+  const ip = clientIp(req) ?? 'unknown';
+  const authDecision = deps.limiter.take('auth', ip);
+  if (!authDecision.ok) {
+    res.setHeader('Retry-After', String(authDecision.retryAfterSeconds));
+    throw new ServiceError(429, 'rate-limited', 'too many requests: slow down and retry');
+  }
+
+  // Authentication covers every remaining /v1 route.
+  const principal = await deps.auth.authenticate(req.headers.authorization);
+  ctx.subject = principal.subject;
+  ctx.action = 'read';
+
+  const rest = segments.slice(1);
+
+  // GET /v1/search?q=... — scoped to the caller's org.
+  if (rest.length === 1 && rest[0] === 'search') {
+    requireMethod(method, 'GET', '/v1/search');
+    requireLevel(principal, Levels.read);
+    ctx.org = principal.org;
+    const query = (url.searchParams.get('q') ?? '').slice(0, 256);
+    const results = await deps.driver.search(principal.org, null, query);
+    sendJson(res, 200, { query, results });
+    return 200;
+  }
+
+  // GET /v1/audit — admin-only, filterable, newest first.
+  if (rest.length === 1 && rest[0] === 'audit') {
+    requireMethod(method, 'GET', '/v1/audit');
+    requireLevel(principal, Levels.admin);
+    ctx.action = 'audit';
+    ctx.org = principal.org;
+    const entries = await deps.audit.query({
+      org: url.searchParams.get('org') ?? undefined,
+      project: url.searchParams.get('project') ?? undefined,
+      actor: url.searchParams.get('actor') ?? undefined,
+      action: url.searchParams.get('action') ?? undefined,
+      contract: url.searchParams.get('contract') ?? undefined,
+      from: url.searchParams.get('from') ?? undefined,
+      to: url.searchParams.get('to') ?? undefined,
+      limit: clampLimit(limitParam(url)),
+    });
+    sendJson(res, 200, { entries });
+    return 200;
+  }
+
+  // /v1/orgs/{org}/projects/{project}/...
+  if (rest[0] !== 'orgs' || rest[2] !== 'projects' || rest.length < 4) {
+    throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
+  }
+  const org = rest[1]!;
+  const project = rest[3]!;
+  // Tenancy: another org's resources are indistinguishable from unknown
+  // ones (404 — never 403 — so existence is not leaked).
+  if (principal.org !== org) {
+    throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
+  }
+  ctx.org = org;
+  ctx.project = project;
+
+  const tail = rest.slice(4);
+  // /v1/orgs/{org}/projects/{project} → project-level routes
+  if (tail.length === 0) {
+    requireMethod(method, 'GET', `/v1/orgs/${org}/projects/${project}`);
+    requireLevel(principal, Levels.read);
+    const contracts = await deps.driver.list(org, project);
+    sendJson(res, 200, { contracts });
+    return 200;
+  }
+
+  if (tail[0] !== 'contracts') {
     throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
   }
 
-  // Authentication covers every /api/v1 route; authorization happens per route.
-  ctx.auth = authenticate(deps.tokens, req.headers.authorization);
-
-  switch (route.kind) {
-    case 'list': {
-      requireMethod(method, 'GET', '/api/v1/contracts');
-      ctx.action = 'read';
-      sendJson(res, 200, { contracts: deps.store.list() });
-      return;
-    }
-    case 'contract': {
-      ctx.contract = route.name;
-      if (method === 'PUT') {
-        await publish(req, res, ctx, route.name, deps);
-        return;
+  if (tail.length === 1) {
+    // GET list is project-level (handled above); a bare /contracts POST
+    // is a project-scoped publish with the package name inside the body.
+    if (method === 'POST' || method === 'PUT') {
+      ctx.action = 'publish';
+      requireLevel(principal, Levels.publish);
+      const body = await readJsonBody(req);
+      const name = body['packageName'];
+      if (typeof name !== 'string') {
+        throw new ServiceError(400, 'invalid_argument', 'body.packageName is required');
       }
-      requireMethod(method, 'GET', `/api/v1/contracts/${route.name}`);
-      ctx.action = 'read';
-      const { name, version } = splitTarget(route.name);
-      if (version === null) {
-        const latest = deps.store.latest(name); // 404 when unknown
-        const { ir, meta } = deps.store.pull(name, latest.version);
-        ctx.version = meta.version;
-        sendJson(res, 200, { ir, meta });
-      } else {
-        const { ir, meta } = deps.store.pull(name, version); // re-verifies integrity
-        ctx.version = meta.version;
-        sendJson(res, 200, { ir, meta });
-      }
-      return;
+      const contract = assertContractName(name);
+      ctx.contract = splitPackageVersion(contract).base;
+      return publish(req, res, ctx, deps, org, project, contract, body);
     }
-    case 'versions': {
-      requireMethod(method, 'GET', `/api/v1/contracts/${route.name}/versions`);
-      ctx.action = 'read';
-      ctx.contract = route.name;
-      sendJson(res, 200, { name: route.name, versions: deps.store.versions(route.name) });
-      return;
-    }
-    case 'dependents': {
-      requireMethod(method, 'GET', `/api/v1/contracts/${route.name}/dependents`);
-      ctx.action = 'read';
-      ctx.contract = route.name;
-      sendJson(res, 200, { dependents: deps.store.dependents(route.name) });
-      return;
-    }
-    case 'search': {
-      requireMethod(method, 'GET', '/api/v1/search');
-      ctx.action = 'read';
-      const query = url.searchParams.get('q') ?? '';
-      sendJson(res, 200, { query, results: deps.store.search(query) });
-      return;
-    }
-    case 'audit': {
-      requireMethod(method, 'GET', '/api/v1/audit');
-      ctx.action = 'audit';
-      requireRole(ctx.auth, Roles.admin);
-      sendJson(res, 200, { entries: deps.audit.tail(auditLimit(url)) });
-      return;
-    }
+    requireMethod(method, 'GET', `/v1/orgs/${org}/projects/${project}/contracts`);
+    const contracts = await deps.driver.list(org, project);
+    sendJson(res, 200, { contracts });
+    return 200;
   }
+
+  const contract = assertContractName(tail[1]!);
+  ctx.contract = splitPackageVersion(contract).base;
+
+  // PUT/POST /v1/orgs/{org}/projects/{project}/contracts/{contract} — publish
+  if (tail.length === 2 && (method === 'PUT' || method === 'POST')) {
+    ctx.action = 'publish';
+    requireLevel(principal, Levels.publish);
+    const body = await readJsonBody(req);
+    return publish(req, res, ctx, deps, org, project, contract, body);
+  }
+
+  requireMethod(method, 'GET', `/v1/orgs/${org}/projects/${project}/contracts/${contract}`);
+
+  if (tail.length === 2) {
+    // Latest version (or the version embedded in the route name).
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const { base, version } = splitPackageVersion(contract);
+    ctx.contract = base;
+    const target = version ?? (await deps.driver.latest(org, project, base)).version;
+    ctx.version = target;
+    const { ir, meta } = await deps.driver.pull(org, project, base, target);
+    sendJson(res, 200, { ir, meta });
+    return 200;
+  }
+
+  if (tail.length === 3 && tail[2] === 'versions') {
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const base = splitPackageVersion(contract).base;
+    const versions = await deps.driver.versions(org, project, base);
+    sendJson(res, 200, { contract: base, versions });
+    return 200;
+  }
+
+  if (tail.length === 4 && tail[2] === 'versions') {
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const base = splitPackageVersion(contract).base;
+    const version = normalizeVersionParam(tail[3]!);
+    ctx.version = version;
+    const { ir, meta } = await deps.driver.pull(org, project, base, version);
+    sendJson(res, 200, { ir, meta });
+    return 200;
+  }
+
+  if (tail.length === 5 && tail[2] === 'versions' && tail[4] === 'consumers') {
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const base = splitPackageVersion(contract).base;
+    const version = normalizeVersionParam(tail[3]!);
+    ctx.version = version;
+    const consumers = await deps.driver.dependents(org, project, base);
+    sendJson(res, 200, { contract: base, version, consumers });
+    return 200;
+  }
+
+  if (tail.length === 3 && tail[2] === 'diff') {
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const base = splitPackageVersion(contract).base;
+    const from = normalizeVersionParam(url.searchParams.get('from') ?? '');
+    const to = normalizeVersionParam(url.searchParams.get('to') ?? '');
+    ctx.version = to;
+    const oldIr = (await deps.driver.pull(org, project, base, from)).ir;
+    const newIr = (await deps.driver.pull(org, project, base, to)).ir;
+    const report = diffPackages(oldIr, newIr);
+    sendJson(res, 200, {
+      contract: base,
+      from,
+      to,
+      verdict: report.verdict,
+      summary: report.summary,
+      changes: report.changes,
+    });
+    return 200;
+  }
+
+  if (tail.length === 3 && tail[2] === 'graph') {
+    ctx.action = 'read';
+    requireLevel(principal, Levels.read);
+    const base = splitPackageVersion(contract).base;
+    const meta = await deps.driver.latest(org, project, base);
+    ctx.version = meta.version;
+    const deps_closure = await deps.driver.dependencies(org, project, base);
+    const nodes = [
+      { name: meta.packageName, version: meta.version, hash: meta.hash },
+      ...deps_closure.map((name) => ({ name })),
+    ];
+    const edges = deps_closure.map((dep) => ({ from: meta.packageName, to: dep }));
+    sendJson(res, 200, { contract: base, version: meta.version, nodes, edges });
+    return 200;
+  }
+
+  throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
 }
 
 // ------------------------------------------------------------------ publish
 
-interface PublishPayload {
-  ir: IRPackage;
-  meta: PublishMeta;
-  publishTime?: string;
-  version?: string;
-}
-
+/**
+ * Publish flow: signature verification → IR validation → content-hash
+ * tripwire → driver publish (immutability enforced below the driver).
+ */
 async function publish(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RequestContext,
-  routeName: string,
   deps: Deps,
-): Promise<void> {
-  ctx.action = 'publish';
-  const auth = ctx.auth; // authenticate() has run for every /api/v1 route
-  if (auth === null) {
-    throw new ServiceError(401, 'unauthenticated', 'missing or invalid bearer token');
+  org: string,
+  project: string,
+  contract: string,
+  body: unknown,
+): Promise<number> {
+  const ip = clientIp(req) ?? 'unknown';
+  const publishDecision = deps.limiter.take('publish', `${ctx.subject ?? ''}|${ip}`);
+  if (!publishDecision.ok) {
+    res.setHeader('Retry-After', String(publishDecision.retryAfterSeconds));
+    throw new ServiceError(429, 'rate-limited', 'publish rate limit exceeded');
   }
-  requireRole(auth, Roles.write);
 
-  const bodyText = await readBody(req);
-  const parsed = parseJsonBody(bodyText);
-  const payload = extractPublishPayload(parsed);
-  const target = resolvePublishTarget(routeName, payload.ir, payload.version);
-  // Record the attempted coordinates for the audit log even on failure.
-  ctx.version = (target.version ?? splitPackageVersion(payload.ir.name).version) || null;
+  // Signature verification happens BEFORE any parsing of the payload so a
+  // tampered body can never reach storage.
+  verifyPublishSignature(body, req.headers, deps.signing);
 
-  const existed = probeExisting(deps.store, payload.ir.name, target.version);
-  const meta = deps.store.publish(
-    payload.ir,
-    { ...payload.meta, owner: auth.tenant },
-    { publishTime: payload.publishTime, version: target.version },
-  );
-  ctx.version = meta.version;
-  sendJson(res, existed ? 200 : 201, { meta });
-}
-
-/** Parse the request body into the publish payload (envelope or bare IR). */
-function extractPublishPayload(parsed: unknown): PublishPayload {
-  if (!isPlainObject(parsed)) {
+  if (!isPlainObject(body)) {
     throw new ServiceError(400, 'invalid_argument', 'request body must be a JSON object');
   }
-  let ir: unknown;
-  let meta: unknown = {};
-  let publishTime: unknown;
-  let version: unknown;
-  if (parsed['ir'] !== undefined) {
-    ir = parsed['ir'];
-    meta = parsed['meta'] ?? {};
-    publishTime = parsed['publishTime'];
-    version = parsed['version'];
-  } else if (typeof parsed['name'] === 'string') {
-    ir = parsed; // bare-IR form: the body is the IR itself
-  } else {
-    throw new ServiceError(
-      400,
-      'invalid_argument',
-      'request body must be {"ir": <IRPackage>, "meta"?: {...}} or an IR object with a string "name"',
-    );
+  const rawIr = body['ir'];
+  if (!isPlainObject(rawIr)) {
+    throw new ServiceError(400, 'invalid_argument', 'body.ir is required');
   }
-  if (!isPlainObject(ir)) {
-    throw new ServiceError(400, 'invalid_argument', 'body.ir must be a JSON object');
+  const validated = validateIRPackage(rawIr);
+  if (!validated.ok) {
+    throw new ServiceError(400, 'invalid_contract', 'contract failed validation', {
+      errors: validated.errors.slice(0, 50),
+    });
   }
-  if (typeof ir['name'] !== 'string') {
-    throw new ServiceError(400, 'invalid_argument', 'body.ir.name must be a string');
-  }
-  if (!isPlainObject(meta)) {
-    throw new ServiceError(400, 'invalid_argument', 'body.meta must be a JSON object');
-  }
-  const publishMeta: PublishMeta = {};
-  for (const field of ['description', 'repository'] as const) {
-    const value = meta[field];
-    if (value === undefined) continue;
-    if (typeof value !== 'string') {
-      throw new ServiceError(400, 'invalid_argument', `body.meta.${field} must be a string`);
-    }
-    publishMeta[field] = value;
-  }
-  if (meta['owner'] !== undefined && typeof meta['owner'] !== 'string') {
-    throw new ServiceError(400, 'invalid_argument', 'body.meta.owner must be a string when provided');
-  }
-  if (publishTime !== undefined && typeof publishTime !== 'string') {
-    throw new ServiceError(400, 'invalid_argument', 'body.publishTime must be a string');
-  }
-  if (version !== undefined && typeof version !== 'string') {
-    throw new ServiceError(400, 'invalid_argument', 'body.version must be a string');
-  }
-  return {
-    ir: ir as unknown as IRPackage,
-    meta: publishMeta,
-    publishTime: publishTime as string | undefined,
-    version: version as string | undefined,
-  };
-}
+  const ir = validated.ir;
 
-/**
- * Reconcile the route target with the IR's own name.
- *
- * Accepted route shapes: `payments`, `payments.v1`, `payments@v1`.
- * The route base must equal the IR name's base, and an explicit route
- * version must agree with the IR name's version segment. When the IR name
- * carries no version, the route version (or body `version`) selects one;
- * when neither exists the store rejects with `invalid-version` (400).
- */
-function resolvePublishTarget(
-  routeName: string,
-  ir: IRPackage,
-  bodyVersion: string | undefined,
-): { name: string; version: string | undefined } {
-  const at = routeName.indexOf('@');
-  let namePart = routeName;
-  let atVersion: string | null = null;
-  if (at >= 0) {
-    namePart = routeName.slice(0, at);
-    atVersion = routeName.slice(at + 1);
-    if (namePart === '' || atVersion === '') {
-      throw new ServiceError(
-        400,
-        'invalid_argument',
-        `route name '${routeName}': expected <name>@<version> with non-empty parts`,
-      );
-    }
-  }
+  const actualHash = hashPackage(ir);
+  assertContentHash(body, actualHash);
 
-  const routeParts = splitPackageVersion(namePart);
-  const irParts = splitPackageVersion(ir.name);
-  if (routeParts.base !== irParts.base) {
-    throw new ServiceError(
-      400,
-      'invalid_argument',
-      `route name '${routeName}' does not match IR package name '${ir.name}'`,
-    );
-  }
-  if (atVersion !== null && routeParts.version !== '' && routeParts.version !== atVersion) {
-    throw new ServiceError(
-      400,
-      'invalid_argument',
-      `route name '${routeName}' carries conflicting versions '${atVersion}' and '${routeParts.version}'`,
-    );
-  }
+  const { base, version: embedded } = splitPackageVersion(contract);
+  const explicitVersion =
+    typeof body['version'] === 'string' && body['version'].length > 0
+      ? body['version']
+      : undefined;
+  const version = embedded ?? explicitVersion ?? 'v1';
 
-  const routeVersion = atVersion ?? (routeParts.version !== '' ? routeParts.version : null);
-  if (irParts.version !== '') {
-    if (routeVersion !== null && normalizeVersion(routeVersion) !== irParts.version) {
-      throw new ServiceError(
-        400,
-        'invalid_argument',
-        `route version '${routeVersion}' does not match IR package name '${ir.name}'`,
-      );
-    }
-    return { name: ir.name, version: undefined }; // store derives from ir.name
-  }
-  if (routeVersion !== null && bodyVersion !== undefined) {
-    if (normalizeVersion(routeVersion) !== normalizeVersion(bodyVersion)) {
-      throw new ServiceError(
-        400,
-        'invalid_argument',
-        `route version '${routeVersion}' conflicts with body version '${bodyVersion}'`,
-      );
-    }
-  }
-  const version = routeVersion ?? bodyVersion;
-  return { name: ir.name, version };
-}
+  const metaRaw = isPlainObject(body['meta']) ? body['meta'] : {};
+  const meta: PublishMeta = {};
+  if (typeof metaRaw['description'] === 'string') meta.description = metaRaw['description'].slice(0, 2048);
+  if (typeof metaRaw['repository'] === 'string') meta.repository = metaRaw['repository'].slice(0, 2048);
 
-/** Best-effort "does this version already exist" probe for 200-vs-201. */
-function probeExisting(store: RegistryStore, name: string, version: string | undefined): boolean {
-  const resolved = version ?? splitPackageVersion(name).version;
-  if (resolved === '') return false; // store will reject with 'invalid-version'
-  try {
-    store.inspect(name, resolved);
-    return true;
-  } catch (err) {
-    if (err instanceof RegistryError && err.code === 'not-found') return false;
-    throw err;
-  }
+  const publishTime =
+    typeof body['publishTime'] === 'string' && body['publishTime'].length > 0
+      ? body['publishTime']
+      : undefined;
+
+  const result = await deps.driver.publish({
+    org,
+    project,
+    ir,
+    meta,
+    version,
+    publishTime,
+    publishedBy: ctx.subject ?? 'unknown',
+  });
+  ctx.version = result.meta.version;
+
+  const status = result.outcome === 'created' ? 201 : 200;
+  sendJson(res, status, { outcome: result.outcome, meta: result.meta });
+  return status;
 }
 
 // ------------------------------------------------------------------ helpers
 
-function classifyRoute(rest: Segments): Route | null {
-  if (rest.length === 1 && rest[0] === 'contracts') return { kind: 'list' };
-  if (rest.length === 2 && rest[0] === 'contracts') return { kind: 'contract', name: rest[1] ?? '' };
-  if (rest.length === 3 && rest[0] === 'contracts') {
-    if (rest[2] === 'versions') return { kind: 'versions', name: rest[1] ?? '' };
-    if (rest[2] === 'dependents') return { kind: 'dependents', name: rest[1] ?? '' };
-    return null;
-  }
-  if (rest.length === 1 && rest[0] === 'search') return { kind: 'search' };
-  if (rest.length === 1 && rest[0] === 'audit') return { kind: 'audit' };
-  return null;
+function clientIp(req: IncomingMessage): string | null {
+  return req.socket.remoteAddress ?? null;
 }
 
-/** Split `name@version`; `@`-less targets have `version: null`. */
-function splitTarget(segment: string): { name: string; version: string | null } {
-  const at = segment.lastIndexOf('@');
-  if (at <= 0) return { name: segment, version: null };
-  const name = segment.slice(0, at);
-  const version = segment.slice(at + 1);
-  if (version === '') {
-    throw new ServiceError(400, 'invalid_argument', `empty version after '@' in '${segment}'`);
+function limitParam(url: URL): number | undefined {
+  const raw = url.searchParams.get('limit');
+  if (raw === null) return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : undefined;
+}
+
+function normalizeVersionParam(value: string): string {
+  if (value.length === 0 || value.length > 128) {
+    throw new ServiceError(400, 'invalid_argument', 'invalid version parameter');
   }
-  return { name, version };
+  return value.startsWith('v') || /^v/i.test(value) ? `v${value.slice(1)}` : `v${value}`;
 }
 
 function decodeSegment(segment: string): string {
-  return decodeURIComponent(segment);
-}
-
-function requireMethod(method: string, allowed: string, what: string): void {
-  if (method !== allowed) {
-    throw new ServiceError(405, 'method-not-allowed', `method ${method} is not allowed for ${what}`);
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    throw new ServiceError(400, 'invalid_argument', 'malformed percent-encoding in request path');
   }
 }
 
-function auditLimit(url: URL): number {
-  const raw = url.searchParams.get('limit');
-  if (raw === null) return DEFAULT_AUDIT_TAIL;
-  if (raw.trim() === '') {
-    throw new ServiceError(400, 'invalid_argument', 'query parameter limit must be a non-negative integer');
+function requireMethod(method: string, expected: string, route: string): void {
+  if (method !== expected) {
+    throw new ServiceError(405, 'method-not-allowed', `method ${method} is not allowed for ${route}`);
   }
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value < 0 || Math.trunc(value) !== value) {
-    throw new ServiceError(400, 'invalid_argument', `query parameter limit '${raw}' is not a non-negative integer`);
-  }
-  return Math.min(Math.trunc(value), MAX_AUDIT_TAIL);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const body = await readRawBody(req);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    throw new ServiceError(400, 'invalid_argument', 'request body is not valid JSON');
+  }
+  if (!isPlainObject(parsed)) {
+    throw new ServiceError(400, 'invalid_argument', 'request body must be a JSON object');
+  }
+  return parsed;
+}
+
+async function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    let size = 0;
+    let total = 0;
     req.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
         reject(new ServiceError(413, 'payload-too-large', `request body exceeds ${MAX_BODY_BYTES} bytes`));
         req.destroy();
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', (err) => reject(err));
   });
 }
 
-function parseJsonBody(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    throw new ServiceError(
-      400,
-      'invalid_argument',
-      `request body is not valid JSON: ${(err as Error).message}`,
-    );
-  }
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const data = Buffer.from(JSON.stringify(body), 'utf8');
+function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': String(data.byteLength),
+    'content-length': Buffer.byteLength(body),
   });
-  res.end(data);
+  res.end(body);
 }
 
-function sendError(res: ServerResponse, err: unknown): void {
+function sendError(res: ServerResponse, err: unknown): number {
+  if (res.headersSent) {
+    res.destroy();
+    return 500;
+  }
   let status = 500;
-  let code = 'internal';
-  let message = 'internal server error';
+  let code: string = 'internal';
+  let message = 'internal error';
+  let details: unknown;
+
   if (err instanceof ServiceError) {
     status = err.status;
     code = err.code;
     message = err.message;
+    details = err.details;
   } else if (err instanceof RegistryError) {
     status = statusForRegistryError(err.code);
     code = err.code;
     message = err.message;
-  } else if (err instanceof TypeError) {
-    // Store argument validation (e.g. malformed IR shapes from clients).
-    status = 400;
-    code = 'invalid_argument';
-    message = err.message;
+    if (status >= 500) message = 'storage error';
+  } else {
+    // Unknown failures never leak internals.
+    console.error('registry-service internal error:', err);
   }
-  try {
-    sendJson(res, status, { error: { code, message } });
-  } catch {
-    // Socket already destroyed (client abort): nothing to send.
-    res.destroy();
-  }
-}
 
-function appendAudit(sink: AuditSink, ctx: RequestContext, ok: boolean): void {
-  if (ctx.action === null) return;
-  const entry: AuditEntry = {
-    time: new Date().toISOString(),
-    action: ctx.action,
-    tenant: ctx.auth?.tenant ?? null,
-    contract: ctx.contract,
-    version: ctx.version,
-    ok,
-  };
-  try {
-    sink.append(entry);
-  } catch (err) {
-    // A broken audit sink must not take the response down with it.
-    console.error('[bridge-registry-service] audit append failed:', (err as Error)?.message ?? err);
+  const envelope: Record<string, unknown> = { error: { code, message } };
+  if (details !== undefined) {
+    (envelope['error'] as Record<string, unknown>)['details'] = details;
   }
+  const body = JSON.stringify(envelope);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+  return status;
 }
