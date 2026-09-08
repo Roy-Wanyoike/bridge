@@ -139,7 +139,7 @@ type Ticket {
     id: TicketId
     priority: int32 @min(1) @max(5) = 3
     contact: Contact
-    tags: list<string> @length(0)
+    tags: list<string>
     score: float64?
     /// deprecated legacy field
     old_ref: uuid? @deprecated("use id")
