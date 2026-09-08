@@ -2,15 +2,21 @@
 # scripts/verify-all.sh — regenerate + verify generated code for every example.
 #
 # Runs the full local verification suite in sequence and prints a summary.
-# Exit status: 0 when every check passes, 1 if any check fails.
+# Exit status: 0 when every check passed (skips allowed), 1 if any check
+# failed or — with STRICT_SKIP=1 — if any check was skipped.
 #
 #   node scripts/generate-all.mjs   (run by each verifier; idempotent)
 #   scripts/verify-python.sh        — ast.parse + import + round-trip
 #   scripts/verify-ts.sh            — workspace tsc over generated packages
-#   scripts/verify-go.sh            — go vet + go build (skips w/o toolchain)
-#   scripts/verify-rust.sh          — cargo check + clippy (skips w/o toolchain)
-#   scripts/verify-java.sh          — javac/ecj compile + round-trip (skips w/o toolchain)
-#   scripts/verify-csharp.sh        — dotnet build + round-trip (skips w/o toolchain)
+#   scripts/verify-go.sh            — go vet + go build (SKIP w/o toolchain)
+#   scripts/verify-rust.sh          — cargo check + clippy (SKIP w/o toolchain)
+#   scripts/verify-java.sh          — javac/ecj compile + round-trip (SKIP w/o)
+#   scripts/verify-csharp.sh        — dotnet build + round-trip (SKIP w/o toolchain)
+#
+# Skip semantics: verifiers exit 77 (SKIP_EXITS-overridable) when their
+# toolchain is missing; that is reported as SKIP, not PASS. Locally a skip
+# leaves the overall result green; set STRICT_SKIP=1 (CI contexts) to fail
+# on any skipped leg.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,8 +28,15 @@ results=""
 run() {
   local name="$1"
   shift
-  if "$@"; then
+  local rc=0
+  "$@" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     results+="PASS  ${name}"$'\n'
+  elif [ "$rc" -eq 77 ]; then
+    results+="SKIP  ${name}"$'\n'
+    if [ "${STRICT_SKIP:-0}" = "1" ]; then
+      overall=1
+    fi
   else
     results+="FAIL  ${name}"$'\n'
     overall=1

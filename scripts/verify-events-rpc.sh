@@ -37,16 +37,13 @@ pass "tsc --strict clean"
 
 # ---------------------------------------------------------------- Go
 step "2/6 Go: generate + build + vet + test"
-if command -v go > /dev/null 2>&1; then
-  GO=go
-elif [ -x /home/z/toolchain/go/bin/go ]; then
-  GO=/home/z/toolchain/go/bin/go
-else
-  echo "  SKIP Go toolchain not available"; GO=""
+GO_BIN="${GO:-go}"
+if ! command -v "$GO_BIN" > /dev/null 2>&1; then
+  echo "  SKIP Go toolchain not available (set GO=<path-to-go> to override)"; GO_BIN=""
 fi
-if [ -n "${GO:-}" ]; then
+if [ -n "$GO_BIN" ]; then
   node "$CLI" generate "$CONTRACT" --language go --out "$WORK/go" --force > /dev/null
-  (cd "$WORK/go" && "$GO" build ./... && "$GO" vet ./... && "$GO" test ./... > /dev/null)
+  (cd "$WORK/go" && "$GO_BIN" build ./... && "$GO_BIN" vet ./... && "$GO_BIN" test ./... > /dev/null)
   pass "go build + vet + test"
 fi
 

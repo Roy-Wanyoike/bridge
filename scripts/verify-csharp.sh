@@ -5,16 +5,17 @@
 # Regenerates code on the fly (scripts/generate-all.mjs), then runs
 # `dotnet build` and `dotnet run` (the generated RoundTripTest entry
 # point) in each examples/*/generated/csharp project. Without the .NET
-# SDK this skips gracefully (exit 0) — CI, which has dotnet installed,
-# enforces the same checks.
+# SDK this prints "SKIP <reason>" to stderr and exits 77 (overridable via
+# SKIP_EXITS for local convenience) so callers can distinguish a skip from
+# a pass; CI, which has dotnet installed, enforces the same checks.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if ! command -v dotnet >/dev/null 2>&1; then
-  echo ".NET SDK not available — skipping (CI covers this)"
-  exit 0
+  echo "SKIP .NET SDK not available (CI covers this)" >&2
+  exit "${SKIP_EXITS:-77}"
 fi
 
 node scripts/generate-all.mjs || exit 1

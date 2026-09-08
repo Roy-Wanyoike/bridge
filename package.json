@@ -15,12 +15,15 @@
     "packages/*"
   ],
   "devDependencies": {
+    "@eslint/js": "^9.39.2",
     "@types/node": "^22.0.0",
-    "typescript": "^5.9.3"
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.4"
   },
   "scripts": {
     "build": "tsc -b packages/bridge-core packages/bridge-generators packages/bridge-compat packages/bridge-registry packages/bridge-serialization packages/bridge-registry-service packages/bridge-cli packages/bridge-ffi",
     "test": "npm run test --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present"
+    "lint": "eslint packages --max-warnings 25"
   }
 }
