@@ -166,6 +166,7 @@ export interface ConsumerRef {
 
 /** Node of the dependency graph (one per contract, at its latest version). */
 export interface GraphNode {
+  /** Stable unique key: `org/project/base` (base names can repeat across orgs). */
   id: string;
   org: string;
   project: string;

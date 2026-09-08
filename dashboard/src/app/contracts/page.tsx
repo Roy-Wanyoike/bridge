@@ -22,7 +22,10 @@ import { cn } from '@/lib/utils';
 
 export const dynamic = 'force-dynamic';
 
-export const metadata = { title: 'Contracts' };
+export const metadata = {
+  title: 'Contracts',
+  description: 'Browse every published contract at its latest version: owners, verdicts, consumers and generated languages.',
+};
 
 const SORTS: Record<string, string> = {
   name: 'Name (A-Z)',

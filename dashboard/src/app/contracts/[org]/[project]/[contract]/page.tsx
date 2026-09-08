@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { ClassificationBadge, VerdictBadge } from '@/components/classification-badge';
 import { CodeSnippet } from '@/components/code-snippet';
+import { CopyButton } from '@/components/copy-button';
 import { EmptyState } from '@/components/empty-state';
 import { LanguageBadges } from '@/components/language-badges';
 import { Badge } from '@/components/ui/badge';
@@ -35,7 +36,10 @@ type Params = Promise<{ org: string; project: string; contract: string }>;
 
 export async function generateMetadata({ params }: { params: Params }) {
   const { org, project, contract } = await params;
-  return { title: `${contract} (${org}/${project})` };
+  return {
+    title: `${contract} (${org}/${project})`,
+    description: `Versions, consumers, producers and schema of the ${contract} contract in ${org}/${project}.`,
+  };
 }
 
 export default async function ContractDetailPage({ params }: { params: Params }) {
@@ -45,7 +49,11 @@ export default async function ContractDetailPage({ params }: { params: Params })
   const summary = await client.getContract(org, project, contract);
   if (!summary) notFound();
 
-  const versions = await client.listVersions(org, project, contract);
+  // API order is not guaranteed: index everything by publication time so
+  // "latest" and adjacent-diff windows are chronological.
+  const versions = (await client.listVersions(org, project, contract)).sort((a, b) =>
+    a.publishedAt.localeCompare(b.publishedAt),
+  );
   const latest = versions[versions.length - 1];
   const latestDetail = await client.getVersion(org, project, contract, latest?.version ?? 'v1');
   const consumers = latest
@@ -114,7 +122,8 @@ export default async function ContractDetailPage({ params }: { params: Params })
           )}
           <span className="inline-flex items-center gap-1.5">
             <Fingerprint className="h-3.5 w-3.5" aria-hidden="true" />
-            <span className="font-mono text-[13px] text-zinc-400">{summary.latestHash}</span>
+            <span className="font-mono text-[13px] text-zinc-400">{summary.latestShortHash}</span>
+            <CopyButton value={summary.latestHash} label="Copy hash" className="h-6 px-1.5" />
           </span>
           <span className="inline-flex items-center gap-2">
             Generated for <LanguageBadges languages={summary.languages} />
@@ -188,8 +197,9 @@ export default async function ContractDetailPage({ params }: { params: Params })
                       Published by <span className="text-foreground">{v.publisher}</span>
                     </span>
                     <span>{formatDateTime(v.publishedAt)}</span>
-                    <span className="font-mono text-[12px] text-zinc-400">
-                      sha256:{v.hash}
+                    <span className="inline-flex items-center gap-1 font-mono text-[12px] text-zinc-400">
+                      sha256:{v.shortHash}
+                      <CopyButton value={v.hash} label="Copy hash" className="h-6 px-1.5" />
                     </span>
                     <span className="inline-flex items-center gap-2">
                       languages <LanguageBadges languages={v.languages} />

@@ -18,7 +18,10 @@ type SP = Promise<{ from?: string; to?: string }>;
 
 export async function generateMetadata({ params }: { params: Params }) {
   const { org, project, contract } = await params;
-  return { title: `Compatibility: ${contract} (${org}/${project})` };
+  return {
+    title: `Compatibility: ${contract} (${org}/${project})`,
+    description: `Classified compatibility report between versions of ${contract} in ${org}/${project}, with consumer impact.`,
+  };
 }
 
 const VERDICT_BANNER: Record<Classification, { border: string; bg: string; text: string }> = {
@@ -65,7 +68,11 @@ export default async function DiffPage({
   const summary = await client.getContract(org, project, contract);
   if (!summary) notFound();
 
-  const versions = await client.listVersions(org, project, contract);
+  // API order is not guaranteed: sort by publication time so "latest" and
+  // the adjacent-version diff window are chronological.
+  const versions = (await client.listVersions(org, project, contract)).sort((a, b) =>
+    a.publishedAt.localeCompare(b.publishedAt),
+  );
   if (versions.length === 0) notFound();
 
   const from = versions.some((v) => v.version === sp.from)

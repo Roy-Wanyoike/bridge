@@ -7,9 +7,10 @@ export default function NotFound() {
   return (
     <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3 text-center">
       <FileQuestion className="h-10 w-10 text-muted-foreground/60" aria-hidden="true" />
-      <h1 className="text-lg font-semibold">Contract not found</h1>
+      <h1 className="text-lg font-semibold">Page not found</h1>
       <p className="max-w-md text-sm text-muted-foreground">
-        The contract, project or version you requested does not exist in this registry scope.
+        The page you requested does not exist in this console. If you followed a link to a
+        contract, it may have been moved or never published to this registry.
       </p>
       <Link href="/contracts" className={cn(buttonVariants(), 'mt-2')}>
         Browse contracts

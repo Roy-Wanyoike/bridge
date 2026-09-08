@@ -39,12 +39,22 @@ export function CopyButton({
   label?: string;
 }) {
   const [copied, setCopied] = React.useState(false);
+  const timerRef = React.useRef<number | null>(null);
+
+  // Clear a pending reset timer on unmount so it never fires into a
+  // detached component.
+  React.useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   const onCopy = async () => {
     const ok = await copyText(value);
     if (ok) {
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => setCopied(false), 1600);
     }
   };
 
