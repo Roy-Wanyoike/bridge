@@ -4,8 +4,9 @@
 # Regenerates code on the fly (scripts/generate-all.mjs), then for each
 # examples/*/generated/python: ast.parse every module, import the package,
 # and run a generic to_dict/from_dict round-trip for every dataclass.
-# Exit status: 0 when everything passes (or when python3 is unavailable —
-# CI covers it), 1 on the first category of failure.
+# Exit status: 0 when everything passes, 1 on the first category of failure,
+# and 77 (overridable via SKIP_EXITS) with a "SKIP <reason>" on stderr when
+# python3 is unavailable — CI covers that leg.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,8 +14,8 @@ cd "$ROOT"
 
 PY="${PYTHON:-python3}"
 if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "python3 not available — skipping (CI covers this)"
-  exit 0
+  echo "SKIP python3 not available (CI covers this)" >&2
+  exit "${SKIP_EXITS:-77}"
 fi
 
 node scripts/generate-all.mjs || exit 1

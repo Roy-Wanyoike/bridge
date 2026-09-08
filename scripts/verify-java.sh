@@ -6,8 +6,9 @@
 # examples/*/generated/java tree, and runs the generated RoundTripTest.
 # Prefers javac (JDK); falls back to the Eclipse batch compiler via the
 # ECJ_JAR environment variable (`java -jar "$ECJ_JAR"`). When neither is
-# available this skips gracefully (exit 0) — CI, which has a JDK,
-# enforces the same checks.
+# available this prints "SKIP <reason>" to stderr and exits 77 (overridable
+# via SKIP_EXITS for local convenience) so callers can distinguish a skip
+# from a pass; CI, which has a JDK, enforces the same checks.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,8 +22,8 @@ elif [ -n "${ECJ_JAR:-}" ] && [ -f "${ECJ_JAR}" ]; then
 fi
 
 if [ -z "$mode" ]; then
-  echo "Java compiler not available (javac or ECJ_JAR) — skipping (CI covers this)"
-  exit 0
+  echo "SKIP Java compiler not available (javac or ECJ_JAR; CI covers this)" >&2
+  exit "${SKIP_EXITS:-77}"
 fi
 
 node scripts/generate-all.mjs || exit 1

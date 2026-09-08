@@ -3,16 +3,18 @@
 #
 # Regenerates code on the fly (scripts/generate-all.mjs), then runs
 # `go vet ./...` and `go build ./...` in each examples/*/generated/go module.
-# Without a local Go toolchain this skips gracefully (exit 0) — CI, which has
-# Go installed, enforces the same checks.
+# Without a local Go toolchain this prints "SKIP <reason>" to stderr and
+# exits 77 (overridable via SKIP_EXITS for local convenience) so callers can
+# distinguish a skip from a pass; CI, which has Go installed, enforces the
+# same checks.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if ! command -v go >/dev/null 2>&1; then
-  echo "go toolchain not available — skipping (CI covers this)"
-  exit 0
+  echo "SKIP go toolchain not available (CI covers this)" >&2
+  exit "${SKIP_EXITS:-77}"
 fi
 
 node scripts/generate-all.mjs || exit 1

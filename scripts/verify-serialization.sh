@@ -23,15 +23,12 @@ npm test --workspace @bridge/serialization > /dev/null 2>&1 || fail "npm test @b
 pass "80/80 assertions (encode + decode + round-trips)"
 
 step "2/4 Go runtime (canonical writer + vmihailenco/msgpack + fxamacker/cbor)"
-if command -v go > /dev/null 2>&1; then
-  GO=go
-elif [ -x /home/z/toolchain/go/bin/go ]; then
-  GO=/home/z/toolchain/go/bin/go
-else
-  echo "  SKIP Go toolchain not available"; GO=""
+GO_BIN="${GO:-go}"
+if ! command -v "$GO_BIN" > /dev/null 2>&1; then
+  echo "  SKIP Go toolchain not available (set GO=<path-to-go> to override)"; GO_BIN=""
 fi
-if [ -n "${GO:-}" ]; then
-  (cd "$ROOT/packages/bridge-serialization/runtimes/go" && "$GO" run . "$VECTORS" > /dev/null)
+if [ -n "$GO_BIN" ]; then
+  (cd "$ROOT/packages/bridge-serialization/runtimes/go" && "$GO_BIN" run . "$VECTORS" > /dev/null)
   pass "160 checks byte-exact"
 fi
 

@@ -3,8 +3,10 @@
 #
 # Regenerates code on the fly (scripts/generate-all.mjs), then runs
 # `cargo check` (gating) and `cargo clippy` (reporting) in each
-# examples/*/generated/rust crate. Without a local Rust toolchain this skips
-# gracefully (exit 0) — CI, which has Rust installed, enforces the checks.
+# examples/*/generated/rust crate. Without a local Rust toolchain this
+# prints "SKIP <reason>" to stderr and exits 77 (overridable via SKIP_EXITS
+# for local convenience) so callers can distinguish a skip from a pass; CI,
+# which has Rust installed, enforces the checks.
 # Note: the generated crates depend on serde/serde_json, so the first
 # `cargo check` may fetch dependencies.
 set -u
@@ -13,8 +15,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "cargo toolchain not available — skipping (CI covers this)"
-  exit 0
+  echo "SKIP cargo toolchain not available (CI covers this)" >&2
+  exit "${SKIP_EXITS:-77}"
 fi
 
 node scripts/generate-all.mjs || exit 1
