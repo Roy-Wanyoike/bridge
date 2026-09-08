@@ -6,7 +6,7 @@ How Bridge tests itself, and how to reproduce any failure deterministically.
 
 | Layer | What it proves | Where |
 | ----- | -------------- | ----- |
-| Unit + functional suites | Every package behaves to spec (435+ tests) | `packages/*/src/test/` |
+| Unit + functional suites | Every package behaves to spec (669+ tests across nine packages) | `packages/*/src/test/` |
 | Golden vectors | 4 languages agree byte-for-byte on the wire | `packages/bridge-serialization/vectors/` + `scripts/verify-serialization.sh` |
 | Property-based tests | Invariants hold over hundreds of seeded generated inputs | `packages/*/src/test/property/` |
 | Fuzz harness | The parser and decoders never crash on hostile input | `packages/bridge-core/src/fuzz/` + `bin/bridge-fuzz` |

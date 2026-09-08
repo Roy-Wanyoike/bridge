@@ -126,8 +126,11 @@ registry reference (`--against payments.v1` / `--against payments.v1@v1`).
 bridge impact payments.v1 --to candidate.bridge --registry .bridge-registry --strict
 ```
 
-Advisory by default (exit 0); with `--strict` it exits 1 when any BREAKING
-change reaches at least one consumer contract, after walking the graph.
+Advisory by default (exit 0); with `--strict` it exits 1 when the diff
+contains **any BREAKING change** — whether or not that change reaches a
+consumer. The report still shows which consumers are affected (and which
+were scanned and cleared), so a strict failure always comes with the
+migration list attached.
 
 ### Example workflow
 

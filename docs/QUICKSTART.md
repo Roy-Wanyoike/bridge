@@ -14,7 +14,7 @@ without breaking consumers.
 > npm run build
 > ```
 >
-> The `bridge` binary then lives at `packages/bridge-cli/dist/index.js`
+> The `bridge` binary then lives at `packages/bridge-cli/dist/bin/bridge.js`
 > (link it or add an alias as you prefer).
 
 ---
@@ -26,7 +26,7 @@ bridge init payments-service
 ```
 
 Creates a ready-to-edit project layout with a first `.bridge` contract and
-a `bridge.config.json`. Prefer manual? Any directory with `*.bridge` files
+a `bridge.json`. Prefer manual? Any directory with `*.bridge` files
 works — Bridge has no required project file:
 
 ```
@@ -147,7 +147,7 @@ bridge check v1.payments.bridge v2.payments.bridge
 ```
 
 `check` implements the strict gate: BREAKING and UNKNOWN verdicts fail,
-SAFE and WARNING pass (use `bridge check --mode compatible` during an
+SAFE and WARNING pass (use `bridge check --compatible` during an
 explicit migration window). The full classification matrix and a
 GitHub Actions recipe: [COMPATIBILITY](./COMPATIBILITY.md).
 
@@ -208,5 +208,5 @@ The same one-liners drive every
   complete examples
 - [COMPATIBILITY](./COMPATIBILITY.md) — classification table, modes, CI
 - [ARCHITECTURE](./ARCHITECTURE.md) — how the pipeline fits together
-- [examples/](../examples) — seven runnable examples, each with exact
+- [examples/](../examples) — eight runnable examples, each with exact
   commands and expected output

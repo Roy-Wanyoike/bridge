@@ -35,13 +35,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signing, SPDX/CycloneDX SBOMs, multi-arch container images, npm
   publishing, Homebrew formula (`RELEASE.md`).
 - **LSP** (`@bridge/lsp`, #21) and **property/fuzz harnesses** (#23)
-  shipped earlier in the 0.1.x line; roadmap through Phase 3 is now
-  complete.
+  shipped during the run-up to 0.2.0 (no 0.1.x releases were cut);
+  the roadmap through Phase 3 is now complete.
+- **Serialization matrix** (`@bridge/serialization`, #31): golden
+  vectors + property tests proving byte-identical cross-language
+  round-trips — 50 values × 2 wire formats (MessagePack + CBOR) × 2
+  directions, plus reject vectors, verified in TypeScript, Go, Rust and
+  Python (`scripts/verify-serialization.sh`, wired into CI).
+- **Events + RPC** (#29): typed CloudEvents-style event
+  publishers/consumers/dispatchers and JSON-over-HTTP RPC clients +
+  server adapters generated in every language; cross-language pairing
+  proven over real TCP loopback (`scripts/verify-events-rpc.sh`, the
+  `examples/events-rpc` demo).
+- **Consumer-aware impact analysis** (`bridge impact`, #28): walks the
+  registry's dependency graph, reports which consumers a change reaches
+  (and through what), and gates CI (`--strict`); `check --against` diffs
+  against a published registry version. Markdown/JSON reports for PR
+  comments and automation.
+- **Audit-hardening wave**: a full-surface audit of the shipped code
+  produced fixes across the stack — registry-service secure-by-default
+  posture (rate limiting on, sane timeouts, stricter DSN/auth handling),
+  compiler robustness and new diagnostics (`BR1005`, `BR2104`,
+  `BR2016`–`BR2019`: constraint arity, recursive structs, RE2 `@pattern`,
+  set element rules), generator fixes for generated code that failed to
+  compile (Java/C# + CBOR timestamps), CLI correctness (git-conformant
+  diff hunks, JSON output contract, arg parsing), and CI unmasking
+  (generator-verify jobs no longer `continue-on-error`; dashboard and
+  PostgreSQL jobs added; least-privilege workflow permissions).
 
 ### Changed
 
 - README and roadmap updated to the shipped state; six target languages
   (Go, Rust, TypeScript, Python, Java, C#) plus WASM; nine packages.
+- **CLI** gained `bridge impact` — the command surface is now 16 commands
+  (`init` `validate` `fmt` `lint` `generate` `diff` `check` `impact`
+  `publish` `pull` `versions` `inspect` `search` `doctor` `version`
+  `help`).
 
 ## [0.1.0] — initial public pipeline
 
@@ -101,4 +130,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [ARCHITECTURE](docs/ARCHITECTURE.md) — cross-linked and verified against
   the shipped APIs.
 
+[0.2.0]: https://github.com/Roy-Wanyoike/bridge/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Roy-Wanyoike/bridge/releases/tag/v0.1.0

@@ -1,12 +1,12 @@
 # Bridge Roadmap
 
-A three-phase public roadmap — now fully shipped. Every item links to a tracked [GitHub issue](https://github.com/Roy-Wanyoike/bridge/issues) — subscribe there for progress and design discussion. The strategy behind the sequence is in [docs/strategy/MARKET_ANALYSIS.md](strategy/MARKET_ANALYSIS.md) and [docs/strategy/POSITIONING.md](strategy/POSITIONING.md).
+A three-phase public roadmap — shipped through Phase 3, with one AI-native item still open. Every item links to a tracked [GitHub issue](https://github.com/Roy-Wanyoike/bridge/issues) — subscribe there for progress and design discussion. The strategy behind the sequence is in [docs/strategy/MARKET_ANALYSIS.md](strategy/MARKET_ANALYSIS.md) and [docs/strategy/POSITIONING.md](strategy/POSITIONING.md).
 
 Legend: 🔲 planned · 🟡 in progress · ✅ done
 
 ## Phase 1 — The compiler era (shipped)
 
-One IDL → one deterministic IR → validated code in four languages, with compatibility checking and an immutable registry. 355+ tests green across five packages.
+One IDL → one deterministic IR → validated code in four languages, with compatibility checking and an immutable registry. Shipped with 355+ tests across five packages; the full suite now stands at 669+ tests across nine packages.
 
 | Capability | Status | Notes |
 |------------|--------|-------|
@@ -17,9 +17,9 @@ One IDL → one deterministic IR → validated code in four languages, with comp
 | Canonical formatter (`bridge fmt`) | ✅ | Idempotent, meaning-preserving |
 | Compatibility engine (`bridge diff` / `check`) | ✅ | SAFE / WARNING / BREAKING / UNKNOWN; rename synthesis; strict + compatible gates |
 | Go, Rust, TypeScript, Python generators | ✅ | Types, enums, tagged unions, aliases, validators, service clients/traits, event envelopes; byte-deterministic output |
-| CLI (15 commands) | ✅ | `init` `validate` `fmt` `lint` `generate` `diff` `check` `publish` `pull` `versions` `inspect` `search` `doctor` `version` |
+| CLI (16 commands) | ✅ | `init` `validate` `fmt` `lint` `generate` `diff` `check` `impact` `publish` `pull` `versions` `inspect` `search` `doctor` `version` `help` |
 | Local registry | ✅ | Content-addressed, immutable, tamper detection, `dependents`/`dependencies` graph |
-| Examples + verification scripts + docs | ✅ | Seven runnable examples; generated-code type-check and round-trip verification |
+| Examples + verification scripts + docs | ✅ | Eight runnable examples (seven with verified `demo.mjs` runs; `events-rpc` is verified by `scripts/verify-events-rpc.sh` in CI); generated-code type-check and round-trip verification |
 | CI: build, test matrix, generated-code verification | ✅ | GitHub Actions (Node 22/24 matrix + Go/Rust verify jobs) |
 
 ## Phase 2 — The governance era (shipped)
@@ -34,10 +34,10 @@ Prove wire-level correctness across languages, then turn the registry into the p
 | Consumer-aware impact analysis + CI governance | ✅ | [#19](https://github.com/Roy-Wanyoike/bridge/issues/19) | "17 consumers affected" — diff × registry graph, enforced in CI |
 | Registry service: server, OIDC auth, multi-tenancy, audit logs | ✅ | [#18](https://github.com/Roy-Wanyoike/bridge/issues/18) | `@bridge/registry-service`: OpenAPI, signing, rate limits, in-memory + PostgreSQL |
 | Dashboard (Next.js): contracts, versions, consumers, dependency graph | ✅ | [#20](https://github.com/Roy-Wanyoike/bridge/issues/20) | `dashboard/` — demo mode, SVG dependency graph, diff reports |
-| Release engineering: binaries, package managers, containers, SBOM | ✅ | [#24](https://github.com/Roy-Wanyoike/bridge/issues/24) | Bun-compiled binaries, cosign signing, SPDX/CycloneDX SBOMs, multi-arch images, npm — see [RELEASE.md](../RELEASE.md) |
+| Release engineering: binaries, package managers, containers, SBOM | ✅ | [#24](https://github.com/Roy-Wanyoike/bridge/issues/24) | Bun-compiled binaries, cosign signing, SPDX/CycloneDX SBOMs, multi-arch images, npm — see [RELEASE.md](../RELEASE.md). Pipeline shipped; the first release is not yet cut (Actions billing lock — the workflow runs once CI is unlocked) |
 | Property-based + fuzz harness expansion, deterministic caching | ✅ | [#23](https://github.com/Roy-Wanyoike/bridge/issues/23) | Parser/compat fuzzing; cache keyed on schema hash |
 
-## Phase 3 — The platform & AI-native era (shipped)
+## Phase 3 — The platform & AI-native era (shipped, except AI-native tooling)
 
 Widen the languages, lower the friction, and carry contracts across language boundaries — including to non-human consumers.
 
@@ -48,6 +48,6 @@ Widen the languages, lower the friction, and carry contracts across language bou
 | Java + C# generators | ✅ | [#25](https://github.com/Roy-Wanyoike/bridge/issues/25) | Compile-verified against every example (ECJ / dotnet in CI) |
 | AI-native tooling: tool-call/MCP schema emission from the IR | 🔲 | tracked under [#19](https://github.com/Roy-Wanyoike/bridge/issues/19) + [#22](https://github.com/Roy-Wanyoike/bridge/issues/22) discussion | Agent-facing contracts get the same governance plane (see [strategy](strategy/MARKET_ANALYSIS.md), Gap 6) |
 
-**Status: every phase above is shipped.** What's next: AI-native tooling (tool-call/MCP schema emission), gRPC/Connect transports, and consumer registry federation.
+**Status: every phase is shipped except AI-native tooling (Phase 3, last row).** What's next: AI-native tooling (tool-call/MCP schema emission), gRPC/Connect transports, and consumer registry federation.
 
 Sequencing principle: every phase ships standalone value — the compiler, the gate, the registry, then the service — so no phase depends on a later one to be useful. Issues are the source of truth for scope; this file is the map.

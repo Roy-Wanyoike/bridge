@@ -9,20 +9,27 @@ By participating in this project you agree to abide by our [Code of Conduct](COD
 ## Getting started
 
 1. Fork the repository and create your branch from `main`.
-2. Install dependencies: `npm install` (Node.js >= 20 required).
+2. Install dependencies: `npm install` (Node.js >= 22 required).
 3. Run the test suite: `npm test`.
 4. Make your changes with tests. A feature is not done when the code exists — it is done when it is implemented, tested, documented, and verified.
+
+The full suite currently runs 669+ tests across all nine packages; `npm run build` must succeed and `npm test` must report 0 failures for every PR.
 
 ## Repository layout
 
 | Path | Description |
 |------|-------------|
 | `packages/bridge-core` | IDL lexer, parser, AST, semantic analysis, canonical IR |
+| `packages/bridge-generators` | Code generators (Go, Rust, TypeScript, Python, Java, C#) |
 | `packages/bridge-compat` | Compatibility engine (diff, classification, impact analysis) |
-| `packages/bridge-generators` | Code generators (Go, Rust, TypeScript, Python) |
-| `packages/bridge-registry` | Contract registry |
+| `packages/bridge-serialization` | Wire formats (MessagePack, CBOR) + golden vectors |
+| `packages/bridge-registry` | Contract registry (local, content-addressed) |
+| `packages/bridge-registry-service` | Multi-tenant registry HTTP service (OIDC, signing, audit) |
+| `packages/bridge-ffi` | Cross-language FFI (C ABI) + WASM target |
+| `packages/bridge-lsp` | Language server for the IDL (JSON-RPC over stdio) |
 | `packages/bridge-cli` | The `bridge` CLI |
 | `examples/` | Runnable examples |
+| `dashboard/` | Next.js registry console |
 
 ## Pull request guidelines
 

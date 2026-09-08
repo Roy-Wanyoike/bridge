@@ -5,12 +5,16 @@ compares two versions of a package's canonical IR and classifies every
 change so CI can block breaking contract evolution.
 
 ```
-bridge diff <old.bridge> <new.bridge>   # report only — always exits 0
-bridge check <old.bridge> <new.bridge>  # CI gate — exits 1 when the gate fails
+bridge diff <old.bridge> <new.bridge>   # full human-readable report — also gates: exit 1 on failure
+bridge check <old.bridge> <new.bridge>  # CI gate — compact output, exit 1 when the gate fails
 ```
 
-Both commands accept the same optional flags as the API
-(`--mode compatible`, see [Modes](#modes) below).
+Both commands enforce the same gate: they **exit 1** when the selected mode
+fails the diff, so even `bridge diff` blocks a pipeline on a breaking
+change. `diff` additionally accepts `--compatible` (see [Modes](#modes)
+below); `check` additionally accepts `--strict` (also gate WARNING
+changes) and `--against <ref>` (diff against a published registry version
+instead of a file). Usage mistakes (bad flags, wrong argument count) exit 2.
 
 ---
 
@@ -79,7 +83,8 @@ with an empty change list.
 
 ## Modes
 
-`check()` — and `bridge check` — apply a failure policy to the verdict:
+`check()` — and the `bridge diff` / `bridge check` commands — apply a
+failure policy to the verdict:
 
 | Verdict | `strict` (default) | `compatible` |
 | --- | --- | --- |
@@ -95,16 +100,28 @@ with an empty change list.
 - `compatible` fails only on definite BREAKING changes — for teams that
   explicitly accept warnings and unknowns during a migration window.
 
+On the command line these are selected with flags — there is no `--mode`
+option. `bridge diff` and `bridge check` both run the `strict` policy by
+default; pass `--compatible` to switch. `bridge check` additionally offers
+`--strict` for **full governance**: WARNING changes gate too (fail set:
+BREAKING, UNKNOWN, WARNING). `--strict` and `--compatible` are mutually
+exclusive.
+
 ## Exit codes
 
 | Command | Exit `0` | Exit `1` |
 | --- | --- | --- |
-| `bridge diff <old> <new>` | always (report-only) | — |
-| `bridge check <old> <new>` | gate passed | gate failed (BREAKING or UNKNOWN under `strict`; BREAKING under `compatible`) |
+| `bridge diff <old> <new>` | gate passed (report printed either way) | gate failed (BREAKING or UNKNOWN under `strict`; BREAKING under `compatible`) or an input failed to compile |
+| `bridge check <old> <new>` | gate passed | gate failed (BREAKING, UNKNOWN — plus WARNING with `--strict`; BREAKING only under `--compatible`) or an input failed to compile |
 
-Both commands print the same human-readable report (plus, for `check`, the
-`Compatibility: PASSED/FAILED` line). Use `diff` in PR descriptions and
-`check` in CI steps.
+Misuse (unknown flag, wrong argument count) exits `2` for both commands.
+
+The two commands differ in presentation, not in verdict: `diff` prints the
+full human-readable report ending in the `Compatibility: PASSED/FAILED`
+line (shown above); `check` prints a compact `key: value` summary
+(`baseline`, `mode`, `verdict`, `passed`, `changes` — switch to JSON or
+markdown with `--format`). Use `diff` in PR descriptions and `check` in
+CI steps.
 
 ## Report format
 
@@ -159,7 +176,7 @@ jobs:
 
 A failing `bridge check` exits non-zero and blocks the merge. Teams that
 accept unknowns during a migration window switch that step to
-`bridge check --mode compatible "$base" "$contract"`.
+`bridge check --compatible "$base" "$contract"`.
 
 ### Why gate on the IR and not the source text?
 

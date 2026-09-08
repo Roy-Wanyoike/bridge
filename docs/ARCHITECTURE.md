@@ -26,9 +26,10 @@ wall of the whole system.
       └──────┬──────┘   └──────┬──────┘  └──────┬──────┘   └─────────────┘
              ▼                 ▼                ▼
       Go / Rust /       CompatReport       .bridge-registry/
-      TypeScript /      SAFE/WARNING/      objects/<hash>.json
-      Python files      BREAKING/UNKNOWN   packages/<base>/<version>/
-      (byte-deterministic)  (deterministic)   (content-addressed)
+      TypeScript /      + ImpactReport     objects/<hash>.json
+      Python / Java /   SAFE/WARNING/      packages/<base>/<version>/
+      C# files          BREAKING/UNKNOWN   (content-addressed)
+      (byte-deterministic)  (deterministic)
 ```
 
 ## Pipeline (inside @bridge/core)
@@ -43,8 +44,8 @@ wall of the whole system.
    (`BR1004`) are recoverable — the parser reports and continues.
 3. **Semantic analysis** — name resolution (locals + imported packages),
    duplicate detection, method-signature, map-key, optionality and
-   constraint-applicability rules (`BR2001`–`BR2015`), plus style warnings
-   (`BR2101`–`BR2103`). Cross-package references are validated only when the
+   constraint-applicability rules (`BR2001`–`BR2019`), plus style warnings
+   (`BR2101`–`BR2104`). Cross-package references are validated only when the
    caller supplies already-compiled dependencies (`compilePackage`);
    `compileSource` records imports without resolving them.
 4. **Canonical IR** — the semantic stage emits an `IRPackage`: dotted
@@ -62,16 +63,20 @@ canonical `bridge validate` output shape).
 registry and CLI all program against these shapes, and changing an existing
 signature is a breaking change to every consumer. Extension requires
 coordination; rewrites are out. This is deliberate — the IR is the only
-contract the four downstream packages share, which keeps package boundaries
+contract the downstream packages share, which keeps package boundaries
 honest:
 
 | Package | Depends on | Responsibility |
 | --- | --- | --- |
 | `@bridge/core` | — | lexer, parser, semantic, IR, hashing, formatter, diagnostics |
 | `@bridge/generators` | core (IR types) | `generate(ir, { language })` → `GeneratedFile[]` |
-| `@bridge/compat` | core (IR types) | `diffPackages` / `check` / `formatReport` |
+| `@bridge/compat` | core (IR types) | `diffPackages` / `check` / `formatReport` + consumer-aware impact analysis |
+| `@bridge/serialization` | core (IR types) | MessagePack + CBOR codecs, golden vectors, cross-language wire guarantees |
 | `@bridge/registry` | core (IR types + hashing) | content-addressed local store |
-| `bridge-cli` | all of the above | command surface: `init`, `validate`, `fmt`, `lint`, `generate`, `diff`, `check`, `publish`, `pull`, `versions`, `inspect`, `search`, `doctor`, `version` |
+| `@bridge/registry-service` | registry (driver interface) | multi-tenant HTTP API: OIDC/static auth, signing, audit, rate limits, in-memory + PostgreSQL drivers |
+| `@bridge/ffi` | generators (Rust + Go targets) | C-ABI cdylib + Go cgo client + `wasm32`/wasm-bindgen target |
+| `@bridge/lsp` | core | JSON-RPC language server over stdio |
+| `bridge-cli` | all of the above | command surface: `init`, `validate`, `fmt`, `lint`, `generate`, `diff`, `check`, `impact`, `publish`, `pull`, `versions`, `inspect`, `search`, `doctor`, `version` |
 
 No package reaches into another package's internals; everything flows
 through the IR (or, in the registry's case, through IR hashes).
@@ -125,7 +130,11 @@ Determinism makes the generated code verifiable: the repository's
 - type-check every generated TypeScript package with the workspace `tsc`
   (strict, 0 errors),
 - `go vet`/`go build` and `cargo check`/`cargo clippy` when the toolchains
-  exist (CI covers them otherwise).
+  exist (CI covers them otherwise),
+- compile + run the generated Java (`javac` or ECJ) and C# (`dotnet`) projects
+  with their round-trip tests — `scripts/verify-java.sh`,
+  `scripts/verify-csharp.sh` (CI enforces; they SKIP locally without the
+  toolchains).
 
 Because output is byte-deterministic, a generator regression shows up as a
 reviewable diff, and a wire-format regression shows up as a failing

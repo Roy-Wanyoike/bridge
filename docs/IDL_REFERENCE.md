@@ -2,7 +2,7 @@
 
 The Bridge Interface Definition Language: a small, deterministic contract
 language that compiles to a canonical, hashable IR and generates code for
-Go, Rust, TypeScript and Python.
+Go, Rust, TypeScript, Python, Java and C#.
 
 This document describes the v1 grammar as implemented by `@bridge/core`
 ([ARCHITECTURE](./ARCHITECTURE.md) explains the pipeline behind it).
@@ -282,9 +282,9 @@ payment.bridge:8:13: error BR2001: Unknown type `mony`.
 | Family | Codes |
 | --- | --- |
 | Lexical | `BR1001` unexpected character · `BR1002` unterminated string · `BR1003` invalid escape |
-| Syntax | `BR1004` (parser errors: unexpected token, unclosed block, malformed constraint args, …) |
+| Syntax | `BR1004` (parser errors: unexpected token, unclosed block, malformed constraint args, …) · `BR1005` type nesting too deep (max 256 levels) |
 | Semantic — declarations | `BR2001` unknown type · `BR2002` duplicate declaration · `BR2003` duplicate field/union member · `BR2004` duplicate enum variant · `BR2005` duplicate method · `BR2006` duplicate import · `BR2007` package statement problems · `BR2008` invalid dotted name · `BR2009` alias cycle · `BR2010` method signature must reference structs · `BR2011` invalid map key · `BR2012` optional collection element · `BR2013` constraint not applicable · `BR2014` unknown constraint · `BR2015` unknown imported package · `BR2016` constraint argument shape/arity · `BR2017` recursive struct · `BR2018` @pattern not RE2-compatible · `BR2019` unhashable set element |
-| Semantic — style (warnings) | `BR2101` · `BR2102` · `BR2103` (see Naming conventions) |
+| Semantic — style (warnings) | `BR2101` · `BR2102` · `BR2103` (see Naming conventions) · `BR2104` redundant optional marker (`T??` / `T?: T?`) |
 | Internal | `BR2999` (unexpected compiler failure — please report) |
 
 Only `error`-severity diagnostics block compilation (`ok === false`);

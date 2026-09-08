@@ -54,6 +54,8 @@ For each service, per language — a client and a server side:
 | Python     | `<Service>Client(base_url)` on `urllib`  | `make_<service>_handler(handler)` — a `http.server` binding |
 | Go         | `New<Service>JSONClient(doer, baseURL)` on `net/http` | `New<Service>Handler(server)` — an `http.Handler` |
 | Rust       | `<Service>HttpClient::new(base_url)` on stdlib TCP | `serve_once` / `serve_forever` on `std::net::TcpListener` |
+| Java       | `new <Service>Client(baseUrl)` on `java.net.http` | `<Service>HttpServer` — an adapter on the JDK's built-in `com.sun.net.httpserver` |
+| C#         | `new <Service>Client(baseUrl)` on `System.Net.Http.HttpClient` | `<Service>HttpListenerServer` — an adapter on `System.Net.HttpListener` |
 
 All server adapters share the same behavior:
 

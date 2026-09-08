@@ -50,7 +50,7 @@ The REST client (`src/lib/registry-client.ts`) targets the service API:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `NEXT_PUBLIC_DEMO_MODE` | `true` | Render seeded demo data instead of calling the registry. Only the exact values `false` / `0` enable live mode; any other value keeps demo mode on and logs a warning (booleans are not loosely coerced — `FALSE` does **not** go live) |
-| `NEXT_PUBLIC_REGISTRY_URL` | `http://localhost:8080` | Registry service base URL (live mode) |
+| `NEXT_PUBLIC_REGISTRY_URL` | `http://localhost:8080` | Registry service base URL (live mode). Note the service itself binds **4350** by default — set `NEXT_PUBLIC_REGISTRY_URL=http://localhost:4350` when running `@bridge/registry-service` with defaults |
 | `NEXT_PUBLIC_CONSOLE_URL` | `http://localhost:3000` | Console's own origin, used as the metadata/OG canonical base |
 
 ## Theme
