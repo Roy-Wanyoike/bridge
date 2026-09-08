@@ -225,8 +225,21 @@ async function routeRequest(
     requireLevel(principal, Levels.admin);
     ctx.action = 'audit';
     ctx.org = principal.org;
+    // Tenancy (issue #47): audit reads are FORCE-SCOPED to the principal's
+    // own org, mirroring /v1/search. The Principal model has no cross-org
+    // role — `org` is the tenancy binding of every credential (static-token
+    // tenant or OIDC `org` claim) and `registry:admin` grants audit access
+    // within that org, never across tenants. An explicit foreign org filter
+    // is indistinguishable from an unknown route (404 — never 403 — so the
+    // existence of other tenants is not leaked).
+    const requestedOrg = url.searchParams.get('org');
+    const orgFilter =
+      requestedOrg === null || requestedOrg.length === 0 ? undefined : requestedOrg;
+    if (orgFilter !== undefined && orgFilter !== principal.org) {
+      throw new ServiceError(404, 'not-found', `unknown route ${url.pathname}`);
+    }
     const entries = await deps.audit.query({
-      org: url.searchParams.get('org') ?? undefined,
+      org: principal.org,
       project: url.searchParams.get('project') ?? undefined,
       actor: url.searchParams.get('actor') ?? undefined,
       action: url.searchParams.get('action') ?? undefined,
