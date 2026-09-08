@@ -28,6 +28,7 @@ Options:
   --max-mutations N    Max mutation operations per case (default 8).
   --deadline-ms MS     Stop between cases after this wall-clock budget.
   --json               Print the full summary as JSON instead of one line.
+  --help, -h           Print this usage text and exit 0.
 
 Exit codes: 0 = no crashes, 1 = crashes found, 2 = bad arguments.
 `;
@@ -160,7 +161,7 @@ export function runCli(argv: readonly string[]): number {
           `  message: ${crash.message}`,
           `  repro: node bin/bridge-fuzz.js --seed ${summary.seed} --case ${crash.case}`,
           `  mutated source (first 400 chars):`,
-          ...chunk(crash.mutatedSource, 400),
+          ...truncationHead(crash.mutatedSource, 400),
           '',
         ].join('\n'),
       );
@@ -169,7 +170,12 @@ export function runCli(argv: readonly string[]): number {
   return summary.crashes.length === 0 ? 0 : 1;
 }
 
-function chunk(text: string, max: number): string[] {
+/**
+ * First line for the mutated-source dump: the head of `text` truncated to
+ * `max` chars (ellipsis-suffixed when anything was cut, `<empty>` when the
+ * text is empty). Internal to the crash-report renderer.
+ */
+function truncationHead(text: string, max: number): string[] {
   const head = text.slice(0, max);
   return head.length === 0 ? ['<empty>'] : [head.length < text.length ? `${head}…` : head];
 }
