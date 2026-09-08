@@ -27,9 +27,11 @@ import { generatedFile, joinBlocks } from '../util';
 import {
   deserializeExpr,
   pyField,
+  pythonDecodeExpr,
   pythonFieldType,
   serializeExpr,
 } from './python';
+import { renderTypeRef } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes } from '../analysis';
 import {
   ENVELOPE_SPECVERSION,
@@ -359,8 +361,10 @@ function renderServiceServer(
   lines.push(`class ${service.name}ServiceHandler:`);
   lines.push(`    """Implement this protocol to serve the ${service.name} service."""`);
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Signatures render through the type table so cross-package (opaque)
+    // and alias-substituted method types stay decodable/annotatable.
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     lines.push('');
     lines.push(`    def ${camelToLowerSnake(method.name)}(self, request: ${inputType}) -> ${outputType}:`);
     lines.push('        raise NotImplementedError');
@@ -376,6 +380,10 @@ function renderServiceServer(
     `    http.server. Malformed requests become 400 invalid_argument;`,
     `    BridgeRpcError maps code → status; anything else is 500."""`);
   lines.push(`    route_prefix = ${JSON.stringify(routePrefix)}`);
+  lines.push('    # DoS guard: maximum request body size decoded by generated servers.');
+  lines.push('    bridge_max_body_bytes = 1 << 20');
+  lines.push('');
+  lines.push('    BRIDGE_MAX_BODY_BYTES = bridge_max_body_bytes');
   lines.push('');
   lines.push('    class BridgeHandler(BaseHTTPRequestHandler):');
   lines.push('        """Routes POST <prefix><Method> to the handler implementation."""');
@@ -398,6 +406,10 @@ function renderServiceServer(
   lines.push('                return');
   lines.push('            method_name = path[len(route_prefix):]');
   lines.push('            length = int(self.headers.get("Content-Length") or 0)');
+  lines.push('            # DoS guard: reject oversized declared bodies before reading (issue #45).');
+  lines.push('            if length > BRIDGE_MAX_BODY_BYTES:');
+  lines.push('                self._send_bridge_error("payload_too_large", "request body exceeds the 1 MiB limit")');
+  lines.push('                return');
   lines.push('            raw = self.rfile.read(length) if length > 0 else b""');
   lines.push('            try:');
   lines.push('                parsed = json.loads(raw.decode("utf-8"))');
@@ -412,18 +424,26 @@ function renderServiceServer(
   lines.push('        def _dispatch(self, method_name: str, parsed: "Any") -> None:');
   lines.push('            try:');
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Request decode degrades to passthrough for opaque cross-package
+    // inputs; validation only applies to local struct inputs (same guard
+    // as the Go/TS generators' validator tables).
+    const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+    const isLocalStruct =
+      ref.kind === 'named' &&
+      !(ref.package !== undefined && ref.package !== input.ir.name) &&
+      localStructs.has(ref.name);
     lines.push(`                if method_name == ${JSON.stringify(method.name)}:`);
-    lines.push(`                    request = ${inputType}.from_dict(parsed)`);
-    if (localStructs.has(inputType)) {
-      lines.push(`                    violations = validate_${inputType}(request)`);
+    lines.push(
+      `                    request = ${pythonDecodeExpr(method.input, input, 'parsed')}`,
+    );
+    if (isLocalStruct && ref.kind === 'named') {
+      lines.push(`                    violations = validate_${ref.name}(request)`);
       lines.push('                    if violations:');
       lines.push('                        self._send_bridge_error("invalid_argument", "; ".join(violations))');
       lines.push('                        return');
     }
     lines.push(`                    result = handler.${camelToLowerSnake(method.name)}(request)`);
-    lines.push('                    self._send_json(200, result.to_dict())');
+    lines.push(`                    self._send_json(200, ${serializeExpr(method.output, 'result', input)})`);
     lines.push('                    return');
   }
   lines.push('                self._send_bridge_error("not_found", f"unknown method {method_name!r}")');

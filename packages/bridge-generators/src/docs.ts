@@ -12,8 +12,6 @@
  * - Python: docstrings with a `Deprecated:` line.
  */
 
-import type { TargetLanguage } from './mappings';
-
 /** Splits an IR docs string into clean lines. */
 export function docLines(docs: string | undefined): string[] {
   if (docs === undefined) return [];
@@ -47,28 +45,18 @@ export function rustDoc(docs: string | undefined, deprecated?: string | true): s
   return lines.map((line) => `/// ${line}`).join('\n');
 }
 
+/** Escapes text destined for a `*`+`/`-terminated block comment (JSDoc/Javadoc). */
+function escapeBlockComment(text: string): string {
+  return text.split('*/').join('*\\/');
+}
+
 /** TS JSDoc block. Empty docs -> empty string. */
 export function tsDoc(docs: string | undefined, deprecated?: string | true): string {
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return '';
-  if (lines.length === 1) return `/** ${lines[0]} */`;
-  const body = lines.map((line) => ` * ${line}`).join('\n');
+  if (lines.length === 1) return `/** ${escapeBlockComment(lines[0] ?? '')} */`;
+  const body = lines.map((line) => ` * ${escapeBlockComment(line)}`).join('\n');
   return `/**\n${body}\n */`;
-}
-
-/**
- * TS JSDoc for fields that had to be renamed away from the wire name
- * (reserved-word escapes). Adds the `@wireName` tag documenting the
- * actual JSON key.
- */
-export function tsFieldDoc(
-  docs: string | undefined,
-  wire: string,
-  escaped: boolean,
-): string {
-  const lines = docLines(docs);
-  if (escaped) lines.push(`@wireName "${wire}" — JSON wire key for this field.`);
-  return tsDoc(lines.length > 0 ? lines.join('\n') : undefined);
 }
 
 /**
@@ -83,8 +71,10 @@ export function pythonDocstring(
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return undefined;
   const pad = ' '.repeat(indent);
-  if (lines.length === 1) return `${pad}"""${lines[0]}"""`;
-  const body = lines.map((line) => `${pad}${line}`).join('\n');
+  // A triple quote inside a doc line would terminate the docstring early.
+  const safe = lines.map((line) => line.split('"""').join('\\"\\"\\"'));
+  if (safe.length === 1) return `${pad}"""${safe[0]}"""`;
+  const body = safe.map((line) => `${pad}${line}`).join('\n');
   return `${pad}"""\n${body}\n${pad}"""`;
 }
 
@@ -110,10 +100,4 @@ export function indentBlock(block: string, spaces: number): string {
     .split('\n')
     .map((line) => (line.length > 0 ? `${pad}${line}` : line))
     .join('\n');
-}
-
-/** Empty-line separators between top-level declarations, per language. */
-export function separator(language: TargetLanguage): string {
-  // All four languages use a single blank line between declarations.
-  return '';
 }

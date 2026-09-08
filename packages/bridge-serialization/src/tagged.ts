@@ -136,7 +136,7 @@ export function valueToTagged(value: BridgeValue): TaggedValue {
     const out: Record<string, TaggedValue> = {};
     for (const key of sortedMapKeys(value as BridgeMap)) {
       const inner = (value as BridgeMap)[key];
-      out[key] = inner === undefined ? { t: 'absent' } : valueToTagged(inner);
+      out[key] = valueToTagged(inner!);
     }
     return { t: 'map', v: out };
   }

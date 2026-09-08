@@ -470,15 +470,19 @@ function rustConstraintCheck(
     inner.kind === 'primitive' &&
     ['string', 'uuid', 'timestamp', 'decimal'].includes(inner.primitive);
 
-  const optionalGuardOpen = field.optional ? `if let Some(value) = &self.${field.name} {\n` : '';
+  // Struct member accesses must go through rustFieldName: keyword-named
+  // fields are declared as raw identifiers (r#type) or escaped names
+  // (self_), and the raw wire name would be a rustc syntax error here.
+  const member = rustFieldName(field.name).name;
+  const optionalGuardOpen = field.optional ? `if let Some(value) = &self.${member} {\n` : '';
   const optionalGuardClose = field.optional ? '}\n' : '';
   const err = (message: string): string =>
     `return Err(ValidationError::new(${JSON.stringify(field.name)}, ${JSON.stringify(message)}));`;
   // Numeric comparisons dereference the borrowed value; string-like checks
   // pass it by reference (deref coercion &String -> &str).
-  const numericExpr = field.optional ? '*value' : `self.${field.name}`;
-  const methodExpr = field.optional ? 'value' : `self.${field.name}`;
-  const borrowedArgExpr = field.optional ? 'value' : `&self.${field.name}`;
+  const numericExpr = field.optional ? '*value' : `self.${member}`;
+  const methodExpr = field.optional ? 'value' : `self.${member}`;
+  const borrowedArgExpr = field.optional ? 'value' : `&self.${member}`;
 
   switch (constraint.kind) {
     case 'min':
@@ -565,14 +569,15 @@ function rustValidateImpl(
     if (ref.kind === 'optional') ref = ref.inner;
     if (!isLocalStructRef(ref, input.ir)) continue;
     const prefix = `format!(${JSON.stringify(`${field.name}.{}`)}, err.field)`;
+    const member = rustFieldName(field.name).name;
     if (field.optional) {
-      checks += `if let Some(value) = &self.${field.name} {\n`;
+      checks += `if let Some(value) = &self.${member} {\n`;
       checks += `    if let Err(err) = value.validate() {\n`;
       checks += `        return Err(ValidationError { field: ${prefix}, message: err.message });\n`;
       checks += `    }\n`;
       checks += `}\n`;
     } else {
-      checks += `if let Err(err) = self.${field.name}.validate() {\n`;
+      checks += `if let Err(err) = self.${member}.validate() {\n`;
       checks += `    return Err(ValidationError { field: ${prefix}, message: err.message });\n`;
       checks += `}\n`;
     }

@@ -703,6 +703,8 @@ function goRpcBlock(): string {
   out += 'func writeBridgeError(w http.ResponseWriter, code string, message string) {\n';
   out += '\twriteBridgeJSON(w, BridgeStatusForCode(code), map[string]string{"code": code, "message": message})\n';
   out += '}\n\n';
+  out += `${goDoc('bridgeMaxBodyBytes caps request bodies decoded by generated servers (DoS guard).')}\n`;
+  out += 'const bridgeMaxBodyBytes int64 = 1 << 20\n\n';
   out += `${goDoc('bridgeErrorFromBody parses a non-2xx {"code", "message"} body into a *BridgeRPCError.')}\n`;
   out += 'func bridgeErrorFromBody(status int, body []byte) *BridgeRPCError {\n';
   out += '\tcode := "internal"\n';
@@ -838,9 +840,11 @@ function goServiceHandler(
   out += '\t\t\treturn\n';
   out += '\t\t}\n';
   out += '\t\tmethod := strings.TrimPrefix(r.URL.Path, routePrefix)\n';
+  out += '\t\t// DoS guard: cap the decoded body size before buffering it (issue #45).\n';
+  out += '\t\tr.Body = http.MaxBytesReader(w, r.Body, bridgeMaxBodyBytes)\n';
   out += '\t\tbody, err := io.ReadAll(r.Body)\n';
   out += '\t\tif err != nil {\n';
-  out += '\t\t\twriteBridgeError(w, "invalid_argument", "failed to read request body")\n';
+  out += '\t\t\twriteBridgeError(w, "payload_too_large", "request body exceeds the 1 MiB limit")\n';
   out += '\t\t\treturn\n';
   out += '\t\t}\n';
   out += '\t\tswitch method {\n';

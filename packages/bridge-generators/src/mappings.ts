@@ -415,6 +415,11 @@ export function isLocalEnumRef(ref: TypeRef, ir: IRPackage): boolean {
 /**
  * Renders the zero value / empty literal for a field type, used by
  * constructors and decode helpers (Go only).
+ *
+ * Named references resolve through the local alias table first: Go
+ * composite literals are only legal for struct/array/map/slice types, so
+ * an alias to a primitive (`type OrderId = uuid`) must contribute the
+ * primitive zero value (`""`), never `OrderId{}`.
  */
 export function goZeroValue(ref: TypeRef, ctx: RenderContext): string {
   switch (ref.kind) {
@@ -425,8 +430,11 @@ export function goZeroValue(ref: TypeRef, ctx: RenderContext): string {
       if (p === 'json') return 'nil';
       return '0';
     }
-    case 'named':
+    case 'named': {
+      const aliasTarget = ctx.aliasTargets?.get(ref.name);
+      if (aliasTarget !== undefined) return goZeroValue(aliasTarget, ctx);
       return `${namedRefName(ref, ctx)}{}`;
+    }
     case 'list':
     case 'set':
       return 'nil';

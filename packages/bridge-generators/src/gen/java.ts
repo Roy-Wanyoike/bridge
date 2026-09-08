@@ -134,8 +134,10 @@ function javaDoc(
 ): string | undefined {
   const lines = withDeprecation(docLines(docs), deprecated);
   if (lines.length === 0) return undefined;
+  // `*/` inside a doc line would terminate the Javadoc block early (issue #45).
+  const safe = lines.map((line) => line.replace(/\*\//g, '*\\/'));
   const out = [`${indent}/**`];
-  for (const line of lines) out.push(`${indent} * ${line}`.trimEnd());
+  for (const line of safe) out.push(`${indent} * ${line}`.trimEnd());
   out.push(`${indent} */`);
   return out.join('\n');
 }
@@ -166,6 +168,29 @@ function pascal(name: string): string {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Java type for use INSIDE generics (collection element/value types and
+ * casts): primitives are boxed recursively because `List<int>` and
+ * `Map<String, int>` are illegal Java. Leaf shapes render through
+ * {@link renderTypeRef} (which substitutes alias targets for Java) and
+ * box bare primitives via {@link boxedJava}; composite shapes mirror the
+ * Java renderings from mappings.ts (listType/setType/mapType/optionalType).
+ */
+function boxedTypeRef(ref: TypeRef, input: GeneratorInput): string {
+  switch (ref.kind) {
+    case 'list':
+      return `List<${boxedTypeRef(ref.element, input)}>`;
+    case 'set':
+      return `Set<${boxedTypeRef(ref.element, input)}>`;
+    case 'map':
+      return `Map<String, ${boxedTypeRef(ref.value, input)}>`;
+    case 'optional':
+      return `Optional<${boxedTypeRef(ref.inner, input)}>`;
+    default:
+      return boxedJava(renderTypeRef(ref, input.render));
+  }
+}
+
+/**
  * Expression that converts a Java value of the given type into its JSON
  * wire value, for leaf-like references (primitives, bytes, json, local
  * enums, local structs, opaque cross-package values). Returns undefined
@@ -176,6 +201,7 @@ function serializeLeafExpr(ref: TypeRef, value: string, input: GeneratorInput): 
   switch (ref.kind) {
     case 'primitive':
       if (ref.primitive === 'bytes') return `Base64.getEncoder().encodeToString(${value})`;
+      if (ref.primitive === 'uint64') return `Long.toUnsignedString(${value})`;
       return value;
     case 'named': {
       const aliasTarget = input.render.aliasTargets?.get(ref.name);
@@ -210,13 +236,13 @@ function serializeBlock(
       // Deterministic wire order: sort a copy (natural ordering of the
       // element type — UTF-16 code units for strings, matching TS).
       const sorted = `s${depth}`;
-      lines.push(`    List<${renderTypeRef(ref.element, input.render)}> ${sorted} = new ArrayList<>(${value});`);
+      lines.push(`    List<${boxedTypeRef(ref.element, input)}> ${sorted} = new ArrayList<>(${value});`);
       lines.push(`    Collections.sort(${sorted});`);
       source = sorted;
     }
     lines.push(`    List<Object> ${tmp} = new ArrayList<>();`);
     const element = serializeLeafExpr(ref.element, 'item', input);
-    lines.push(`    for (${renderTypeRef(ref.element, input.render)} item : ${source}) {`);
+    lines.push(`    for (${boxedTypeRef(ref.element, input)} item : ${source}) {`);
     if (element !== undefined) {
       lines.push(`        ${tmp}.add(${element});`);
     } else {
@@ -231,7 +257,7 @@ function serializeBlock(
     const tmp = `v${depth}`;
     const lines = [`    Map<String, Object> ${tmp} = new LinkedHashMap<>();`];
     const valueExpr = serializeLeafExpr(ref.value, 'e.getValue()', input);
-    lines.push(`    for (Map.Entry<${renderTypeRef(ref.key, input.render)}, ${renderTypeRef(ref.value, input.render)}> e : ${value}.entrySet()) {`);
+    lines.push(`    for (Map.Entry<String, ${boxedTypeRef(ref.value, input)}> e : ${value}.entrySet()) {`);
     if (valueExpr !== undefined) {
       lines.push(`        ${tmp}.put(e.getKey(), ${valueExpr});`);
     } else {
@@ -316,7 +342,7 @@ function deserializeValue(
     case 'list': {
       const inner = deserializeValue(ref.element, 'item', input, `${ctx}[]`, depth + 1);
       const lines = [
-        `    List<${renderTypeRef(ref.element, input.render)}> l${depth} = new ArrayList<>();`,
+        `    List<${boxedTypeRef(ref.element, input)}> l${depth} = new ArrayList<>();`,
         `    for (Object item : BridgeJson.expectList(${raw}, ${JSON.stringify(ctx)})) {`,
       ];
       lines.push(...indent(inner.lines, 1));
@@ -327,7 +353,7 @@ function deserializeValue(
     case 'set': {
       const inner = deserializeValue(ref.element, 'item', input, `${ctx}[]`, depth + 1);
       const lines = [
-        `    Set<${renderTypeRef(ref.element, input.render)}> s${depth} = new LinkedHashSet<>();`,
+        `    Set<${boxedTypeRef(ref.element, input)}> s${depth} = new LinkedHashSet<>();`,
         `    for (Object item : BridgeJson.expectList(${raw}, ${JSON.stringify(ctx)})) {`,
       ];
       lines.push(...indent(inner.lines, 1));
@@ -338,7 +364,7 @@ function deserializeValue(
     case 'map': {
       const inner = deserializeValue(ref.value, 'e.getValue()', input, `${ctx}[]`, depth + 1);
       const lines = [
-        `    Map<String, ${renderTypeRef(ref.value, input.render)}> m${depth} = new LinkedHashMap<>();`,
+        `    Map<String, ${boxedTypeRef(ref.value, input)}> m${depth} = new LinkedHashMap<>();`,
         `    for (Map.Entry<String, Object> e : BridgeJson.expectMap(${raw}, ${JSON.stringify(ctx)}).entrySet()) {`,
       ];
       lines.push(...indent(inner.lines, 1));
@@ -349,7 +375,7 @@ function deserializeValue(
     case 'optional': {
       const inner = deserializeValue(ref.inner, raw, input, ctx, depth + 1);
       const lines = [...inner.lines];
-      const typed = renderTypeRef(ref, input.render);
+      const typed = boxedTypeRef(ref, input);
       lines.push(`    ${typed} o${depth};`);
       lines.push(`    if (${raw} == null) {`);
       lines.push(`        o${depth} = Optional.empty();`);
@@ -616,7 +642,13 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('            try {');
   lines.push('                return Long.parseLong(num);');
   lines.push('            } catch (NumberFormatException exc) {');
-  lines.push('                return Double.parseDouble(num);');
+  lines.push('                // Out-of-long-range integers (e.g. uint64 > 2^63-1) keep');
+  lines.push('                // full precision as BigInteger, never clamping via double.');
+  lines.push('                try {');
+  lines.push('                    return new java.math.BigInteger(num);');
+  lines.push('                } catch (NumberFormatException ignored) {');
+  lines.push('                    return Double.parseDouble(num);');
+  lines.push('                }');
   lines.push('            }');
   lines.push('        }');
   lines.push('    }');
@@ -737,6 +769,10 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('    /** Extracts an integer value; integral doubles are accepted. */');
   lines.push('    public static Long expectLong(Object raw, String ctx) {');
   lines.push('        if (raw instanceof Long l) { return l; }');
+  lines.push('        if (raw instanceof java.math.BigInteger bi) {');
+  lines.push('            if (bi.bitLength() <= 63) { return bi.longValue(); }');
+  lines.push('            throw new IllegalArgumentException(ctx + ": integer out of 64-bit range");');
+  lines.push('        }');
   lines.push('        if (raw instanceof Number n) {');
   lines.push('            double d = n.doubleValue();');
   lines.push('            if (d == Math.rint(d) && !Double.isInfinite(d)) { return (long) d; }');
@@ -761,6 +797,10 @@ function bridgeJsonFile(input: GeneratorInput): GeneratedFile {
   lines.push('');
   lines.push('    /** Extracts an unsigned integer value (rejects negatives). */');
   lines.push('    public static Long expectUnsigned(Object raw, String ctx) {');
+  lines.push('        if (raw instanceof java.math.BigInteger bi) {');
+  lines.push('            if (bi.signum() >= 0 && bi.bitLength() <= 64) { return bi.longValue(); }');
+  lines.push('            throw new IllegalArgumentException(ctx + ": expected unsigned 64-bit integer");');
+  lines.push('        }');
   lines.push('        Long l = expectLong(raw, ctx);');
   lines.push('        if (l < 0) {');
   lines.push('            throw new IllegalArgumentException(ctx + ": expected unsigned integer");');
@@ -1264,9 +1304,11 @@ function unionFile(
   lines.push('    public Object getValue() { return this.value; }');
   lines.push('');
 
-  // Per-variant factories and typed accessors.
+  // Per-variant factories and typed accessors. Variant types render with
+  // boxed generics (a list<int32> payload must be List<Integer>, and
+  // casting Object to List<int> is illegal Java).
   for (const variant of type.variants) {
-    const variantType = renderTypeRef(variant.type, input.render);
+    const variantType = boxedTypeRef(variant.type, input);
     const factory = javaSafeIdent(variant.name.toLowerCase());
     const vdoc = javaDoc(variant.docs, variant.deprecated, '    ');
     if (vdoc !== undefined) lines.push(vdoc);
@@ -1275,7 +1317,7 @@ function unionFile(
     lines.push('    }');
     lines.push('');
     const accessor = `as${pascal(variant.name)}`;
-    lines.push(`    public java.util.Optional<${boxedJava(variantType)}> ${accessor}() {`);
+    lines.push(`    public java.util.Optional<${variantType}> ${accessor}() {`);
     lines.push(`        if (this.kind.equals(${JSON.stringify(variant.name)})) {`);
     lines.push(`            return java.util.Optional.of((${variantType}) this.value);`);
     lines.push('        }');
@@ -1293,7 +1335,7 @@ function unionFile(
   lines.push('        out.put("kind", this.kind);');
   lines.push('        Object v = this.value;');
   for (const variant of type.variants) {
-    const castType = renderTypeRef(variant.type, input.render);
+    const castType = boxedTypeRef(variant.type, input);
     lines.push(`        if (this.kind.equals(${JSON.stringify(variant.name)})) {`);
     lines.push(...indent(serializeInto(variant.type, `((${castType}) v)`, 'value', 'out', input, 0), 2));
     lines.push('            return out;');
@@ -1382,15 +1424,15 @@ function javaConstraintCheck(
         `${pad}}`,
       ];
     case 'email':
-      return [`${pad}if (!EMAIL_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!EMAIL_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'url':
-      return [`${pad}if (!URL_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!URL_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'uuid':
-      return [`${pad}if (!UUID_PATTERN.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!UUID_PATTERN.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     case 'pattern': {
       if (arg === undefined) return undefined;
       const constant = `P_${pascal(className)}_${pascal(field.name)}`;
-      return [`${pad}if (!${constant}.matcher(${accessor}).find()) {`, `${pad}    ${fail}`, `${pad}}`];
+      return [`${pad}if (!${constant}.matcher(${accessor}).matches()) {`, `${pad}    ${fail}`, `${pad}}`];
     }
     default:
       return undefined;
@@ -1418,11 +1460,6 @@ function javaFieldIsPrimitive(field: IRField, input: GeneratorInput): boolean {
   if (field.type.kind !== 'primitive') return false;
   const p = field.type.primitive;
   return !STRING_LIKE_PRIMITIVES.has(p) && p !== 'bytes' && p !== 'json';
-}
-
-/** True when the struct has at least one checkable constraint. */
-function structHasConstraints(type: IRTypeDefinition & { kind: 'struct' }): boolean {
-  return type.fields.some((f) => f.constraints.length > 0);
 }
 
 /** Emits BridgeValidation.java with per-struct validate functions. */
@@ -1528,7 +1565,6 @@ function bridgeValidationFile(input: GeneratorInput, srcDir: string): GeneratedF
 
   lines.push('}');
   lines.push('');
-  void structHasConstraints;
   return generatedFile(`${srcDir}/BridgeValidation.java`, lines.join('\n'));
 }
 
@@ -1568,13 +1604,21 @@ function serviceClientFile(
   lines.push(fileHeader('java', input.packageName));
   lines.push(`package ${javaPackageName(input.packageName)};`);
   lines.push('');
-  lines.push('import java.net.URI;');
-  lines.push('import java.net.http.HttpClient;');
-  lines.push('import java.net.http.HttpRequest;');
-  lines.push('import java.net.http.HttpResponse;');
-  lines.push('import java.nio.charset.StandardCharsets;');
-  lines.push('import java.time.Duration;');
-  lines.push('import java.util.Map;');
+  // Base64 is needed when a method serializes a top-level bytes value
+  // (or an alias resolving to bytes) directly; struct payloads import it
+  // in their own files.
+  const needsBase64 = service.methods.some((m) => methodUsesBytes(m.input, input));
+  const imports = [
+    'java.net.URI',
+    'java.net.http.HttpClient',
+    'java.net.http.HttpRequest',
+    'java.net.http.HttpResponse',
+    'java.nio.charset.StandardCharsets',
+    'java.time.Duration',
+    'java.util.Map',
+    ...(needsBase64 ? ['java.util.Base64'] : []),
+  ].sort();
+  for (const imp of imports) lines.push(`import ${imp};`);
   lines.push('');
   const doc = javaDoc(
     service.docs !== undefined
@@ -1601,14 +1645,19 @@ function serviceClientFile(
   lines.push('');
 
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Signatures render through the type table so cross-package (opaque)
+    // and alias-substituted method types stay compilable; serialization
+    // degrades to passthrough for those (same guard as the Go generator).
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     const mName = camelToLowerSnakeJava(method.name);
     const mdoc = javaDoc(method.docs, method.deprecated, '    ');
-    lines.push(`    public ${outputType} ${mName}(${inputType} request) {`);
     if (mdoc !== undefined) lines.push(mdoc);
+    lines.push(`    public ${outputType} ${mName}(${inputType} request) {`);
     lines.push(`        String url = this.baseUrl + "/${input.packageName}/${service.name}/${method.name}";`);
-    lines.push('        byte[] body = BridgeJson.encode(request.toDict()).getBytes(StandardCharsets.UTF_8);');
+    const wire = javaWireValue(method.input, 'request', input, 0);
+    lines.push(...indent(wire.lines, 1));
+    lines.push(`        byte[] body = BridgeJson.encode(${wire.expr}).getBytes(StandardCharsets.UTF_8);`);
     lines.push('        HttpRequest httpRequest = HttpRequest.newBuilder(URI.create(url))');
     lines.push('                .timeout(this.timeout)');
     lines.push('                .header("Content-Type", "application/json")');
@@ -1627,7 +1676,10 @@ function serviceClientFile(
     lines.push('            throw new BridgeServiceError(response.statusCode(), new String(response.body(), StandardCharsets.UTF_8));');
     lines.push('        }');
     lines.push('        String text = new String(response.body(), StandardCharsets.UTF_8);');
-    lines.push(`        return ${outputType}.fromDict(BridgeJson.expectMap(BridgeJson.parse(text), "response"));`);
+    lines.push('        Object parsed = BridgeJson.parse(text);');
+    const decoded = deserializeValue(method.output, 'parsed', input, 'response', 0);
+    lines.push(...indent(decoded.lines, 2));
+    lines.push(`        return ${decoded.expr};`);
     lines.push('    }');
     lines.push('');
   }
@@ -1694,8 +1746,10 @@ function serviceServerFile(
   lines.push('     */');
   lines.push(`    public interface ${handler} {`);
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Signatures render through the type table so cross-package (opaque)
+    // and alias-substituted method types stay compilable.
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     lines.push(`        ${outputType} ${camelToLowerSnakeJava(method.name)}(${inputType} request);`);
   }
   lines.push('    }');
@@ -1716,33 +1770,47 @@ function serviceServerFile(
   lines.push('            return;');
   lines.push('        }');
   lines.push('        String method = path.substring(prefix.length());');
-  lines.push('        byte[] body = exchange.getRequestBody().readAllBytes();');
-  lines.push('        Map<String, Object> data;');
+  lines.push('        // DoS guard: cap the decoded body size before buffering it (issue #45).');
+  lines.push('        byte[] body = readBodyCapped(exchange);');
+  lines.push('        if (body == null) {');
+  lines.push('            respondError(exchange, "payload_too_large");');
+  lines.push('            return;');
+  lines.push('        }');
+  lines.push('        Object parsed;');
   lines.push('        try {');
-  lines.push('            data = BridgeJson.expectMap(BridgeJson.parse(new String(body, StandardCharsets.UTF_8)), "request");');
+  lines.push('            parsed = BridgeJson.parse(new String(body, StandardCharsets.UTF_8));');
   lines.push('        } catch (RuntimeException exc) {');
   lines.push('            respondError(exchange, "invalid_argument");');
   lines.push('            return;');
   lines.push('        }');
   for (const methodDef of service.methods) {
-    const inputType = (methodDef.input as { name: string }).name;
-    const outputType = (methodDef.output as { name: string }).name;
     const mName = camelToLowerSnakeJava(methodDef.name);
+    // Request decode degrades to passthrough for opaque cross-package
+    // inputs; validation only applies to local struct inputs (same guard
+    // as the Go generator's validator table).
+    const ref = methodDef.input.kind === 'optional' ? methodDef.input.inner : methodDef.input;
+    const validates = ref.kind === 'named' && isLocalStructRef(ref, input.ir);
     lines.push(`        if ("${methodDef.name}".equals(method)) {`);
-    lines.push(`            ${inputType} request;`);
+    lines.push(`            ${renderTypeRef(methodDef.input, input.render)} request;`);
     lines.push('            try {');
-    lines.push(`                request = ${inputType}.fromDict(data);`);
+    const decoded = deserializeValue(methodDef.input, 'parsed', input, 'request', 0);
+    lines.push(...indent(decoded.lines, 2));
+    lines.push(`                request = ${decoded.expr};`);
     lines.push('            } catch (RuntimeException exc) {');
     lines.push('                respondError(exchange, "invalid_argument");');
     lines.push('                return;');
     lines.push('            }');
-    lines.push('            for (String violation : BridgeValidation.validate' + inputType + '(request)) {');
-    lines.push('                respondError(exchange, "invalid_argument");');
-    lines.push('                return;');
-    lines.push('            }');
+    if (validates && ref.kind === 'named') {
+      lines.push(`            for (String violation : BridgeValidation.validate${ref.name}(request)) {`);
+      lines.push('                respondError(exchange, "invalid_argument");');
+      lines.push('                return;');
+      lines.push('            }');
+    }
     lines.push('            try {');
-    lines.push(`                ${outputType} response = this.handler.${mName}(request);`);
-    lines.push('                respondJson(exchange, 200, BridgeJson.encode(response.toDict()));');
+    const wire = javaWireValue(methodDef.output, 'response', input, 0);
+    lines.push(...indent(wire.lines, 3));
+    lines.push(`                ${renderTypeRef(methodDef.output, input.render)} response = this.handler.${mName}(request);`);
+    lines.push(`                respondJson(exchange, 200, BridgeJson.encode(${wire.expr}));`);
     lines.push('            } catch (RuntimeException exc) {');
     lines.push('                respondError(exchange, "internal");');
     lines.push('            }');
@@ -1768,6 +1836,19 @@ function serviceServerFile(
   lines.push('        respondJson(exchange, statusFor(code), BridgeJson.encode(payload));');
   lines.push('    }');
   lines.push('');
+  lines.push('    /** DoS guard: maximum request body size decoded by generated servers. */');
+  lines.push('    static final int MAX_BODY_BYTES = 1 << 20;');
+  lines.push('');
+  lines.push('    /** Reads the request body, or returns null when it exceeds {@link #MAX_BODY_BYTES}. */');
+  lines.push('    private static byte[] readBodyCapped(HttpExchange exchange) throws IOException {');
+  lines.push('        java.io.InputStream in = exchange.getRequestBody();');
+  lines.push('        byte[] buffer = in.readNBytes(MAX_BODY_BYTES + 1);');
+  lines.push('        if (buffer.length > MAX_BODY_BYTES) {');
+  lines.push('            return null;');
+  lines.push('        }');
+  lines.push('        return buffer;');
+  lines.push('    }');
+  lines.push('');
   lines.push('    /** Canonical Bridge error-code to HTTP-status mapping. */');
   lines.push('    static int statusFor(String code) {');
   lines.push('        switch (code) {');
@@ -1787,6 +1868,34 @@ function serviceServerFile(
 /** lowerCamelCase method name for Java (service methods are CamelCase). */
 function camelToLowerSnakeJava(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
+}
+
+/**
+ * Serializes a top-level service request/response value into its JSON
+ * wire object: leaf shapes (primitives, bytes, json, enums, structs,
+ * unions, opaque passthrough) via serializeLeafExpr, composites via
+ * serializeBlock statements.
+ */
+function javaWireValue(
+  ref: TypeRef,
+  value: string,
+  input: GeneratorInput,
+  depth: number,
+): { lines: string[]; expr: string } {
+  const leaf = serializeLeafExpr(ref, value, input);
+  if (leaf !== undefined) return { lines: [], expr: leaf };
+  const block = serializeBlock(ref, value, input, depth);
+  return { lines: block.lines, expr: block.tmp };
+}
+
+/** True when a top-level method value needs a Base64 import to serialize. */
+function methodUsesBytes(ref: TypeRef, input: GeneratorInput): boolean {
+  if (ref.kind === 'named') {
+    const aliasTarget = input.render.aliasTargets?.get(ref.name);
+    if (aliasTarget !== undefined) return methodUsesBytes(aliasTarget, input);
+    return false; // structs/enums import (or need) Base64 in their own files
+  }
+  return typeContainsPrimitive(ref, 'bytes');
 }
 
 /* ------------------------------------------------------------------ */
@@ -2035,13 +2144,13 @@ function roundtripTestFile(input: GeneratorInput, testSrc: string): GeneratedFil
   lines.push('');
   lines.push('    public static void main(String[] args) {');
   lines.push('        int checks = 0;');
-  for (const structType of structs.slice(0, 2)) {
+  for (const structType of structs) {
     lines.push(`        checks += roundTrip${structType.name}(sample${structType.name}());`);
   }
   lines.push('        System.out.println("RoundTripTest: " + checks + " checks passed");');
   lines.push('    }');
   lines.push('');
-  for (const structType of structs.slice(0, 2)) {
+  for (const structType of structs) {
     lines.push(`    private static int roundTrip${structType.name}(${structType.name} value) {`);
     lines.push(`        String encoded = BridgeJson.encode(value.toDict());`);
     lines.push(`        Map<String, Object> parsed = BridgeJson.expectMap(BridgeJson.parse(encoded), "roundtrip");`);
@@ -2129,6 +2238,17 @@ function javaSampleValueFor(ref: TypeRef, input: GeneratorInput, depth: number):
       if (local !== undefined && local.kind === 'enum') {
         return { lines: [], expr: `${ref.name}.fromWire(${JSON.stringify(local.variants[0]!.name)})` };
       }
+      if (local !== undefined && local.kind === 'union') {
+        // Unions have no public constructor: build the sample through the
+        // first variant's factory so required union fields still decode.
+        const unionType = local as IRTypeDefinition & { kind: 'union' };
+        const first = unionType.variants[0]!;
+        const payload = javaSampleValueFor(first.type, input, depth + 1);
+        return {
+          lines: payload.lines,
+          expr: `${ref.name}.${javaSafeIdent(first.name.toLowerCase())}(${payload.expr})`,
+        };
+      }
       if (local !== undefined && local.kind === 'struct') {
         const structType = local as IRTypeDefinition & { kind: 'struct' };
         const varName = `s${depth}`;
@@ -2181,6 +2301,12 @@ function sampleJsonForRef(ref: TypeRef, input: GeneratorInput): unknown {
       if (aliasTarget !== undefined) return sampleJsonForRef(aliasTarget, input);
       const local = input.ir.types.find((t) => t.name === ref.name);
       if (local !== undefined && local.kind === 'enum') return local.variants[0]!.name;
+      if (local !== undefined && local.kind === 'union') {
+        // Required union fields sample their first variant on the wire:
+        // {"kind": "<first>", "value": <first-variant sample>}.
+        const first = local.variants[0]!;
+        return { kind: first.name, value: sampleJsonForRef(first.type, input) };
+      }
       if (local !== undefined && local.kind === 'struct') {
         const structType = local as IRTypeDefinition & { kind: 'struct' };
         const obj: Record<string, unknown> = {};

@@ -326,7 +326,7 @@ export function rustServerPrelude(): string {
   out += '    let _ = stream.write_all(response.as_bytes());\n}\n\n';
   out += 'pub(crate) fn parse_http_request(stream: &mut std::net::TcpStream) -> Option<(String, serde_json::Value)> {\n';
   out += '    use std::io::{BufRead, BufReader, Read};\n';
-  out += '    let mut reader = BufReader::new(stream);\n';
+  out += '    let mut reader = BufReader::new(&mut *stream);\n';
   out += '    let mut request_line = String::new();\n';
   out += '    reader.read_line(&mut request_line).ok()?;\n';
   out += '    let mut parts = request_line.split_whitespace();\n';
@@ -344,9 +344,22 @@ export function rustServerPrelude(): string {
   out += '            content_length = value.trim().parse().unwrap_or(0);\n';
   out += '        }\n';
   out += '    }\n';
-  out += '    let mut body = vec![0u8; content_length];\n';
-  out += '    if content_length > 0 {\n';
+  out += '    // DoS guard: reject oversized declared bodies before allocating (issue #45).\n';
+  out += '    const BRIDGE_MAX_BODY_BYTES: usize = 1 << 20;\n';
+  out += '    let oversized = content_length > BRIDGE_MAX_BODY_BYTES;\n';
+  out += '    let mut body: Vec<u8> = Vec::new();\n';
+  out += '    if !oversized && content_length > 0 {\n';
+  out += '        body = vec![0u8; content_length];\n';
   out += '        reader.read_exact(&mut body).ok()?;\n';
+  out += '    }\n';
+  out += '    drop(reader);\n';
+  out += '    if oversized {\n';
+  out += '        write_http_response(\n';
+  out += '            stream,\n';
+  out += '            413,\n';
+  out += '            &serde_json::json!({"code": "payload_too_large", "message": "request body exceeds the 1 MiB limit"}),\n';
+  out += '        );\n';
+  out += '        return None;\n';
   out += '    }\n';
   out += '    let value = serde_json::from_slice::<serde_json::Value>(&body)\n';
   out += '        .unwrap_or(serde_json::Value::Null);\n';
@@ -356,6 +369,19 @@ export function rustServerPrelude(): string {
 
 /** Per-service client + server emission over the stdlib HTTP plumbing. */
 export function rustServiceHttp(service: IRService, input: GeneratorInput): string {
+  // Server-side request validators: one per method whose input is a local
+  // struct (validate.rs emits validate for every local struct).
+  // Cross-package/optional-composite inputs are opaque aliases
+  // (serde_json::Value) without a validate method — they must not be
+  // dereferenced (same guard as the Go generator's validator table).
+  const validators = new Set<string>();
+  for (const method of service.methods) {
+    const ref = method.input.kind === 'optional' ? method.input.inner : method.input;
+    if (ref.kind === 'named' && isLocalStructRef(ref, input.ir)) {
+      validators.add(method.name);
+    }
+  }
+
   let out = '';
   const snakeService = camelToLowerSnake(service.name);
   const routePrefix = `/${input.packageName}/${service.name}`;
@@ -381,7 +407,7 @@ export function rustServiceHttp(service: IRService, input: GeneratorInput): stri
     out += `        let (status, value) =\n`;
     out += `            bridge_http_post_json(&self.base_url, "${routePrefix}/${method.name}", &body)\n`;
     out += '                .map_err(|err| BridgeRpcError::new("internal", err))?;\n';
-    out += '        if status == 200 {\n';
+    out += '        if (200..300).contains(&status) {\n';
     out += '            let parsed = serde_json::from_value(value)\n';
     out += '                .map_err(|err| BridgeRpcError::new("internal", err.to_string()))?;\n';
     out += '            Ok(parsed)\n';
@@ -431,14 +457,16 @@ export function rustServiceHttp(service: IRService, input: GeneratorInput): stri
     out += `            let parsed: Result<${inputType}, String> = serde_json::from_value(body).map_err(|err| err.to_string());\n`;
     out += '            match parsed {\n';
     out += '                Ok(req) => {\n';
-    out += '                    if let Err(validation_error) = req.validate() {\n';
-    out += '                        write_http_response(\n';
-    out += '                            stream,\n';
-    out += '                            400,\n';
-    out += '                            &serde_json::json!({"code": "invalid_argument", "message": format!("{}: {}", validation_error.field, validation_error.message)}),\n';
-    out += '                        );\n';
-    out += '                        return;\n';
-    out += '                    }\n';
+    if (validators.has(method.name)) {
+      out += '                    if let Err(validation_error) = req.validate() {\n';
+      out += '                        write_http_response(\n';
+      out += '                            stream,\n';
+      out += '                            400,\n';
+      out += '                            &serde_json::json!({"code": "invalid_argument", "message": format!("{}: {}", validation_error.field, validation_error.message)}),\n';
+      out += '                        );\n';
+      out += '                        return;\n';
+      out += '                    }\n';
+    }
     out += '                    match handler.' + snakeMethod + '(&req) {\n';
     out += '                        Ok(result) => {\n';
     out += '                            let body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);\n';

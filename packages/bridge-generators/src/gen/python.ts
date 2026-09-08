@@ -48,10 +48,17 @@ import type {
 import { generatedFile, joinBlocks } from '../util';
 import { fileHeader } from '../header';
 import { pythonDocstring, pythonFieldComment } from '../docs';
-import { NUMERIC_PRIMITIVES, renderTypeRef } from '../mappings';
+import { NUMERIC_PRIMITIVES, isLocalStructRef, renderTypeRef } from '../mappings';
 import { crossPackageRefs, sortedEvents, sortedServices, sortedTypes } from '../analysis';
 import { pythonEventsFileV2, pythonServerBlocks } from './python-wire';
-import { camelToScreamingSnake, camelToLowerSnake, pythonFieldName, pythonModuleName, rustCrateName } from '../naming';
+import {
+  PYTHON_KEYWORDS,
+  camelToScreamingSnake,
+  camelToLowerSnake,
+  pythonFieldName,
+  pythonModuleName,
+  rustCrateName,
+} from '../naming';
 import type { GeneratedFile, GeneratorInput } from './input';
 
 /** Generates the Python project for an IR package. */
@@ -180,26 +187,26 @@ function renderConstraintCheck(
     }
     case 'email': {
       return [
-        `    if not EMAIL_RE.search(${accessor}):`,
+        `    if not EMAIL_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'url': {
       return [
-        `    if not URL_RE.search(${accessor}):`,
+        `    if not URL_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'uuid': {
       return [
-        `    if not UUID_RE.search(${accessor}):`,
+        `    if not UUID_RE.fullmatch(${accessor}):`,
         `        ${fail}`,
       ];
     }
     case 'pattern': {
       if (arg === undefined) return undefined;
       return [
-        `    if not re.search(${JSON.stringify(arg)}, ${accessor}):`,
+        `    if not re.fullmatch(${JSON.stringify(arg)}, ${accessor}):`,
         `        ${fail}`,
       ];
     }
@@ -449,7 +456,11 @@ function renderStruct(
     if (field.optional || field.default !== undefined) {
       const defExpr = dataclassDefault(field, input);
       const fallback = field.optional ? 'None' : (defExpr ?? 'None');
-      lines.push(`        raw = data.get(${key}, ${fallback})`);
+      // Explicit JSON null behaves like a missing key (parity with the Java
+      // and C# decoders): it must not smuggle None past a field default.
+      lines.push(`        raw = data.get(${key})`);
+      lines.push(`        if raw is None:`);
+      lines.push(`            raw = ${fallback}`);
       lines.push(`        ${pyField(field)} = ${deserializeExpr(field.type, 'raw', input, true)}`);
     } else {
       lines.push(`        if data.get(${key}) is None:`);
@@ -617,9 +628,20 @@ function renderUnion(
   return lines.join('\n');
 }
 
-/** snake_case classmethod name for a union variant name. */
+/**
+ * snake_case classmethod name for a union variant name.
+ *
+ * Variant names collide with the union dataclass's own fields (`kind`,
+ * `value`) and with `self` (which would produce unusable `def self(...)`
+ * methods), so those lower_snake names get a trailing underscore. Python
+ * keywords are escaped the same way.
+ */
+const PYTHON_UNION_RESERVED: ReadonlySet<string> = new Set(['self', 'kind', 'value']);
+
 function snakeMethod(variantName: string): string {
-  return variantName.toLowerCase();
+  const snake = camelToLowerSnake(variantName);
+  if (PYTHON_KEYWORDS.has(snake) || PYTHON_UNION_RESERVED.has(snake)) return `${snake}_`;
+  return snake;
 }
 
 /* ------------------------------------------------------------------ */
@@ -760,13 +782,16 @@ function pythonServicesFile(
   blocks.push('from http.server import BaseHTTPRequestHandler');
   blocks.push('from typing import Any, Callable');
 
-  // Request-type validators for the server adapter (local structs only).
-  const localStructs = new Set(
-    sortedTypes(input.ir).filter((t) => t.kind === 'struct').map((t) => t.name),
-  );
+  // Request-type validators for the server adapter (local struct inputs
+  // only; cross-package opaque inputs have no generated validator).
   const requestTypes = sortedServices(input.ir)
-    .flatMap((service) => service.methods.map((m) => (m.input as { name: string }).name))
-    .filter((name) => localStructs.has(name));
+    .flatMap((service) =>
+      service.methods.map((m) => {
+        const ref = m.input.kind === 'optional' ? m.input.inner : m.input;
+        return isLocalStructRef(ref, input.ir) && ref.kind === 'named' ? ref.name : undefined;
+      }),
+    )
+    .filter((name): name is string => name !== undefined);
   const uniqueRequestTypes = [...new Set(requestTypes)].sort();
   const hasEnumsForServices = sortedTypes(input.ir).some((t) => t.kind === 'enum');
   blocks.push('');
@@ -826,20 +851,26 @@ function renderServiceClient(
   lines.push('        self._timeout = timeout');
   lines.push('        self._urlopen = urlopen');
   for (const method of service.methods) {
-    const inputType = (method.input as { name: string }).name;
-    const outputType = (method.output as { name: string }).name;
+    // Method input/output are rendered through the type table: local
+    // structs/unions keep their to_dict/from_dict machinery, while
+    // cross-package (opaque) or alias-substituted signatures degrade to
+    // JSON passthrough — same guard as the Go/TS generators.
+    const inputType = renderTypeRef(method.input, input.render);
+    const outputType = renderTypeRef(method.output, input.render);
     lines.push('');
     lines.push(`    def ${camelToLowerSnake(method.name)}(self, request: ${inputType}) -> ${outputType}:`);
     const mdoc = pythonDocstring(method.docs, method.deprecated, 8);
     if (mdoc !== undefined) lines.push(mdoc);
     lines.push('        raw = self._call(');
     lines.push(`            ${JSON.stringify(method.name)},`);
-    lines.push('            request.to_dict(),');
+    lines.push(`            ${serializeExpr(method.input, 'request', input)},`);
     lines.push('        )');
-    lines.push(`        return ${outputType}.from_dict(json.loads(raw.decode("utf-8")))`);
+    lines.push(
+      `        return ${pythonDecodeExpr(method.output, input, 'json.loads(raw.decode("utf-8"))')}`,
+    );
   }
   lines.push('');
-  lines.push('    def _call(self, method_name: "str", payload: "dict[str, Any]") -> bytes:');
+  lines.push('    def _call(self, method_name: "str", payload: "Any") -> bytes:');
   lines.push('        body = json.dumps(payload).encode("utf-8")');
   lines.push(`        url = f"{self._base_url}/${input.packageName}/${service.name}/{method_name}"`);
   lines.push('        if self._urlopen is not None:');
@@ -858,6 +889,25 @@ function renderServiceClient(
   return lines.join('\n');
 }
 
+/**
+ * Client-side decode for a service output value: local structs/unions
+ * decode through from_dict, local enums through parse_<Name>; opaque
+ * cross-package values (and any non-model shape) are returned as plain
+ * decoded JSON instead of calling a method that does not exist. Also used
+ * by the server-side request decoder (python-wire.ts).
+ */
+export function pythonDecodeExpr(ref: TypeRef, input: GeneratorInput, raw: string): string {
+  if (ref.kind === 'named') {
+    if (ref.package !== undefined && ref.package !== input.ir.name) return raw;
+    const local = input.ir.types.find((t) => t.name === ref.name);
+    if (local !== undefined && local.kind === 'enum') return `parse_${ref.name}(${raw})`;
+    if (local !== undefined && (local.kind === 'struct' || local.kind === 'union')) {
+      return `${ref.name}.from_dict(${raw})`;
+    }
+  }
+  return raw;
+}
+
 /* ------------------------------------------------------------------ */
 /* events.py                                                           */
 /* ------------------------------------------------------------------ */
@@ -869,120 +919,6 @@ function pythonEventsFile(
   return pythonEventsFileV2(input, module);
 }
 
-function pythonEventsFileOldDisabled(
-  input: GeneratorInput,
-  _module: string,
-): GeneratedFile | undefined {
-  if (!input.generateEvents) return undefined;
-  const events = sortedEvents(input.ir);
-  if (events.length === 0) return undefined;
-
-  const blocks: string[] = [];
-  blocks.push(
-    [
-      '"""Event payloads and the Bridge wire envelope.',
-      '',
-      'Envelope wire format: {"event": name, "payload": {...}}.',
-      '"""',
-    ].join('\n'),
-  );
-  blocks.push('from __future__ import annotations');
-  blocks.push('');
-  blocks.push('from dataclasses import dataclass');
-  blocks.push('from typing import Any');
-  blocks.push('');
-  blocks.push(`from .models import *  # noqa: F401,F403`);
-  blocks.push(`from .enums import *  # noqa: F401,F403`);
-
-  for (const event of events) {
-    blocks.push(renderEvent(event, input));
-  }
-
-  blocks.push(
-    [
-      '',
-      'def decode_event(data: "dict[str, Any]") -> "tuple[str, dict[str, Any]]":',
-      '    """Split a Bridge wire envelope into (event name, payload dict)."""',
-      '    name = data.get("event")',
-      '    payload = data.get("payload")',
-      '    if not isinstance(name, str) or not isinstance(payload, dict):',
-      '        raise ValueError("Invalid Bridge event envelope: expected {event: str, payload: dict}")',
-      '    return name, payload',
-    ].join('\n'),
-  );
-
-  const content = [fileHeader('python', input.packageName), joinBlocks(blocks), ''].join('\n');
-  return generatedFile(`${module}/events.py`, content);
-}
-
-function renderEvent(event: IREvent, input: GeneratorInput): string {
-  const lines: string[] = [];
-  lines.push('');
-  lines.push('');
-  lines.push('@dataclass');
-  lines.push(`class ${event.name}:`);
-  const doc = pythonDocstring(event.docs, undefined);
-  lines.push(doc ?? `    """${event.name} event payload."""`);
-
-  const required = event.fields.filter((f) => !f.optional);
-  const defaulted = event.fields.filter((f) => f.optional);
-  const ordered = [...required, ...defaulted];
-  for (const field of ordered) {
-    const comment = pythonFieldComment(field.docs, field.deprecated);
-    if (comment !== undefined) lines.push(comment);
-    const defaultPart = field.optional ? ' = None' : '';
-    lines.push(`    ${pyField(field)}: ${pythonFieldType(field, input)}${defaultPart}`);
-  }
-
-  lines.push('');
-  lines.push('    def to_dict(self) -> "dict[str, Any]":');
-  lines.push('        out: "dict[str, Any]" = {}');
-  for (const field of event.fields) {
-    const key = JSON.stringify(field.name);
-    const expr = serializeExpr(field.type, `self.${pyField(field)}`, input);
-    if (field.optional) {
-      lines.push(`        if self.${pyField(field)} is not None:`);
-      lines.push(`            out[${key}] = ${expr}`);
-    } else {
-      lines.push(`        out[${key}] = ${expr}`);
-    }
-  }
-  lines.push('        return out');
-
-  lines.push('');
-  lines.push('    @classmethod');
-  lines.push(`    def from_dict(cls, data: "dict[str, Any]") -> "${event.name}":`);
-  for (const field of event.fields) {
-    const key = JSON.stringify(field.name);
-    if (field.optional) {
-      lines.push(`        ${pyField(field)} = ${deserializeExpr(field.type, `data.get(${key})`, input, true)}`);
-    } else {
-      lines.push(`        if data.get(${key}) is None:`);
-      lines.push(`            raise ValueError("Missing required field ${field.name} for ${event.name}")`);
-      lines.push(`        ${pyField(field)} = ${deserializeExpr(field.type, `data.get(${key})`, input, false)}`);
-    }
-  }
-  lines.push('        return cls(');
-  for (const field of event.fields) {
-    lines.push(`            ${pyField(field)}=${pyField(field)},`);
-  }
-  lines.push('        )');
-
-  const snake = camelToLowerSnake(event.name);
-  lines.push('');
-  lines.push(`def wrap_${snake}(payload: ${event.name}) -> "dict[str, Any]":`);
-  lines.push(`    """Wrap a ${event.name} in the Bridge wire envelope."""`);
-  lines.push(`    return {"event": ${JSON.stringify(event.name)}, "payload": payload.to_dict()}`);
-  lines.push('');
-  lines.push('');
-  lines.push(`def unwrap_${snake}(data: "dict[str, Any]") -> ${event.name}:`);
-  lines.push(`    """Extract a ${event.name} payload from a Bridge wire envelope."""`);
-  lines.push('    name, payload = decode_event(data)');
-  lines.push(`    if name != ${JSON.stringify(event.name)}:`);
-  lines.push(`        raise ValueError(f"Expected event '${event.name}', got {name!r}")`);
-  lines.push(`    return ${event.name}.from_dict(payload)`);
-  return lines.join('\n');
-}
 
 /* ------------------------------------------------------------------ */
 /* __init__.py                                                         */

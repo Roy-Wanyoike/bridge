@@ -493,3 +493,130 @@ export function makeMinimalIR(): IRPackage {
     events: [],
   };
 }
+
+/**
+ * Adversarial package for issue #44: every shape that previously produced
+ * compile-breaking output in at least one backend.
+ *
+ * - primitive collections (list<int32>, set<boolean>, list<int64>,
+ *   set<int32>) — Java fromDict/serialize used to emit List<int>/Set<int>;
+ * - a keyword-named CONSTRAINED field (`type`) — Rust validate.rs used to
+ *   reference self.type while types.rs declares r#type;
+ * - a union whose variant names collide with Python classmethod/field
+ *   names (SELF/KIND/VALUE);
+ * - a union variant whose payload is a primitive alias (OrderRef = uuid)
+ *   — Go used to emit the invalid composite literal `OrderRef{}`;
+ * - value/obj/errors field names — TS validators used to redeclare their
+ *   own locals;
+ * - a service whose method input and output are CROSS-PACKAGE named refs
+ *   (opaque in every backend);
+ * - an enum-less package (no enum types at all) — wasm lib.rs used to
+ *   declare the missing enums module unconditionally.
+ */
+export function makeAdversarialIR(): IRPackage {
+  const tags: IRTypeDefinition = {
+    name: 'Tags',
+    kind: 'struct',
+    fields: [
+      {
+        name: 'nums',
+        type: { kind: 'list', element: { kind: 'primitive', primitive: 'int32' } },
+        optional: false,
+        constraints: [],
+      },
+      {
+        name: 'flags',
+        type: { kind: 'set', element: { kind: 'primitive', primitive: 'bool' } },
+        optional: false,
+        constraints: [],
+      },
+      {
+        name: 'bigs',
+        type: { kind: 'list', element: { kind: 'primitive', primitive: 'int64' } },
+        optional: false,
+        constraints: [],
+      },
+      {
+        name: 'quantities',
+        type: { kind: 'set', element: { kind: 'primitive', primitive: 'int32' } },
+        optional: false,
+        constraints: [],
+      },
+      {
+        name: 'type',
+        type: { kind: 'primitive', primitive: 'string' },
+        optional: false,
+        constraints: [{ kind: 'length', args: ['3'] }],
+        docs: 'Keyword-named constrained field: Rust member is r#type.',
+      },
+    ],
+  };
+
+  const channel: IRTypeDefinition = {
+    name: 'Channel',
+    kind: 'union',
+    docs: 'Channel collides with Python classmethod/field names.',
+    variants: [
+      { name: 'SELF', type: { kind: 'primitive', primitive: 'string' }, optional: false, constraints: [] },
+      { name: 'KIND', type: { kind: 'primitive', primitive: 'bool' }, optional: false, constraints: [] },
+      { name: 'VALUE', type: { kind: 'primitive', primitive: 'int64' }, optional: false, constraints: [] },
+    ],
+  };
+
+  const orderRef: IRTypeDefinition = {
+    name: 'OrderRef',
+    kind: 'alias',
+    docs: 'OrderRef aliases the uuid primitive.',
+    target: { kind: 'primitive', primitive: 'uuid' },
+  };
+
+  const pick: IRTypeDefinition = {
+    name: 'Pick',
+    kind: 'union',
+    docs: 'Pick carries a primitive-alias payload (Go zero-value case).',
+    variants: [
+      { name: 'ORDER', type: { kind: 'named', name: 'OrderRef' }, optional: false, constraints: [] },
+      { name: 'NONE', type: { kind: 'primitive', primitive: 'string' }, optional: false, constraints: [] },
+    ],
+  };
+
+  const holder: IRTypeDefinition = {
+    name: 'Holder',
+    kind: 'struct',
+    docs: 'Holder fields collide with TS validator locals.',
+    fields: [
+      { name: 'value', type: { kind: 'primitive', primitive: 'string' }, optional: false, constraints: [] },
+      { name: 'obj', type: { kind: 'named', name: 'Tags' }, optional: false, constraints: [] },
+      {
+        name: 'errors',
+        type: { kind: 'list', element: { kind: 'primitive', primitive: 'string' } },
+        optional: false,
+        constraints: [],
+      },
+      { name: 'pick', type: { kind: 'named', name: 'Pick' }, optional: false, constraints: [] },
+      { name: 'channel', type: { kind: 'named', name: 'Channel' }, optional: false, constraints: [] },
+    ],
+  };
+
+  return {
+    name: 'edge.v1',
+    imports: ['loyalty.v1'],
+    types: [tags, channel, orderRef, pick, holder],
+    services: [
+      {
+        name: 'Profiles',
+        docs: 'Profiles exercises cross-package method signatures.',
+        methods: [
+          {
+            name: 'Fetch',
+            input: { kind: 'named', name: 'LoyaltyProfile', package: 'loyalty.v1' },
+            output: { kind: 'named', name: 'LoyaltyProfile', package: 'loyalty.v1' },
+            docs: 'Cross-package input AND output (opaque aliases).',
+          },
+        ],
+      },
+    ],
+    events: [],
+    docs: 'Adversarial contract for generator compile-break coverage.',
+  };
+}

@@ -15,40 +15,9 @@
 
 import type { IRPackage } from '@bridge/core';
 import { generate } from '@bridge/generators';
-import { rustCrateName } from './abi';
 import { ffiCrateName } from './abi';
 import { fileHeader, generatedFile } from './util';
 import type { GeneratedFile } from './util';
-
-/** TS type for a wasm-exposed Bridge type. */
-function wasmTsType(ref: Record<string, unknown>): string {
-  switch (ref['kind']) {
-    case 'primitive': {
-      switch (ref['primitive']) {
-        case 'bool':
-          return 'boolean';
-        case 'int32':
-        case 'int64':
-        case 'uint32':
-        case 'uint64':
-        case 'float32':
-        case 'float64':
-          return 'number';
-        default:
-          return 'string';
-      }
-    }
-    case 'list':
-    case 'set':
-      return `${wasmTsType(ref['element'] as Record<string, unknown>)}[]`;
-    case 'map':
-      return `Record<string, ${wasmTsType(ref['value'] as Record<string, unknown>)}>`;
-    case 'optional':
-      return `${wasmTsType(ref['inner'] as Record<string, unknown>)} | null`;
-    default:
-      return 'unknown';
-  }
-}
 
 /** Generates the wasm32 crate + TS wrappers for an IR package. */
 export function generateWasm(ir: IRPackage): GeneratedFile[] {
@@ -60,7 +29,10 @@ export function generateWasm(ir: IRPackage): GeneratedFile[] {
     const file = dataFiles.find((f) => f.path === path);
     if (file !== undefined) files.push(file);
   }
-  files.push(wasmLibRs(ir, dataFiles.some((f) => f.path === 'src/types.rs')), tsDeclarations(ir), tsLoader(ir));
+  const hasTypes = dataFiles.some((f) => f.path === 'src/types.rs');
+  const hasEnums = dataFiles.some((f) => f.path === 'src/enums.rs');
+  const hasValidate = dataFiles.some((f) => f.path === 'src/validate.rs');
+  files.push(wasmLibRs(ir, { hasTypes, hasEnums, hasValidate }), tsDeclarations(ir), tsLoader(ir));
   return files;
 }
 
@@ -86,7 +58,10 @@ function wasmCargoToml(ir: IRPackage, crate: string): GeneratedFile {
 }
 
 /** src/lib.rs: wasm-bindgen surface over the contract's types. */
-function wasmLibRs(ir: IRPackage, hasTypes: boolean): GeneratedFile {
+function wasmLibRs(
+  ir: IRPackage,
+  present: { hasTypes: boolean; hasEnums: boolean; hasValidate: boolean },
+): GeneratedFile {
   const lines: string[] = [];
   lines.push(fileHeader('//', ir.name));
   lines.push('');
@@ -95,15 +70,16 @@ function wasmLibRs(ir: IRPackage, hasTypes: boolean): GeneratedFile {
   lines.push('//! `cargo build --target wasm32-unknown-unknown` then generate the JS');
   lines.push('//! glue with `wasm-bindgen` (see index.ts for the typed wrappers).');
   lines.push('');
-  lines.push('use serde::Deserialize;');
-  lines.push('use serde::Serialize;');
   lines.push('use wasm_bindgen::prelude::*;');
   lines.push('');
-  lines.push('pub mod types;');
-  lines.push('pub mod enums;');
-  lines.push('pub mod validate;');
-  lines.push('pub use types::*;');
-  lines.push('pub use enums::*;');
+  // Modules are declared only when their file was actually emitted (mirrors
+  // rust-ffi.ts): an enum-less or struct-less package must not reference
+  // missing src/enums.rs / src/validate.rs, or cargo build fails.
+  if (present.hasTypes) lines.push('pub mod types;');
+  if (present.hasEnums) lines.push('pub mod enums;');
+  if (present.hasValidate) lines.push('pub mod validate;');
+  if (present.hasTypes) lines.push('pub use types::*;');
+  if (present.hasEnums) lines.push('pub use enums::*;');
   lines.push('');
   lines.push('/// Generates a wasm-bindgen class wrapper around one contract type.');
   lines.push('/// (fromJson / toJson / validate, callable from JavaScript).');
@@ -266,7 +242,6 @@ function tsLoader(ir: IRPackage): GeneratedFile {
   lines.push('  return bridgeFormatVersion();');
   lines.push('}');
   lines.push('');
-  void rustCrateName;
   return generatedFile('index.ts', `${lines.join('\n')}\n`);
 }
 
@@ -296,5 +271,3 @@ function rustToTsType(rustType: string): string {
 function camelToJs(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
 }
-
-void wasmTsType;
