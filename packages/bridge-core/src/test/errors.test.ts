@@ -253,3 +253,45 @@ test('diagnostics are deterministic: the same input compiles to identical diagno
   assert.deepEqual(first.diagnostics, second.diagnostics);
   assert.equal(first.ok, second.ok);
 });
+
+// ------------------------------------------------- shared line index (perf)
+
+test('formatDiagnostics splits the source once, not once per diagnostic', () => {
+  const source = Array.from({ length: 20 }, (_, i) => `line ${i} content`).join('\n');
+  const diagnostics: Diagnostic[] = Array.from({ length: 10 }, (_, i) => ({
+    ...SAMPLE_DIAGNOSTIC,
+    line: i + 1,
+  }));
+
+  /** Narrowed split signature: this test only ever forwards string/regex separators. */
+  type SplitFn = (this: string, separator: string | RegExp, limit?: number) => string[];
+  const originalSplit = String.prototype.split as SplitFn;
+  let sourceSplits = 0;
+  const patchedSplit = function patched(
+    this: string,
+    separator: string | RegExp,
+    limit?: number,
+  ): string[] {
+    if (this === source && separator === '\n') sourceSplits += 1;
+    return originalSplit.call(this, separator, limit);
+  } as unknown as typeof String.prototype.split;
+  String.prototype.split = patchedSplit;
+  try {
+    const text = formatDiagnostics(diagnostics, source);
+    assert.equal(sourceSplits, 1, 'the source must be split exactly once for N diagnostics');
+    assert.ok(text.includes('line 5 content'), 'snippet content is still rendered');
+    assert.ok(text.includes('Did you mean `Money`?'), 'hints are still rendered');
+  } finally {
+    String.prototype.split = originalSplit as unknown as typeof String.prototype.split;
+  }
+});
+
+test('formatDiagnostics output is byte-identical to per-diagnostic rendering', () => {
+  const source = 'package p\ntype T {\n    amount: money\n    other: bad\n}\n';
+  const diagnostics: Diagnostic[] = [
+    { ...SAMPLE_DIAGNOSTIC, line: 3, column: 13 },
+    { ...SAMPLE_DIAGNOSTIC, line: 4, column: 12, message: 'Another.', hint: undefined },
+  ];
+  const perDiagnostic = diagnostics.map((d) => formatDiagnostic(d, source)).join('\n\n');
+  assert.equal(formatDiagnostics(diagnostics, source), perDiagnostic);
+});

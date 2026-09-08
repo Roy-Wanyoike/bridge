@@ -19,10 +19,23 @@ import type { Diagnostic } from './ir/types';
 
 /** Render one diagnostic as a multi-line string. */
 export function formatDiagnostic(diagnostic: Diagnostic, sourceText?: string): string {
+  const sourceLines = sourceText === undefined ? undefined : sourceText.split('\n');
+  return renderDiagnostic(diagnostic, sourceLines);
+}
+
+/**
+ * Render the header + snippet + hint block. `sourceLines` is the source
+ * pre-split into lines (or `undefined` when no source is available) so that
+ * rendering N diagnostics costs one split, not N.
+ */
+function renderDiagnostic(
+  diagnostic: Diagnostic,
+  sourceLines: readonly string[] | undefined,
+): string {
   const { file, line, column, severity, code, message } = diagnostic;
   const lines: string[] = [`${file}:${line}:${column}: ${severity} ${code}: ${message}`];
 
-  const snippet = renderSnippet(diagnostic, sourceText);
+  const snippet = renderSnippet(diagnostic, sourceLines);
   if (snippet.length > 0) {
     lines.push('');
     lines.push(...snippet);
@@ -38,11 +51,10 @@ export function formatDiagnostic(diagnostic: Diagnostic, sourceText?: string): s
 
 /**
  * Render the `NNN | source` / `    | ^^^^` snippet pair. Returns an empty
- * array when no source text is available or the line is out of range.
+ * array when no source lines are available or the line is out of range.
  */
-function renderSnippet(diagnostic: Diagnostic, sourceText?: string): string[] {
-  if (sourceText === undefined) return [];
-  const sourceLines = sourceText.split('\n');
+function renderSnippet(diagnostic: Diagnostic, sourceLines: readonly string[] | undefined): string[] {
+  if (sourceLines === undefined) return [];
   const index = diagnostic.line - 1;
   const raw = sourceLines[index];
   if (raw === undefined) return [];
@@ -70,7 +82,11 @@ function renderSnippet(diagnostic: Diagnostic, sourceText?: string): string[] {
 /**
  * Render many diagnostics, separated by a blank line. Convenience for CLI
  * output; individual rendering is {@link formatDiagnostic}.
+ *
+ * The source is split into lines exactly once and shared across every
+ * diagnostic: O(lines) work total instead of O(diagnostics × lines).
  */
 export function formatDiagnostics(diagnostics: readonly Diagnostic[], sourceText?: string): string {
-  return diagnostics.map((d) => formatDiagnostic(d, sourceText)).join('\n\n');
+  const sourceLines = sourceText === undefined ? undefined : sourceText.split('\n');
+  return diagnostics.map((d) => renderDiagnostic(d, sourceLines)).join('\n\n');
 }

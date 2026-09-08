@@ -14,6 +14,11 @@
  * the identical text. Only lexically and syntactically valid input is
  * formatted; otherwise `ok === false` and the diagnostics are returned.
  * Like the compiler, the formatter never throws.
+ *
+ * Depth protection: type expressions are bounded by the parser (BR1005
+ * "type nesting too deep" past 256 levels), so deep input fails at the parse
+ * step with a proper syntax diagnostic instead of overflowing the stack
+ * while rendering (previously an internal BR2999 error).
  */
 
 import type { Diagnostic } from './ir/types';
@@ -223,7 +228,10 @@ function renderDeprecated(deprecated: string | true | undefined): string {
 
 function pushDocs(out: string[], indent: string, docs: string | undefined): void {
   if (docs === undefined) return;
-  for (const lineText of docs.split('\n')) {
+  for (const rawLine of docs.split('\n')) {
+    // Canonicalize CRLF input: a trailing `\r` (from pre-canonical doc text)
+    // would leak mixed line endings into the output.
+    const lineText = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     out.push(lineText.length > 0 ? `${indent}/// ${lineText}` : `${indent}///`);
   }
 }

@@ -5,7 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tokenize } from '../lexer';
-import { parse } from '../parser';
+import { parse, MAX_TYPE_DEPTH } from '../parser';
+import { compileSource } from '../compiler/compile';
 import type {
   AliasDeclNode,
   EnumDeclNode,
@@ -411,4 +412,94 @@ test('positions are 1-based and point at the declaration keyword', () => {
   const t = structOf(file, 0);
   assert.equal(t.line, 3);
   assert.equal(t.column, 1);
+});
+
+// ------------------------------------------------------- type depth limit
+
+/** Build `x: list<list<…string…>>` nested `depth` levels. */
+function nestedType(depth: number, open = 'list<', close = '>'): string {
+  return `package p\ntype T {\n    x: ${open.repeat(depth)}string${close.repeat(depth)}\n}\n`;
+}
+
+test('type depth limit: nesting up to 256 levels parses cleanly', () => {
+  const { file, diagnostics } = parseText(nestedType(MAX_TYPE_DEPTH));
+  assert.equal(diagnostics.length, 0, JSON.stringify(diagnostics));
+  const t = structOf(file, 0);
+  assert.equal(t.fields[0]?.type.kind, 'list');
+});
+
+test('type depth limit: 257 levels report BR1005 "type nesting too deep", not a crash', () => {
+  const { diagnostics } = parseText(nestedType(MAX_TYPE_DEPTH + 1));
+  const depthErrors = diagnostics.filter((d) => d.code === 'BR1005');
+  assert.equal(depthErrors.length, 1, `expected exactly one BR1005, got: ${JSON.stringify(diagnostics)}`);
+  assert.match(depthErrors[0]?.message ?? '', /Type nesting too deep/);
+  assert.match(depthErrors[0]?.message ?? '', /256/);
+  assert.equal(depthErrors[0]?.severity, 'error');
+  assert.ok(diagnostics.every((d) => d.code !== 'BR2999'), 'no internal error');
+});
+
+test('type depth limit: unbounded `list<` seed (8000 deep) recovers with one diagnostic', () => {
+  // The original issue scenario: an 8000-deep `list<` used to overflow the
+  // call stack and surface as BR2999 "Maximum call stack size exceeded".
+  const source = `package p\ntype T {\n    x: ${'list<'.repeat(8000)}\n}\n`;
+  const { diagnostics } = parseText(source);
+  const depthErrors = diagnostics.filter((d) => d.code === 'BR1005');
+  assert.equal(depthErrors.length, 1, `expected exactly one BR1005, got: ${JSON.stringify(diagnostics.map((d) => d.code))}`);
+  assert.ok(diagnostics.every((d) => d.code !== 'BR2999'));
+});
+
+test('type depth limit: parsing continues after a too-deep type', () => {
+  const { file, diagnostics } = parseText(`
+package p
+type T {
+    x: ${'map<string, '.repeat(300)}int32${'>'.repeat(300)}
+    y: int32
+}
+
+type U {
+    z: string
+}
+`);
+  assert.equal(diagnostics.filter((d) => d.code === 'BR1005').length, 1);
+  assert.deepEqual(file.decls.map((d) => d.name), ['T', 'U'], 'following declarations survive');
+  const u = structOf(file, 1);
+  assert.deepEqual(u.fields.map((f) => f.name), ['z']);
+  assert.equal(u.fields[0]?.type.kind, 'primitive');
+});
+
+// -------------------------------------------------- redundant optional markers
+
+test('redundant optional markers warn (BR2104): `a: string ? ?`', () => {
+  const { diagnostics } = parseText('package p\ntype T {\n    a: string ? ?\n}\n');
+  const warnings = diagnostics.filter((d) => d.code === 'BR2104');
+  assert.equal(warnings.length, 1, JSON.stringify(diagnostics));
+  assert.equal(warnings[0]?.severity, 'warning');
+  assert.match(warnings[0]?.message ?? '', /declares the optional marker `\?` more than once/);
+  assert.match(warnings[0]?.hint ?? '', /canonical style/);
+});
+
+test('redundant optional markers warn for `a?: string?` and `a: string??`', () => {
+  for (const field of ['a?: string?', 'a: string??', 'a?: string??']) {
+    const { diagnostics } = parseText(`package p\ntype T {\n    ${field}\n}\n`);
+    const warnings = diagnostics.filter((d) => d.code === 'BR2104');
+    assert.equal(warnings.length, 1, `${field}: ${JSON.stringify(diagnostics)}`);
+    assert.equal(warnings[0]?.severity, 'warning');
+  }
+});
+
+test('a single optional marker never warns', () => {
+  for (const field of ['a: string', 'a: string?', 'a?: string', 'b: list<int32>?', 'c?: list<int32>', 'd: map<string, int32>?']) {
+    const { diagnostics } = parseText(`package p\ntype T {\n    ${field}\n}\n`);
+    assert.equal(
+      diagnostics.filter((d) => d.code === 'BR2104').length,
+      0,
+      `${field} must not warn: ${JSON.stringify(diagnostics)}`,
+    );
+  }
+});
+
+test('redundant optional markers are advisory: compilation still succeeds', () => {
+  const result = compileSource('package p\ntype T {\n    a?: string?\n}\n', 'warn.bridge');
+  assert.equal(result.ok, true, 'warnings must not block compilation');
+  assert.ok(result.diagnostics.some((d) => d.code === 'BR2104' && d.severity === 'warning'));
 });

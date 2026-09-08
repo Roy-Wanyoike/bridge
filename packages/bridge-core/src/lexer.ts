@@ -114,6 +114,14 @@ export function tokenize(text: string, filePath: string): LexResult {
   let line = 1;
   let column = 1;
 
+  // Skip a UTF-8 byte-order mark (U+FEFF) at position 0 — editors emit it
+  // routinely and it must not surface as BR1001. Only position 0 is skipped;
+  // a BOM elsewhere is a genuine unexpected character. The BOM is invisible,
+  // so the column of the following token stays 1.
+  if (text.charCodeAt(0) === 0xfeff) {
+    i = 1;
+  }
+
   const error = (
     code: string,
     message: string,
@@ -167,6 +175,9 @@ export function tokenize(text: string, filePath: string): LexResult {
         column++;
       }
       if (isDoc) {
+        // CRLF files: the comment body ends with `\r` before the `\n` —
+        // strip it so doc text is canonical (the formatter emits LF).
+        if (body.endsWith('\r')) body = body.slice(0, -1);
         // Strip exactly one leading space after `///` (canonical style).
         const content = body.startsWith(' ') ? body.slice(1) : body;
         tokens.push({ kind: 'doc', text: content, line: startLine, column: startColumn });
