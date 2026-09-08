@@ -12,7 +12,7 @@ import { inputFiles } from '../files';
 import { CliError, UsageError } from '../errors';
 import { out, CHECK } from '../output';
 
-const LANGUAGES: readonly TargetLanguage[] = ['go', 'rust', 'typescript', 'python'];
+const LANGUAGES: readonly TargetLanguage[] = ['go', 'rust', 'typescript', 'python', 'java', 'csharp'];
 
 export function run(args: ParsedArgs): void {
   const language = args.values.get('--language');
