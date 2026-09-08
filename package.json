@@ -19,7 +19,7 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "tsc -b packages/bridge-core packages/bridge-generators packages/bridge-compat packages/bridge-registry packages/bridge-cli packages/bridge-ffi",
+    "build": "tsc -b packages/bridge-core packages/bridge-generators packages/bridge-compat packages/bridge-registry packages/bridge-serialization packages/bridge-registry-service packages/bridge-cli packages/bridge-ffi",
     "test": "npm run test --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present"
   }
