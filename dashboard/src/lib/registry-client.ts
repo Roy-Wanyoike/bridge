@@ -30,13 +30,21 @@ import {
 
 /**
  * Reads the demo/live switches. `NEXT_PUBLIC_DEMO_MODE` defaults to true so
- * the console is browsable with zero backend; set it to `false` and point
- * `NEXT_PUBLIC_REGISTRY_URL` at a running registry service to go live.
+ * the console is browsable with zero backend; set it to exactly `false` or
+ * `0` (and point `NEXT_PUBLIC_REGISTRY_URL` at a running registry service)
+ * to go live. Anything else keeps demo mode on and warns — booleans are
+ * never coerced loosely (`'FALSE'` does not disable demo mode).
  */
 export function isDemoMode(): boolean {
   const raw = process.env.NEXT_PUBLIC_DEMO_MODE;
-  if (raw === undefined) return DEMO_MODE_DEFAULT;
-  return raw !== 'false' && raw !== '0';
+  if (raw === undefined || raw === '') return DEMO_MODE_DEFAULT;
+  if (raw === 'false' || raw === '0') return false;
+  if (raw !== 'true' && raw !== '1') {
+    console.warn(
+      `[dashboard] NEXT_PUBLIC_DEMO_MODE=${JSON.stringify(raw)} is not a recognized boolean (true/false/1/0); keeping demo mode ON. Set it to exactly "false" or "0" to go live.`,
+    );
+  }
+  return true;
 }
 
 export function registryBaseUrl(): string | null {
@@ -48,75 +56,125 @@ export function registryBaseUrl(): string | null {
 /* REST client against the registry service                            */
 /* ------------------------------------------------------------------ */
 
-interface ListResponse<T> {
-  [key: string]: unknown;
+/** Hard ceiling for a single registry request, so a hung backend can never hang a render. */
+const FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * Typed failure from the registry REST layer. Thrown for network failures,
+ * timeouts and non-404 HTTP errors so React error boundaries handle them
+ * (Retry UI) instead of pages silently rendering "not found".
+ * `status === 0` means the request never got an HTTP response (timeout,
+ * connection refused, DNS).
+ */
+export class RegistryError extends Error {
+  readonly status: number;
+  readonly path: string;
+
+  constructor(message: string, opts: { status: number; path: string; cause?: unknown }) {
+    super(message, opts.cause !== undefined ? { cause: opts.cause } : undefined);
+    this.name = 'RegistryError';
+    this.status = opts.status;
+    this.path = opts.path;
+  }
 }
 
-function pickArray<T>(body: ListResponse<T>, keys: string[]): T[] {
+/** True when `err` is a typed 404 from the registry (safe to render as "not found"). */
+export function isNotFound(err: unknown): boolean {
+  return err instanceof RegistryError && err.status === 404;
+}
+
+/**
+ * Extracts an array field from a list response. If none of the expected keys
+ * is present this throws a `RegistryError` — an array-shaped response without
+ * the documented key means the API contract drifted, and silently rendering
+ * an empty page ("No contracts match") would mask the bug.
+ */
+function pickArray(body: Record<string, unknown>, keys: string[], path: string): unknown[] {
   for (const k of keys) {
-    const v = (body as Record<string, unknown>)[k];
-    if (Array.isArray(v)) return v as T[];
+    const v = body[k];
+    if (Array.isArray(v)) return v;
   }
-  return [];
+  throw new RegistryError(
+    `registry response for GET ${path} has none of the expected array keys [${keys.join(', ')}] — API schema drift`,
+    { status: 0, path },
+  );
 }
 
 export class RestRegistryClient implements RegistryClient {
   constructor(private readonly baseUrl: string) {}
 
   private async get<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      headers: { accept: 'application/json' },
-      cache: 'no-store',
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}${path}`, {
+        headers: { accept: 'application/json' },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const timedOut = err instanceof Error && err.name === 'TimeoutError';
+      throw new RegistryError(
+        timedOut
+          ? `registry request timed out after ${FETCH_TIMEOUT_MS}ms on GET ${path}`
+          : `registry unreachable on GET ${path}`,
+        { status: 0, path, cause: err },
+      );
+    }
     if (!res.ok) {
-      throw new Error(`registry ${res.status} on GET ${path}`);
+      throw new RegistryError(`registry ${res.status} on GET ${path}`, { status: res.status, path });
     }
     return (await res.json()) as T;
   }
 
   async listOrgs(): Promise<OrgInfo[]> {
-    const body = await this.get<Record<string, unknown>>('/v1/orgs');
-    return pickArray<OrgInfo>(body, ['orgs']);
+    const path = '/v1/orgs';
+    const body = await this.get<Record<string, unknown>>(path);
+    return pickArray(body, ['orgs'], path) as OrgInfo[];
   }
 
   async listContracts(org: string, project: string): Promise<ContractSummary[]> {
-    const body = await this.get<Record<string, unknown>>(
-      `/v1/orgs/${org}/projects/${project}/contracts`,
-    );
-    return pickArray<ContractSummary>(body, ['contracts']);
+    const path = `/v1/orgs/${org}/projects/${project}/contracts`;
+    const body = await this.get<Record<string, unknown>>(path);
+    return pickArray(body, ['contracts'], path) as ContractSummary[];
   }
 
   async listAllContracts(org?: string): Promise<ContractSummary[]> {
     const orgInfos = org ? [{ org, projects: [] as string[] }] : await this.listOrgs();
-    const out: ContractSummary[] = [];
-    for (const o of orgInfos) {
-      let projects = o.projects ?? [];
-      if (projects.length === 0) {
-        const body = await this.get<Record<string, unknown>>(`/v1/orgs/${o.org}/projects`);
-        projects = pickArray<{ project: string }>(body, ['projects']).map((p) => p.project);
-      }
-      for (const project of projects) {
-        out.push(...(await this.listContracts(o.org, project)));
-      }
-    }
-    return out;
+    // Fan out per org, then per (org, project): the org→project→contracts
+    // walk runs in parallel instead of a sequential N+1 cascade.
+    const perOrg = await Promise.all(
+      orgInfos.map(async (o) => {
+        const projectsPath = `/v1/orgs/${o.org}/projects`;
+        let projects = o.projects ?? [];
+        if (projects.length === 0) {
+          const body = await this.get<Record<string, unknown>>(projectsPath);
+          projects = (pickArray(body, ['projects'], projectsPath) as { project: string }[]).map(
+            (p) => p.project,
+          );
+        }
+        const contractLists = await Promise.all(
+          projects.map((project) => this.listContracts(o.org, project)),
+        );
+        return contractLists.flat();
+      }),
+    );
+    return perOrg.flat();
   }
 
   async getContract(org: string, project: string, base: string): Promise<ContractSummary | null> {
+    const path = `/v1/orgs/${org}/projects/${project}/contracts/${base}`;
     try {
-      return await this.get<ContractSummary>(
-        `/v1/orgs/${org}/projects/${project}/contracts/${base}`,
-      );
-    } catch {
-      return null;
+      return await this.get<ContractSummary>(path);
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
     }
   }
 
   async listVersions(org: string, project: string, base: string): Promise<VersionMeta[]> {
-    const body = await this.get<Record<string, unknown>>(
-      `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions`,
-    );
-    return pickArray<VersionMeta>(body, ['versions']);
+    const path = `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions`;
+    const body = await this.get<Record<string, unknown>>(path);
+    return pickArray(body, ['versions'], path) as VersionMeta[];
   }
 
   async getVersion(
@@ -125,12 +183,12 @@ export class RestRegistryClient implements RegistryClient {
     base: string,
     version: string,
   ): Promise<VersionDetail | null> {
+    const path = `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${version}`;
     try {
-      return await this.get<VersionDetail>(
-        `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${version}`,
-      );
-    } catch {
-      return null;
+      return await this.get<VersionDetail>(path);
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
     }
   }
 
@@ -140,10 +198,9 @@ export class RestRegistryClient implements RegistryClient {
     base: string,
     version: string,
   ): Promise<ConsumerRef[]> {
-    const body = await this.get<Record<string, unknown>>(
-      `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${version}/consumers`,
-    );
-    return pickArray<ConsumerRef>(body, ['consumers']);
+    const path = `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${version}/consumers`;
+    const body = await this.get<Record<string, unknown>>(path);
+    return pickArray(body, ['consumers'], path) as ConsumerRef[];
   }
 
   async getDiff(
@@ -153,21 +210,22 @@ export class RestRegistryClient implements RegistryClient {
     from: string,
     to: string,
   ): Promise<DiffReport | null> {
+    const path = `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${to}/diff?from=${encodeURIComponent(from)}`;
     try {
-      return await this.get<DiffReport>(
-        `/v1/orgs/${org}/projects/${project}/contracts/${base}/versions/${to}/diff?from=${encodeURIComponent(from)}`,
-      );
-    } catch {
-      return null;
+      return await this.get<DiffReport>(path);
+    } catch (err) {
+      if (isNotFound(err)) return null;
+      throw err;
     }
   }
 
   async getGraph(org?: string): Promise<GraphData> {
     const qs = org ? `?org=${encodeURIComponent(org)}` : '';
-    const body = await this.get<Record<string, unknown>>(`/v1/graph${qs}`);
+    const path = `/v1/graph${qs}`;
+    const body = await this.get<Record<string, unknown>>(path);
     return {
-      nodes: pickArray<GraphData['nodes'][number]>(body, ['nodes']),
-      edges: pickArray<GraphData['edges'][number]>(body, ['edges']),
+      nodes: pickArray(body, ['nodes'], path) as GraphData['nodes'],
+      edges: pickArray(body, ['edges'], path) as GraphData['edges'],
     };
   }
 
@@ -178,29 +236,39 @@ export class RestRegistryClient implements RegistryClient {
     if (filters?.contract) qs.set('contract', filters.contract);
     if (filters?.org) qs.set('org', filters.org);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
-    const body = await this.get<Record<string, unknown>>(`/v1/audit${suffix}`);
-    return pickArray<AuditEntry>(body, ['entries', 'audit']);
+    const path = `/v1/audit${suffix}`;
+    const body = await this.get<Record<string, unknown>>(path);
+    return pickArray(body, ['entries', 'audit'], path) as AuditEntry[];
   }
 
   async getOverview(): Promise<OverviewData> {
-    const contracts = await this.listAllContracts();
-    const orgs = await this.listOrgs();
-    const audit = await this.listAudit();
+    // Independent sources fetched concurrently, not back-to-back.
+    const [contracts, orgs, audit] = await Promise.all([
+      this.listAllContracts(),
+      this.listOrgs(),
+      this.listAudit(),
+    ]);
     const publishes = audit.filter((e) => e.action === 'publish');
-    const recentBreaking: DiffReport[] = [];
-    for (const c of contracts) {
-      if (!c.latestVerdict || c.latestVerdict === 'SAFE') continue;
-      const versions = await this.listVersions(c.org, c.project, c.base);
-      if (versions.length < 2) continue;
-      const diff = await this.getDiff(
-        c.org,
-        c.project,
-        c.base,
-        versions[versions.length - 2].version,
-        versions[versions.length - 1].version,
-      );
-      if (diff && diff.verdict !== 'SAFE') recentBreaking.push(diff);
-    }
+    const candidates = contracts.filter(
+      (c) => c.latestVerdict && c.latestVerdict !== 'SAFE',
+    );
+
+    // All (versions → diff) lookups run concurrently per candidate contract.
+    const verdicts = await Promise.all(
+      candidates.map(async (c) => {
+        const versions = await this.listVersions(c.org, c.project, c.base);
+        if (versions.length < 2) return null;
+        const diff = await this.getDiff(
+          c.org,
+          c.project,
+          c.base,
+          versions[versions.length - 2].version,
+          versions[versions.length - 1].version,
+        );
+        return diff && diff.verdict !== 'SAFE' ? diff : null;
+      }),
+    );
+    const recentBreaking = verdicts.filter((d): d is DiffReport => d !== null);
     recentBreaking.sort((a, b) => (a.to < b.to ? 1 : -1));
     return {
       contracts: contracts.length,
