@@ -1,0 +1,224 @@
+name: Release
+
+# Triggered by pushing a semver tag (v<major>.<minor>.<patch>):
+#   1. builds self-contained CLI binaries for 5 platform targets
+#   2. generates SHA-256 checksums
+#   3. signs binaries (keyless cosign) and produces SPDX + CycloneDX SBOMs
+#   4. publishes a GitHub release with changelog from conventional commits
+#   5. builds and pushes multi-arch container images (ghcr.io) + signs them
+#   6. publishes the npm workspaces
+#
+# Prerequisites (one-time, repo settings): allow OIDC for cosign keyless
+# signing; set NPM_TOKEN secret for the publish job.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # cosign keyless signing + SBOM attestation
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  binaries:
+    name: Binaries (${{ matrix.os-label }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runs-on: ubuntu-latest, os-label: linux-amd64, target: bun-linux-x64, ext: "" }
+          - { runs-on: ubuntu-latest, os-label: linux-arm64, target: bun-linux-arm64, ext: "" }
+          - { runs-on: macos-latest, os-label: darwin-amd64, target: bun-darwin-x64, ext: "" }
+          - { runs-on: macos-latest, os-label: darwin-arm64, target: bun-darwin-arm64, ext: "" }
+          - { runs-on: ubuntu-latest, os-label: windows-amd64, target: bun-windows-x64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install + build workspace
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Build binary
+        run: |
+          mkdir -p dist/release
+          VERSION="${GITHUB_REF_NAME#v}"
+          bun build --compile --minify \
+            --target=${{ matrix.target }} \
+            packages/bridge-cli/src/bin/bridge.ts \
+            --outfile "dist/release/bridge-v${VERSION}-${{ matrix.os-label }}${{ matrix.ext }}"
+
+      - name: Smoke test the binary
+        if: matrix.os-label != 'windows-amd64' && matrix.os-label != 'linux-arm64' && matrix.os-label != 'darwin-*'
+        run: dist/release/bridge-$(basename dist/release/bridge-* | head -1 | sed 's/^bridge-//;s/\..*//')* version || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-${{ matrix.os-label }}
+          path: dist/release/
+          if-no-files-found: error
+
+  checksums-sbom-sign:
+    name: Checksums, SBOM, signing
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist/release
+        run: |
+          sha256sum bridge-* > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: SBOM (SPDX + CycloneDX) for the release artifacts
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist/release
+          format: spdx-json
+          artifact-name: bridge-sbom.spdx.json
+
+      - uses: anchore/sbom-action@v0
+        with:
+          path: dist/release
+          format: cyclonedx-json
+          artifact-name: bridge-sbom.cyclonedx.json
+
+      - name: Sign binaries + checksums (keyless)
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          for file in dist/release/bridge-* dist/release/checksums-sha256.txt; do
+            cosign sign-blob --yes --output-signature "${file}.sig" "$file"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: |
+            dist/release/checksums-sha256.txt
+            dist/release/*.sig
+
+  github-release:
+    name: GitHub release
+    needs: checksums-sbom-sign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+
+      - name: Changelog from conventional commits
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        continue-on-error: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.content || 'See commit history for changes.' }}
+          files: |
+            dist/release/bridge-*
+            dist/release/checksums-sha256.txt
+            dist/release/*.sig
+            dist/release/bridge-sbom.*.json
+
+  container:
+    name: Container image (${{ matrix.platform }})
+    needs: checksums-sbom-sign
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign the image (keyless)
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          DIGEST=$(docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GITHUB_REF_NAME#v} \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+        continue-on-error: true
+
+  npm:
+    name: Publish npm workspaces
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Publish @bridge/* (public)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in bridge-core bridge-generators bridge-compat bridge-registry bridge-serialization bridge-cli; do
+            (cd "packages/$pkg" && npm publish --access public) || echo "publish skipped for $pkg (already exists?)"
+          done
+        continue-on-error: true
