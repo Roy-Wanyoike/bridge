@@ -1,0 +1,5 @@
+# Python codecs required by scripts/verify-serialization.sh (cross-language
+# golden-vector matrix). Pinned loosely; also serves as the cache-dependency
+# key for actions/setup-python's pip cache in .github/workflows/ci.yml.
+msgpack>=1.0
+cbor2>=5.4
