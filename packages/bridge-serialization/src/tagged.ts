@@ -64,9 +64,13 @@ export function valueFromTagged(tagged: unknown): BridgeValue {
       return v;
     }
     case 'f64': {
-      const v = node.v;
-      if (typeof v !== 'number' || !Number.isFinite(v)) {
-        throw new TypeError(`f64 value must be a finite JSON number`);
+      // Numeric form normally; a decimal string carries values JSON numbers
+      // cannot round-trip exactly — negative zero (JSON.stringify(-0) drops
+      // the sign). Both parse to the same binary64.
+      const raw = node.v;
+      const v = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+      if (!Number.isFinite(v)) {
+        throw new TypeError(`f64 value must be a finite JSON number or decimal string`);
       }
       return v;
     }
@@ -117,7 +121,12 @@ export function valueToTagged(value: BridgeValue): TaggedValue {
     if (value < 0n) return { t: 'i64', v: value.toString() };
     return { t: 'u64', v: value.toString() };
   }
-  if (typeof value === 'number') return { t: 'f64', v: value };
+  if (typeof value === 'number') {
+    // Negative zero would lose its sign through JSON.stringify — emit the
+    // decimal string form the tagged model pins instead.
+    if (Object.is(value, -0)) return { t: 'f64', v: '-0.0' };
+    return { t: 'f64', v: value };
+  }
   if (typeof value === 'string') return { t: 'str', v: value };
   if (value instanceof Uint8Array) return { t: 'bytes', b64: Buffer.from(value).toString('base64') };
   if (value instanceof BridgeTimestamp) return { t: 'timestamp', iso: value.toISO() };

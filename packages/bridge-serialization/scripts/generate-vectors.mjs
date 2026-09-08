@@ -53,6 +53,10 @@ const vectors = [
   enc('float_pi', 3.14),
   enc('float_neg_half', -0.5),
   enc('float_large', 1e300),
+  enc('float_neg_zero', -0.0), // sign survives only via the tagged string form
+  enc('float_smallest_subnormal', 5e-324),
+  enc('float_subnormal', 2.5e-310),
+  enc('float_max', 1.7976931348623157e308),
   enc('string_empty', ''),
   enc('string_ascii', 'hello'),
   enc('string_unicode', 'héllo 🌉 世界'),
@@ -64,6 +68,16 @@ const vectors = [
   enc('timestamp_epoch', new BridgeTimestamp(1717515600n)),
   enc('timestamp_nanos', new BridgeTimestamp(1717515600n, 500_000_000)),
   enc('timestamp_epoch_zero', new BridgeTimestamp(0n)),
+  // Timestamp edge cases (#46): every vector below round-trips EXACTLY in
+  // both formats — pre-1970 fractional via the floor-split float epoch,
+  // whole seconds via exact integer epochs, sub-ms/sub-µs at epoch-zero
+  // magnitudes where binary64 carries nanoseconds faithfully.
+  enc('timestamp_pre1970_subsecond', new BridgeTimestamp(-1n, 500_000_000)),
+  enc('timestamp_pre1970_nano', new BridgeTimestamp(-1n, 1)),
+  enc('timestamp_subms_epoch', new BridgeTimestamp(0n, 123_456)),
+  enc('timestamp_subus_epoch', new BridgeTimestamp(0n, 1)),
+  enc('timestamp_int64max_seconds', new BridgeTimestamp(9223372036854775807n)),
+  enc('timestamp_int64min_seconds', new BridgeTimestamp(-9223372036854775808n)),
   // --- collections ----------------------------------------------------------
   enc('array_empty', []),
   enc('array_mixed', [1n, 'two', false, null, 3.5]),
@@ -89,6 +103,22 @@ const vectors = [
   }),
 ];
 
+/**
+ * Bytes that every runtime must REJECT: decode raises, or the decoded value
+ * is outside the Bridge value model (the model mapper throws). NaN/±Infinity
+ * are not Bridge values on any wire; a tag-1 timestamp carrying a bignum tag
+ * is not a valid epoch.
+ */
+const rejects = [
+  { id: 'reject_cbor_nan', format: 'cbor', hex: 'fb7ff8000000000000' },
+  { id: 'reject_cbor_inf', format: 'cbor', hex: 'fb7ff0000000000000' },
+  { id: 'reject_cbor_neg_inf', format: 'cbor', hex: 'fbfff0000000000000' },
+  { id: 'reject_cbor_tag1_bignum', format: 'cbor', hex: 'c1c201' },
+  { id: 'reject_msgpack_nan', format: 'msgpack', hex: 'cb7ff8000000000000' },
+  { id: 'reject_msgpack_inf', format: 'msgpack', hex: 'cb7ff0000000000000' },
+  { id: 'reject_msgpack_neg_inf', format: 'msgpack', hex: 'cbfff0000000000000' },
+];
+
 // The canonical JSON string is the decoded expectation. It is written as a
 // STRING (not re-parsed) so integers beyond 2^53 keep exact digits — every
 // runtime parses it with bigint-aware JSON parsing (Python int, Go json.Number,
@@ -97,6 +127,7 @@ const vectors = [
 const payload = {
   profile: 'bridge-serialization v1 (docs/SERIALIZATION.md)',
   vectors,
+  rejects,
 };
 fs.writeFileSync(path.join(outDir, 'vectors.json'), JSON.stringify(payload, null, 2) + '\n');
-console.log(`wrote ${vectors.length} vectors to ${path.join(outDir, 'vectors.json')}`);
+console.log(`wrote ${vectors.length} vectors + ${rejects.length} rejects to ${path.join(outDir, 'vectors.json')}`);

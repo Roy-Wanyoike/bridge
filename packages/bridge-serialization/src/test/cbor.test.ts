@@ -108,9 +108,22 @@ test('cbor: undefined map values are absent keys', () => {
   assertRoundTrip({ present: 'x', missing: undefined, nulled: null }, 'a2666e756c6c6564f66770726573656e746178');
 });
 
-test('cbor: timestamp is Tag(1) with binary64 epoch seconds', () => {
-  assertRoundTrip(new BridgeTimestamp(1717515600n), 'c1fb41d997cd54000000');
-  assertRoundTrip(new BridgeTimestamp(0n), 'c1fb0000000000000000');
+test('cbor: timestamps are Tag(1) — integer epoch for whole seconds, binary64 otherwise', () => {
+  // Whole seconds: RFC 8949 §3.4.2 preferred form — integer content, exact
+  // for the full int64 range (no float detour, no Number() precision loss).
+  assertRoundTrip(new BridgeTimestamp(1717515600n), 'c11a665f3550');
+  assertRoundTrip(new BridgeTimestamp(0n), 'c100');
+  assertRoundTrip(new BridgeTimestamp(-1n), 'c120');
+  assertRoundTrip(new BridgeTimestamp(9223372036854775807n), 'c11b7fffffffffffffff');
+  assertRoundTrip(new BridgeTimestamp(-9223372036854775808n), 'c13b7fffffffffffffff');
+  // Fractional seconds: binary64 epoch. Negative seconds round-trip exactly:
+  // -1s + 0.5s → epoch -0.5 → floor-split back to (-1, 500000000). These
+  // exact bytes previously decoded into a RangeError (#46).
+  assertRoundTrip(new BridgeTimestamp(-1n, 500_000_000), 'c1fbbfe0000000000000');
+  assertRoundTrip(new BridgeTimestamp(-1n, 1), 'c1fbbfefffffff768fa1');
+  assertRoundTrip(new BridgeTimestamp(0n, 123_456), 'c1fb3f202e7ef70994dd');
+  assertRoundTrip(new BridgeTimestamp(0n, 1), 'c1fb3e112e0be826d695');
+  assertRoundTrip(new BridgeTimestamp(1717515600n, 500_000_000), 'c1fb41d997cd54200000');
 });
 
 test('cbor: decodes integer-tag epochs and half/single floats leniently', () => {
@@ -120,6 +133,40 @@ test('cbor: decodes integer-tag epochs and half/single floats leniently', () => 
   assert.equal((t as BridgeTimestamp).seconds, 0n);
   // half-float 1.0 (0xf9 0x3c00) decodes (widened) to 1.0
   assert.equal(decodeCbor(unhex('f93c00')), 1.0);
+  // half-float epoch under tag 1: 0xf9 0xbc00 = -1.0 → (-1, 0)
+  const neg = decodeCbor(unhex('c1f9bc00')) as unknown;
+  assert.ok(neg instanceof BridgeTimestamp);
+  assert.equal((neg as BridgeTimestamp).seconds, -1n);
+  assert.equal((neg as BridgeTimestamp).nanos, 0);
+});
+
+test('cbor: fractional-epoch decode is symmetric (floor-split) and rejects non-finite epochs', () => {
+  // Explicit bytes (not produced by this encoder for these values) decode to
+  // the canonical (seconds, nanos) pair on both sides of the epoch.
+  const neg = decodeCbor(unhex('c1fbbfe0000000000000')) as unknown;
+  assert.ok(neg instanceof BridgeTimestamp);
+  assert.equal((neg as BridgeTimestamp).seconds, -1n);
+  assert.equal((neg as BridgeTimestamp).nanos, 500_000_000);
+  // NaN/±Inf tag-1 contents are a decode error, never a timestamp.
+  assert.throws(() => decodeCbor(unhex('c1fb7ff8000000000000')));
+  assert.throws(() => decodeCbor(unhex('c1fb7ff0000000000000')));
+  // Top-level NaN/±Inf floats are a decode error.
+  assert.throws(() => decodeCbor(unhex('fb7ff8000000000000')));
+  assert.throws(() => decodeCbor(unhex('fb7ff0000000000000')));
+});
+
+test('cbor: off-grid fractional seconds follow the documented binary64 contract', () => {
+  // The binary64 epoch carries ~238 ns granularity at 2024-epoch magnitudes.
+  // Off-grid nanos are rounded to the grid on encode (never silently
+  // re-interpreted): the encoded bytes decode to the nearest-grid value and
+  // re-encode byte-identically — encode→decode→encode is stable.
+  const original = new BridgeTimestamp(1717515600n, 123_456);
+  const bytes = hex(encodeCbor(original));
+  const decoded = decodeCbor(Buffer.from(bytes, 'hex')) as BridgeTimestamp;
+  assert.notEqual(decoded.nanos, 123_456); // off-grid: rounded to the double grid
+  assert.equal(Math.abs(decoded.nanos - 123_456) <= 119, true); // within half a grid step
+  assert.equal(decoded.seconds, 1717515600n);
+  assert.equal(hex(encodeCbor(decoded)), bytes); // stable re-encode
 });
 
 test('cbor: sets encode as sorted deduped arrays (decode sees plain arrays)', () => {

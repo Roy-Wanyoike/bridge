@@ -57,7 +57,21 @@ fn parse_model(json: &Json) -> Result<Node, String> {
                 .parse::<u64>()
                 .map_err(|e| e.to_string())?,
         ),
-        "f64" => Node::F64(json["v"].as_f64().ok_or("f64 v")?),
+        "f64" => {
+            // Numeric JSON form normally; a decimal string (e.g. "-0.0")
+            // carries values JSON numbers cannot round-trip exactly.
+            let v = if let Some(n) = json["v"].as_f64() {
+                n
+            } else if let Some(s) = json["v"].as_str() {
+                s.parse::<f64>().map_err(|e| format!("f64 v: {e}"))?
+            } else {
+                return Err("f64 v".to_string());
+            };
+            if !v.is_finite() {
+                return Err("f64 v must be finite".to_string());
+            }
+            Node::F64(v)
+        }
         "str" | "decimal" | "uuid" | "enum" => Node::Str(
             json["v"]
                 .as_str()
@@ -123,8 +137,13 @@ fn decode_b64(s: &str) -> Vec<u8> {
 
 fn parse_iso(iso: &str) -> Result<Node, String> {
     // Minimal RFC 3339 UTC parser for the vector shapes:
-    // YYYY-MM-DDTHH:MM:SS[.frac]Z
-    let (date, rest) = iso
+    // [sign]YYYY…-MM-DDTHH:MM:SS[.frac]Z — years beyond four digits
+    // (expanded form) and negative years carry the int64-second extremes.
+    let (neg_year, body) = match iso.strip_prefix('-') {
+        Some(rest) => (1i64, rest),
+        None => (0i64, iso),
+    };
+    let (date, rest) = body
         .split_once('T')
         .ok_or_else(|| format!("bad iso {iso}"))?;
     let d: Vec<&str> = date.split('-').collect();
@@ -132,6 +151,7 @@ fn parse_iso(iso: &str) -> Result<Node, String> {
         return Err(format!("bad iso date {iso}"));
     }
     let y: i64 = d[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let y = if neg_year == 1 { -y } else { y };
     let mo: i64 = d[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     let da: i64 = d[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     let (time, _tz) = rest
@@ -151,14 +171,19 @@ fn parse_iso(iso: &str) -> Result<Node, String> {
     let ss: i64 = t[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
     // Days since epoch via civil-date algorithm (Howard Hinnant's).
     let days = days_from_civil(y, mo, da);
-    let secs = days * 86_400 + hh * 3600 + mi * 60 + ss;
+    // i128 math: days * 86_400 overflows i64 exactly at the int64-second
+    // extremes the vectors cover.
+    let secs: i128 = days as i128 * 86_400 + hh as i128 * 3600 + mi as i128 * 60 + ss as i128;
+    if secs < i64::MIN as i128 || secs > i64::MAX as i128 {
+        return Err(format!("iso seconds out of int64 range: {iso}"));
+    }
     let nanos: u32 = if frac.is_empty() {
         0
     } else {
         let padded = format!("{:0<9}", &frac[..frac.len().min(9)]);
         padded.parse().map_err(|e: std::num::ParseIntError| e.to_string())?
     };
-    Ok(Node::Timestamp(secs, nanos))
+    Ok(Node::Timestamp(secs as i64, nanos))
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -192,8 +217,19 @@ fn rmpv_to_model(value: &rmpv::Value) -> Result<Node, String> {
                 return Err("integer out of range".into());
             }
         }
-        rmpv::Value::F32(f) => Node::F64(*f as f64),
-        rmpv::Value::F64(f) => Node::F64(*f),
+        rmpv::Value::F32(f) => {
+            let v = *f as f64;
+            if !v.is_finite() {
+                return Err("non-finite float is not a Bridge value".into());
+            }
+            Node::F64(v)
+        }
+        rmpv::Value::F64(f) => {
+            if !f.is_finite() {
+                return Err("non-finite float is not a Bridge value".into());
+            }
+            Node::F64(*f)
+        }
         rmpv::Value::String(s) => Node::Str(
             s.as_str()
                 .ok_or("invalid utf8 string")?
@@ -258,25 +294,46 @@ fn ciborium_to_model(value: &ciborium::value::Value) -> Result<Node, String> {
                 Node::I64(n as i64)
             }
         }
-        C::Float(f) => Node::F64(*f),
+        C::Float(f) => {
+            if !f.is_finite() {
+                return Err("non-finite float is not a Bridge value".into());
+            }
+            Node::F64(*f)
+        }
         C::Text(s) => Node::Str(s.clone()),
         C::Bytes(b) => Node::Bytes(b.clone()),
         C::Tag(1, content) => {
-            let epoch = match **content {
+            // Bridge epoch mapping: integer contents are exact (seconds, 0);
+            // float contents split with FLOOR semantics so pre-1970
+            // fractional epochs decode to the canonical (seconds, nanos)
+            // pair (epoch -0.5 → -1s + 500000000ns), symmetric with the
+            // canonical writer below.
+            match **content {
                 C::Integer(i) => {
                     let n: i128 = i.into();
-                    n as f64
+                    if n < i64::MIN as i128 || n > i64::MAX as i128 {
+                        return Err(format!("tag 1 integer epoch out of int64 range: {n}"));
+                    }
+                    Node::Timestamp(n as i64, 0)
                 }
-                C::Float(f) => f,
+                C::Float(f) => {
+                    if !f.is_finite() {
+                        return Err("tag 1 epoch must be finite".into());
+                    }
+                    let floor = f.floor();
+                    let mut secs = floor as i128;
+                    let mut nanos = ((f - floor) * 1e9).round() as i128;
+                    if nanos >= 1_000_000_000 {
+                        secs += 1;
+                        nanos = 0;
+                    }
+                    if secs < i64::MIN as i128 || secs > i64::MAX as i128 {
+                        return Err(format!("tag 1 epoch out of int64 range: {secs}"));
+                    }
+                    Node::Timestamp(secs as i64, nanos as u32)
+                }
                 ref other => return Err(format!("tag 1 content {other:?}")),
-            };
-            let mut secs = epoch.trunc() as i64;
-            let mut nanos = ((epoch - epoch.trunc()) * 1e9).round() as u32;
-            if nanos >= 1_000_000_000 {
-                secs += 1;
-                nanos = 0;
             }
-            Node::Timestamp(secs, nanos)
         }
         C::Array(items) => Node::Array(
             items
@@ -334,7 +391,7 @@ fn main() {
             // 1. ENCODE: model -> canonical wire writer -> bytes == vector
             // bytes. The hand-rolled writer pins the Bridge canonical forms
             // (minimal int args, bytewise-sorted map keys, always-f64 floats,
-            // timestamp96 / tag 1 + binary64) exactly like the Go runtime.
+            // timestamp96 / tag 1 integer-or-binary64 epoch) exactly like the Go runtime.
             let encoded: Vec<u8> = if format == "msgpack" {
                 encode_msgpack(&model)
             } else {
@@ -377,14 +434,56 @@ fn main() {
         }
         println!("  {id:<24} ok");
     }
+    let (reject_checks, reject_failures) = run_rejects(&file);
+    checks += reject_checks;
+    failures += reject_failures;
     if failures > 0 {
         println!("\n{failures} failure(s) ({checks} checks)");
         exit(1);
     }
     println!(
-        "\nrust runtime: {} vectors, both formats, {checks} checks PASS",
-        vectors.len()
+        "\nrust runtime: {} vectors + {} rejects, both formats, {checks} checks PASS",
+        vectors.len(),
+        file["rejects"].as_array().map(|r| r.len()).unwrap_or(0),
     );
+}
+
+/// Reject vectors: decode must fail (or the decoded value must fall outside
+/// the Bridge value model and the model mapper must throw). Returns
+/// (checks, failures).
+fn run_rejects(file: &Json) -> (usize, usize) {
+    let mut checks = 0;
+    let mut failures = 0;
+    if let Some(rejects) = file["rejects"].as_array() {
+        for reject in rejects {
+            let id = reject["id"].as_str().unwrap_or("?");
+            let format = reject["format"].as_str().unwrap_or("?");
+            let bytes = match decode_hex(reject["hex"].as_str().unwrap_or("")) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("FAIL [{id}/{format}]: bad hex: {e}");
+                    failures += 1;
+                    continue;
+                }
+            };
+            checks += 1;
+            let outcome: Result<Node, String> = if format == "msgpack" {
+                rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes))
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| rmpv_to_model(&v))
+            } else {
+                ciborium::de::from_reader::<ciborium::value::Value, _>(std::io::Cursor::new(&bytes))
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| ciborium_to_model(&v))
+            };
+            if outcome.is_ok() {
+                println!("FAIL [{id}/{format}]: decoded to a Bridge value, expected rejection");
+                failures += 1;
+            }
+            println!("  {id:<24} rejected");
+        }
+    }
+    (checks, failures)
 }
 
 /// Sets decode back as plain arrays: normalize both sides for equality.
@@ -664,6 +763,18 @@ fn encode_cbor_into(out: &mut Vec<u8>, node: &Node) {
         }
         Node::Timestamp(secs, nanos) => {
             out.push(0xc1); // tag 1
+            if *nanos == 0 {
+                // Whole seconds: integer epoch content (RFC 8949 §3.4.2
+                // preferred form) — exact for the full int64 range.
+                if *secs >= 0 {
+                    cbor_head(out, 0, *secs as u64);
+                } else {
+                    cbor_head(out, 1, (-1 - *secs) as u64);
+                }
+                return;
+            }
+            // Fractional seconds: binary64 epoch (precision contract in
+            // docs/SERIALIZATION.md).
             out.push(0xfb); // binary64 epoch seconds
             let epoch = *secs as f64 + *nanos as f64 / 1e9;
             out.extend_from_slice(&epoch.to_bits().to_be_bytes());
