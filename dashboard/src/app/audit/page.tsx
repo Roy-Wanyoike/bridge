@@ -115,6 +115,9 @@ export default async function AuditPage({ searchParams }: { searchParams: SP }) 
       ) : (
         <Card className="overflow-hidden">
           <Table>
+            <caption className="sr-only">
+              Audit trail: time, action, actor, contract and recorded detail
+            </caption>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead>Time</TableHead>
@@ -147,7 +150,7 @@ export default async function AuditPage({ searchParams }: { searchParams: SP }) 
                         <span className="text-muted-foreground">@{e.version}</span>
                       ) : null}
                     </Link>
-                    <div className="text-[11px] text-muted-foreground/70">
+                    <div className="text-[11px] text-muted-foreground/80">
                       {e.org} / {e.project}
                     </div>
                   </TableCell>

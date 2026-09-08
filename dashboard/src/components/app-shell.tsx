@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import {
   Activity,
   Boxes,
@@ -66,26 +66,41 @@ function NavLink({ href, label, icon: Icon, active }: { href: string; label: str
   );
 }
 
+/**
+ * Scope picker derived from the URL (controlled): reflects the org/project
+ * query on /contracts so it never goes stale after navigation.
+ */
 function ScopeSwitcher({ orgs }: { orgs: OrgInfo[] }) {
   const router = useRouter();
-  const value = 'all';
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  const org = searchParams.get('org') ?? '';
+  const project = searchParams.get('project') ?? '';
+  const onContracts = pathname === '/contracts' || pathname.startsWith('/contracts/');
+  const scopedOrg = onContracts && org ? org : '';
+  const value = scopedOrg && project ? `${scopedOrg}/${project}` : scopedOrg || 'all';
+
   return (
     <label className="flex items-center gap-2 text-xs text-muted-foreground">
       <span className="sr-only">Scope: org and project</span>
       <GitBranch className="h-3.5 w-3.5" aria-hidden="true" />
       <select
-        defaultValue={value}
+        value={value}
         onChange={(e) => {
           const v = e.target.value;
           if (v === 'all') router.push('/contracts');
           else {
-            const [org, project] = v.split('/');
-            router.push(`/contracts?org=${encodeURIComponent(org)}&project=${encodeURIComponent(project)}`);
+            const [nextOrg, nextProject] = v.split('/');
+            router.push(
+              `/contracts?org=${encodeURIComponent(nextOrg)}&project=${encodeURIComponent(nextProject)}`,
+            );
           }
         }}
         className="h-8 appearance-none rounded-md border border-input bg-card px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <option value="all">All orgs</option>
+        {scopedOrg && !project && <option value={scopedOrg}>{scopedOrg} / all projects</option>}
         {orgs.map((o) => (
           <optgroup key={o.org} label={o.org}>
             {o.projects.map((p) => (
@@ -162,7 +177,9 @@ export function AppShell({
               </span>
               <span>registry state: content-addressed, immutable versions</span>
             </div>
-            <ScopeSwitcher orgs={orgs} />
+            <React.Suspense fallback={null}>
+              <ScopeSwitcher orgs={orgs} />
+            </React.Suspense>
           </div>
           {/* compact nav for narrow viewports */}
           <nav aria-label="Primary" className="flex gap-1 overflow-x-auto px-4 pb-2 lg:hidden">

@@ -104,7 +104,7 @@ export function CompatGraph({ data }: { data: GraphData }) {
     <svg
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       className="h-auto w-full select-none"
-      role="img"
+      role="group"
       aria-label="Contract dependency graph. Nodes are contracts sized by consumer count; edges are import dependencies."
     >
       <defs>
@@ -134,7 +134,7 @@ export function CompatGraph({ data }: { data: GraphData }) {
             markerEnd={hot ? 'url(#arrow-hot)' : 'url(#arrow)'}
             className={cn(
               'transition-opacity',
-              hot ? 'stroke-primary' : 'stroke-zinc-600',
+              hot ? 'stroke-primary' : 'stroke-zinc-500',
             )}
             strokeWidth={hot ? 2 : 1.2}
             opacity={dim ? 0.15 : 1}
@@ -150,7 +150,7 @@ export function CompatGraph({ data }: { data: GraphData }) {
           hovered !== null &&
           data.edges.some((e) => (e.from === hovered && e.to === n.id) || (e.to === hovered && e.from === n.id));
         const dim = hovered !== null && !hot && !linked;
-        const ring = n.verdict ? STROKE[n.verdict] : '#52525b';
+        const ring = n.verdict ? STROKE[n.verdict] : '#71717a';
         return (
           <g
             key={n.id}
@@ -199,7 +199,7 @@ export function CompatGraph({ data }: { data: GraphData }) {
               x={n.x}
               y={n.y + r + 30}
               textAnchor="middle"
-              className="fill-zinc-500 font-mono"
+              className="fill-zinc-400 font-mono"
               fontSize={10}
             >
               {n.version}
@@ -216,7 +216,7 @@ export function GraphLegend() {
     <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-muted-foreground">
       <span className="flex items-center gap-2">
         <svg width="34" height="20" aria-hidden="true">
-          <circle cx="17" cy="10" r="8" fill="#131316" stroke="#52525b" strokeWidth="2" />
+          <circle cx="17" cy="10" r="8" fill="#131316" stroke="#71717a" strokeWidth="2" />
         </svg>
         node size = direct consumers
       </span>

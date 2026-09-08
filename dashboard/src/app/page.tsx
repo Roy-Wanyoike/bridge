@@ -134,6 +134,9 @@ export default async function OverviewPage() {
           </CardHeader>
           <CardContent>
             <Table>
+              <caption className="sr-only">
+                Most recently published contract versions, with publisher and languages
+              </caption>
               <TableHeader>
                 <TableRow>
                   <TableHead>Contract</TableHead>

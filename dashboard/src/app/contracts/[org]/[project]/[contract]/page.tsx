@@ -235,6 +235,9 @@ export default async function ContractDetailPage({ params }: { params: Params })
               </CardHeader>
               <CardContent>
                 <Table>
+                  <caption className="sr-only">
+                    Contracts that depend on {contract}, with dependency depth and severity
+                  </caption>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
                       <TableHead>Consumer</TableHead>
@@ -253,7 +256,7 @@ export default async function ContractDetailPage({ params }: { params: Params })
                           >
                             {c.packageName}
                           </Link>
-                          <div className="text-[11px] text-muted-foreground/70">
+                          <div className="text-[11px] text-muted-foreground/80">
                             {c.org} / {c.project}
                           </div>
                         </TableCell>
@@ -307,6 +310,9 @@ export default async function ContractDetailPage({ params }: { params: Params })
               </CardHeader>
               <CardContent>
                 <Table>
+                  <caption className="sr-only">
+                    Actors that published versions of {contract}
+                  </caption>
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
                       <TableHead>Actor</TableHead>
@@ -380,7 +386,7 @@ function ProducerChips({
         {label}
       </div>
       {items.length === 0 ? (
-        <div className="text-sm text-muted-foreground/70">none</div>
+        <div className="text-sm text-muted-foreground/80">none</div>
       ) : (
         <div className="flex flex-wrap gap-1.5">
           {items.map((item) => (

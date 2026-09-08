@@ -162,6 +162,9 @@ export default async function ContractsPage({ searchParams }: { searchParams: Se
       ) : (
         <Card className="overflow-hidden">
           <Table>
+            <caption className="sr-only">
+              Contracts at their latest version with owner, verdict, consumer count and languages
+            </caption>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead>Contract</TableHead>
@@ -186,7 +189,7 @@ export default async function ContractsPage({ searchParams }: { searchParams: Se
                     <div className="truncate text-xs text-muted-foreground" title={c.description}>
                       {c.description}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-muted-foreground/70">
+                    <div className="mt-0.5 text-[11px] text-muted-foreground/80">
                       {c.org} / {c.project}
                     </div>
                   </TableCell>
