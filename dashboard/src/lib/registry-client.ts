@@ -25,7 +25,6 @@ import {
   demoListContracts,
   demoListOrgs,
   demoListVersions,
-  demoPublishers,
 } from './demo-data';
 
 /**
@@ -361,7 +360,6 @@ export class RestRegistryClient implements RegistryClient {
         };
       }),
       recentBreaking,
-      objectCount: contracts.reduce((n, c) => n + c.versionCount, 0),
       lastPublishAt: publishes[0]?.at,
     };
   }
@@ -421,17 +419,9 @@ export class DemoRegistryClient implements RegistryClient {
   getOverview(): Promise<OverviewData> {
     return Promise.resolve(demoGetOverview());
   }
-  publishers(org: string, project: string, base: string) {
-    return demoPublishers(org, project, base);
-  }
 }
 
-/** Extra demo-only helpers surface on the demo client; shared base type. */
-export interface RegistryClientWithHelpers extends RegistryClient {
-  publishers?(org: string, project: string, base: string): ReturnType<typeof demoPublishers>;
-}
-
-let cached: RegistryClientWithHelpers | null = null;
+let cached: RegistryClient | null = null;
 
 /**
  * Returns the process-wide registry client (demo or REST, per env).
@@ -440,7 +430,7 @@ let cached: RegistryClientWithHelpers | null = null;
  * live mode but does not configure a registry URL — serving fabricated data
  * there would be worse than an honest, actionable error page.
  */
-export function getRegistryClient(): RegistryClientWithHelpers {
+export function getRegistryClient(): RegistryClient {
   if (!cached) {
     if (isDemoMode()) {
       cached = new DemoRegistryClient();
