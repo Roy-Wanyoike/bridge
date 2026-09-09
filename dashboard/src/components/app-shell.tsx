@@ -170,6 +170,19 @@ export function AppShell({
             <div className="flex items-center gap-2 lg:hidden">
               <BrandMark className="h-6 w-6 text-primary" />
               <span className="text-sm font-semibold tracking-[0.18em]">BRIDGE</span>
+              {/* Demo/live disclosure must survive below lg — the sidebar card
+                  carrying it is hidden on mobile, so a compact chip lives in
+                  the header row instead. */}
+              <span
+                className={cn(
+                  'ml-1 rounded-md border px-1.5 py-0.5 font-mono text-[10px] tracking-wider',
+                  demoMode
+                    ? 'border-[var(--warning)]/50 text-[var(--warning)]'
+                    : 'border-primary/50 text-primary',
+                )}
+              >
+                {demoMode ? 'DEMO' : 'LIVE'}
+              </span>
             </div>
             <div className="hidden items-center gap-2 text-xs text-muted-foreground lg:flex">
               <span className="rounded-md border border-border bg-secondary/60 px-2 py-1 font-mono">

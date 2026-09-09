@@ -1280,4 +1280,10 @@ export function demoPublishers(org: string, project: string, base: string, versi
   return [...byPublisher.entries()].sort((a, b) => b[1].lastAt.localeCompare(a[1].lastAt));
 }
 
-export const DEMO_MODE_DEFAULT = true;
+/**
+ * Production builds default to LIVE mode: fabricated data must never reach
+ * real users just because an env var was forgotten. `next dev` overrides the
+ * unset case to demo (see `isDemoMode`), so the zero-setup clone-and-browse
+ * experience is unchanged for developers.
+ */
+export const DEMO_MODE_DEFAULT = false;
